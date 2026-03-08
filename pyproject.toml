@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "temperature-modeling"
+version = "0.1.0"
+description = "Temperature modeling library for PJM ISO territory"
+requires-python = ">=3.9"
+readme = "README.md"
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+pandas = [
+    "pandas>=2.0",
+]
+dev = [
+    "pytest>=7",
+    "pytest-mock>=3.11",
+    "responses>=0.24",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
