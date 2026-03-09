@@ -8,6 +8,7 @@ from .exceptions import (
     NCEIAuthError,
     NoStationFoundError,
     NWSAPIError,
+    SatelliteAPIError,
     TemperatureModelingError,
 )
 from .models import (
@@ -15,6 +16,7 @@ from .models import (
     ForecastPeriod,
     HourlyForecast,
     Location,
+    SatelliteObservation,
     TemperatureObservation,
     WeatherResult,
 )
@@ -27,6 +29,7 @@ __all__ = [
     "TemperatureObservation",
     "ForecastPeriod",
     "HourlyForecast",
+    "SatelliteObservation",
     "TemperatureModelingError",
     "GeocodingError",
     "LocationNotInPJMError",
@@ -34,4 +37,5 @@ __all__ = [
     "NCEIAPIError",
     "NCEIAuthError",
     "NoStationFoundError",
+    "SatelliteAPIError",
 ]

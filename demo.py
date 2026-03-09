@@ -146,6 +146,39 @@ NCEI_DATA_RESPONSE = {
     ]
 }
 
+# Open-Meteo hourly surface skin temp (soil_temperature_0cm) — 28 days × 24 hours
+_SKIN_TEMPS_C = [
+    -1.2, -1.5, -1.8, -2.0, -2.1, -2.0, -1.4, 0.3, 2.1, 3.8, 4.9, 5.4,
+     5.6,  5.3,  4.8,  4.1,  3.2,  2.3,  1.5, 0.9, 0.4, 0.0,-0.4,-0.8,
+]  # one representative day repeated for simplicity
+
+OPEN_METEO_RESPONSE = {
+    "hourly": {
+        "time": [
+            f"2026-02-{day:02d}T{h:02d}:00"
+            for day in range(1, 29)
+            for h in range(24)
+        ],
+        "soil_temperature_0cm": [
+            _SKIN_TEMPS_C[h % 24] + (day - 1) * 0.05
+            for day in range(1, 29)
+            for h in range(24)
+        ],
+    }
+}
+
+# NASA POWER daily Earth Skin Temp (TS) — 28 days
+NASA_POWER_RESPONSE = {
+    "properties": {
+        "parameter": {
+            "TS": {
+                f"202602{day:02d}": round(-1.0 + day * 0.3, 2)
+                for day in range(1, 29)
+            }
+        }
+    }
+}
+
 
 # ── Mock HTTP session ────────────────────────────────────────────────────────
 
@@ -168,6 +201,12 @@ def mock_session_get(url, **kwargs):
         return _make_response(NWS_FORECAST_RESPONSE)
     if "/stations" in url:
         return _make_response(NCEI_STATIONS_RESPONSE)
+    if "ncei" in url or "noaa.gov/cdo-web" in url:
+        return _make_response(NCEI_DATA_RESPONSE)
+    if "open-meteo" in url:
+        return _make_response(OPEN_METEO_RESPONSE)
+    if "power.larc.nasa.gov" in url:
+        return _make_response(NASA_POWER_RESPONSE)
     if "/data" in url:
         return _make_response(NCEI_DATA_RESPONSE)
     raise ValueError(f"Unexpected URL in mock: {url}")
@@ -187,6 +226,8 @@ def main():
             "Columbus, OH",
             start_date=date(2026, 2, 1),
             end_date=date(2026, 2, 28),
+            include_satellite=True,
+            satellite_source="open-meteo",
         )
 
     # ── Print results ────────────────────────────────────────────────────────
@@ -233,6 +274,16 @@ def main():
     print(f"  {'-'*8} {'-'*10}  {'-'*20}")
     for h in result.hourly_forecast:
         print(f"  {h.timestamp.strftime('%H:%M'):<8} {h.temp_f:>10}  {h.short_forecast}")
+
+    print(f"\n{'─'*60}")
+    print(f"  SATELLITE SURFACE TEMP  ({len(result.satellite)} readings, source: {result.satellite[0].source if result.satellite else 'n/a'})")
+    print(f"{'─'*60}")
+    print(f"  {'Timestamp':<20} {'Skin Temp (°C)':>14} {'Skin Temp (°F)':>14}")
+    print(f"  {'-'*20} {'-'*14} {'-'*14}")
+    for obs in result.satellite[:12]:  # first 12 hours
+        print(f"  {obs.timestamp.strftime('%Y-%m-%d %H:%M'):<20} {obs.surface_temp_c:>14.2f} {obs.surface_temp_f:>14.2f}")
+    if len(result.satellite) > 12:
+        print(f"  ... ({len(result.satellite) - 12} more hourly readings)")
 
     print()
 

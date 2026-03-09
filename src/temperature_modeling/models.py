@@ -44,9 +44,19 @@ class HourlyForecast:
 
 
 @dataclass
+class SatelliteObservation:
+    """A surface skin temperature reading from Open-Meteo or NASA POWER."""
+    timestamp: datetime
+    surface_temp_c: float
+    surface_temp_f: float
+    source: str  # "Open-Meteo" or "NASA-POWER"
+
+
+@dataclass
 class WeatherResult:
     """Top-level container returned to the caller."""
     location: Location
     historical: list = field(default_factory=list)        # list[TemperatureObservation]
     forecast_periods: list = field(default_factory=list)  # list[ForecastPeriod]
     hourly_forecast: list = field(default_factory=list)   # list[HourlyForecast]
+    satellite: list = field(default_factory=list)         # list[SatelliteObservation]

@@ -8,6 +8,8 @@ from .models import Coordinates, Location, WeatherResult
 from .ncei import find_nearest_station, get_historical_temperatures
 from .nws import get_forecast_periods, get_gridpoint_metadata, get_hourly_forecast
 from .pjm import STATE_NAME_TO_ABBR, validate_pjm_state
+from . import open_meteo as _open_meteo
+from . import nasa_power as _nasa_power
 
 _USER_AGENT = (
     "temperature-modeling-library/0.1.0 "
@@ -70,6 +72,8 @@ class WeatherClient:
         end_date: Optional[date] = None,
         include_forecast: bool = True,
         include_historical: bool = True,
+        include_satellite: bool = False,
+        satellite_source: str = "open-meteo",
     ) -> WeatherResult:
         """
         Fetch temperature data for a PJM-territory location.
@@ -79,13 +83,19 @@ class WeatherClient:
         location:
             Either a "City, ST" string or a (lat, lon) tuple.
         start_date, end_date:
-            Date range for historical data. Both must be provided together
-            when fetching historical data.
+            Date range for historical/satellite data. Both must be provided
+            together when fetching historical or satellite data.
         include_forecast:
             Whether to fetch NWS 7-day + hourly forecast.
         include_historical:
             Whether to fetch NCEI historical data. Requires ncei_token and
             both start_date and end_date.
+        include_satellite:
+            Whether to fetch surface skin temperature from a satellite/reanalysis
+            source. Requires both start_date and end_date.
+        satellite_source:
+            Which source to use for satellite data: ``"open-meteo"`` (default,
+            hourly ERA5/NWP, no auth) or ``"nasa-power"`` (daily MERRA-2, no auth).
 
         Returns
         -------
@@ -101,9 +111,12 @@ class WeatherClient:
             NWS API request failed.
         NCEIAPIError / NCEIAuthError / NoStationFoundError
             NCEI API request failed.
+        SatelliteAPIError
+            Open-Meteo or NASA POWER request failed.
         ValueError
             include_historical=True but ncei_token, start_date, or
-            end_date is missing.
+            end_date is missing; or include_satellite=True but dates are missing;
+            or satellite_source is not recognized.
         """
         if include_historical:
             if not self._ncei_token:
@@ -114,6 +127,17 @@ class WeatherClient:
             if start_date is None or end_date is None:
                 raise ValueError(
                     "Both start_date and end_date are required for historical data."
+                )
+
+        if include_satellite:
+            if start_date is None or end_date is None:
+                raise ValueError(
+                    "Both start_date and end_date are required for satellite data."
+                )
+            if satellite_source not in ("open-meteo", "nasa-power"):
+                raise ValueError(
+                    f"Unknown satellite_source '{satellite_source}'. "
+                    "Choose 'open-meteo' or 'nasa-power'."
                 )
 
         # Resolve location; for tuple inputs also fetch NWS metadata once so
@@ -139,6 +163,17 @@ class WeatherClient:
                 station_id, start_date, end_date,  # type: ignore[arg-type]
                 self._ncei_token, self._session     # type: ignore[arg-type]
             )
+
+        if include_satellite:
+            coords = resolved_location.coordinates
+            if satellite_source == "open-meteo":
+                result.satellite = _open_meteo.get_surface_temperatures(
+                    coords, start_date, end_date, self._session  # type: ignore[arg-type]
+                )
+            else:  # "nasa-power"
+                result.satellite = _nasa_power.get_surface_temperatures(
+                    coords, start_date, end_date, self._session  # type: ignore[arg-type]
+                )
 
         return result
 

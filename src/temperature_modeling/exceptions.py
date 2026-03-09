@@ -37,3 +37,7 @@ class NCEIAuthError(NCEIAPIError):
 
 class NoStationFoundError(NCEIAPIError):
     """No NCEI weather station found near the given coordinates."""
+
+
+class SatelliteAPIError(TemperatureModelingError):
+    """Open-Meteo or NASA POWER API returned an unexpected or error response."""
