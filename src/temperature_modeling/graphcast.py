@@ -5,7 +5,10 @@ import requests
 from .exceptions import SatelliteAPIError
 from .models import Coordinates, SatelliteObservation
 
-# GraphCast (gfs_graphcast025) is served through two Open-Meteo endpoints:
+# GraphCast (gfs_graphcast025) is NOAA's operational deployment of Google DeepMind's
+# GraphCast architecture.  It uses the same base weights (trained on ERA5 1979-2017)
+# but is fine-tuned on NOAA GDAS data and initialized from GFS/GDAS analysis rather
+# than ERA5/HRES.  It is served through two Open-Meteo endpoints:
 #   - historical-forecast-api for archived model runs (available from 2024-02-05)
 #   - forecast API for recent/future dates
 _HISTORICAL_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
@@ -26,8 +29,12 @@ def get_surface_temperatures(
     session: requests.Session,
 ) -> list:
     """
-    Fetch hourly 2-metre air temperature from Google's GraphCast model via
-    Open-Meteo (model id: ``gfs_graphcast025``).
+    Fetch hourly 2-metre air temperature from Google DeepMind's GraphCast
+    model via Open-Meteo (model id: ``gfs_graphcast025``).
+
+    This is NOAA's operational deployment of the GraphCast architecture:
+    same base weights (ERA5-trained), fine-tuned on GDAS data, and
+    initialized from GFS/GDAS analysis rather than ERA5/HRES.
 
     GraphCast does not output a land surface skin temperature field; the
     closest available surface variable is ``temperature_2m``.  Readings are
