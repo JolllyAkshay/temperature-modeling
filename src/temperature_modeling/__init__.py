@@ -14,12 +14,15 @@ from .exceptions import (
 from .models import (
     Coordinates,
     ForecastPeriod,
+    ForecastSample,
     HourlyForecast,
+    LeadTimeSkill,
     Location,
     SatelliteObservation,
     TemperatureObservation,
     WeatherResult,
 )
+from .verification import collect_verification_records, score_by_lead
 
 __all__ = [
     "WeatherClient",
@@ -30,6 +33,10 @@ __all__ = [
     "ForecastPeriod",
     "HourlyForecast",
     "SatelliteObservation",
+    "ForecastSample",
+    "LeadTimeSkill",
+    "collect_verification_records",
+    "score_by_lead",
     "TemperatureModelingError",
     "GeocodingError",
     "LocationNotInPJMError",

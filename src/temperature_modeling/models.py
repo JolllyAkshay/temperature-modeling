@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 
@@ -50,6 +50,27 @@ class SatelliteObservation:
     surface_temp_c: float
     surface_temp_f: float
     source: str  # "Open-Meteo" or "NASA-POWER"
+
+
+@dataclass
+class ForecastSample:
+    """One forecast–observation pair from a historical GraphCast run."""
+    init_date: date       # date the model was initialized
+    valid_date: date      # date being verified
+    lead_days: int        # valid_date - init_date
+    forecast_temp_c: float   # GraphCast temperature_2m prediction (°C)
+    observed_temp_c: float   # ERA5 temperature_2m reanalysis truth (°C)
+    error_c: float           # forecast - observed; positive = warm bias
+
+
+@dataclass
+class LeadTimeSkill:
+    """Verification statistics aggregated for a single forecast lead time."""
+    lead_days: int
+    n: int          # number of samples
+    rmse: float     # root-mean-square error (°C)
+    mae: float      # mean absolute error (°C)
+    bias: float     # mean error; positive = model runs warm (°C)
 
 
 @dataclass

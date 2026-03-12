@@ -188,6 +188,28 @@ GRAPHCAST_RESPONSE = {
     }
 }
 
+# ERA5 reanalysis hourly temperature_2m — used as observational truth in
+# verification.  Slightly cooler than GraphCast to produce a realistic warm bias.
+_ERA5_T2M_C = [
+    -1.0, -1.3, -1.6, -1.8, -1.9, -1.8, -1.2, 0.4, 2.2, 3.7, 4.8, 5.2,
+     5.4,  5.1,  4.6,  3.9,  3.0,  2.1,  1.3, 0.7, 0.2,-0.2,-0.5,-0.9,
+]  # one representative day repeated for simplicity
+
+ERA5_T2M_RESPONSE = {
+    "hourly": {
+        "time": [
+            f"2026-02-{day:02d}T{h:02d}:00"
+            for day in range(1, 29)
+            for h in range(24)
+        ],
+        "temperature_2m": [
+            _ERA5_T2M_C[h % 24] + (day - 1) * 0.045
+            for day in range(1, 29)
+            for h in range(24)
+        ],
+    }
+}
+
 # NASA POWER daily Earth Skin Temp (TS) — 28 days
 NASA_POWER_RESPONSE = {
     "properties": {
@@ -226,8 +248,13 @@ def mock_session_get(url, **kwargs):
         return _make_response(NCEI_DATA_RESPONSE)
     if "historical-forecast-api.open-meteo" in url:
         return _make_response(GRAPHCAST_RESPONSE)
+    if "archive-api.open-meteo" in url:
+        params = kwargs.get("params", {})
+        if params.get("hourly") == "temperature_2m":
+            return _make_response(ERA5_T2M_RESPONSE)
+        return _make_response(OPEN_METEO_RESPONSE)  # skin_temperature
     if "open-meteo" in url:
-        # Distinguish GraphCast (models=gfs_graphcast025) from plain ERA5 requests.
+        # Live forecast endpoint — distinguish GraphCast from plain ERA5.
         params = kwargs.get("params", {})
         if params.get("models") == "gfs_graphcast025":
             return _make_response(GRAPHCAST_RESPONSE)
@@ -346,6 +373,32 @@ def main():
         print(f"  {obs.timestamp.strftime('%Y-%m-%d %H:%M'):<20} {obs.surface_temp_c:>13.2f} {obs.surface_temp_f:>13.2f}")
     if len(result_gc.satellite) > 12:
         print(f"  ... ({len(result_gc.satellite) - 12} more hourly readings)")
+
+    # ── Verification: forecast error by lead time ─────────────────────────────
+    from datetime import timedelta
+    from temperature_modeling import collect_verification_records, score_by_lead
+    from temperature_modeling.models import Coordinates
+
+    coords = Coordinates(lat=39.9612, lon=-82.9988)
+    # Use 5 initialization dates (Feb 1–5) so the demo is fast but informative.
+    init_dates = [date(2026, 2, 1) + timedelta(days=i) for i in range(5)]
+
+    with patch.object(client._session, "get", side_effect=mock_session_get):
+        records = collect_verification_records(coords, init_dates, client._session)
+
+    skill = score_by_lead(records)
+
+    print(f"\n{'─'*60}")
+    print(f"  GRAPHCAST VERIFICATION  ({len(records)} samples, {len(init_dates)} init dates)")
+    print(f"{'─'*60}")
+    print(f"  {'Lead':>4}  {'RMSE (°C)':>10}  {'MAE (°C)':>9}  {'Bias (°C)':>9}  {'n':>4}")
+    print(f"  {'────':>4}  {'──────────':>10}  {'─────────':>9}  {'─────────':>9}  {'──':>4}")
+    for s in skill:
+        marker = " ◄" if 10 <= s.lead_days <= 15 else ""
+        print(
+            f"  {s.lead_days:>4}  {s.rmse:>10.3f}  {s.mae:>9.3f}  {s.bias:>+9.3f}  {s.n:>4}{marker}"
+        )
+    print(f"\n  ◄ = target 10–15 day window")
 
     print()
 
