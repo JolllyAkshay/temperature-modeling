@@ -400,6 +400,43 @@ def main():
         )
     print(f"\n  ◄ = target 10–15 day window")
 
+    # ── Feature extraction ────────────────────────────────────────────────────
+    from temperature_modeling import build_climate_normals, extract_features
+
+    # Build 5-year ERA5 climatology anchored to the start of our eval period.
+    anchor = date(2026, 2, 1)
+    with patch.object(client._session, "get", side_effect=mock_session_get):
+        normals = build_climate_normals(coords, anchor, client._session)
+
+    vectors = extract_features(records, normals)
+
+    print(f"\n{'─'*60}")
+    print(f"  FEATURE EXTRACTION  ({len(vectors)} vectors, {len(set(v.lead_days for v in vectors))} lead days)")
+    print(f"{'─'*60}")
+
+    # Print one representative vector per target lead day (10 and 13).
+    for target_lead in (10, 13):
+        sample = next((v for v in vectors if int(v.lead_days) == target_lead), None)
+        if sample is None:
+            continue
+        print(f"\n  Lead day {target_lead}:")
+        print(f"    {'Feature':<24} {'Value':>10}")
+        print(f"    {'-'*24} {'-'*10}")
+        for name, val in [
+            ("lead_days",          sample.lead_days),
+            ("lead_days_sq",       sample.lead_days_sq),
+            ("forecast_temp_c",    sample.forecast_temp_c),
+            ("clim_mean_c",        sample.clim_mean_c),
+            ("forecast_anomaly_c", sample.forecast_anomaly_c),
+            ("clim_std_c",         sample.clim_std_c),
+            ("valid_sin_doy",      sample.valid_sin_doy),
+            ("valid_cos_doy",      sample.valid_cos_doy),
+            ("init_sin_doy",       sample.init_sin_doy),
+            ("init_cos_doy",       sample.init_cos_doy),
+            ("error_c  [target]",  sample.error_c),
+        ]:
+            print(f"    {name:<24} {val:>10.4f}")
+
     print()
 
 

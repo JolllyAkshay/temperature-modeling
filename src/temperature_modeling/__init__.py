@@ -23,6 +23,12 @@ from .models import (
     WeatherResult,
 )
 from .verification import collect_verification_records, score_by_lead
+from .features import (
+    ClimateNormals,
+    FeatureVector,
+    build_climate_normals,
+    extract_features,
+)
 
 __all__ = [
     "WeatherClient",
@@ -37,6 +43,10 @@ __all__ = [
     "LeadTimeSkill",
     "collect_verification_records",
     "score_by_lead",
+    "ClimateNormals",
+    "FeatureVector",
+    "build_climate_normals",
+    "extract_features",
     "TemperatureModelingError",
     "GeocodingError",
     "LocationNotInPJMError",

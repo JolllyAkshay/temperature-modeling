@@ -40,16 +40,16 @@ Typical usage
 
 import math
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Dict, List
 
 import requests
 
+from ._era5 import fetch_era5_daily, get_json, hourly_to_daily_mean
 from .exceptions import SatelliteAPIError
 from .models import Coordinates, ForecastSample, LeadTimeSkill
 
 _GC_HIST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
-_ERA5_URL = "https://archive-api.open-meteo.com/v1/archive"
 _GC_MODEL = "gfs_graphcast025"
 
 # GraphCast archive is available from this date onward via Open-Meteo.
@@ -182,8 +182,8 @@ def _fetch_gc_daily(
         "start_date": init_date.isoformat(),
         "end_date": (init_date + timedelta(days=max_lead_days)).isoformat(),
     }
-    data = _get_json(_GC_HIST_URL, params, session, "GraphCast verification")
-    return _hourly_to_daily_mean(data, "temperature_2m")
+    data = get_json(_GC_HIST_URL, params, session, "GraphCast verification")
+    return hourly_to_daily_mean(data, "temperature_2m")
 
 
 def _fetch_era5_daily(
@@ -192,57 +192,4 @@ def _fetch_era5_daily(
     end: date,
     session: requests.Session,
 ) -> Dict[date, float]:
-    """
-    Fetch ERA5 reanalysis temperature_2m for *start*–*end* and return
-    daily means keyed by date.
-    """
-    params = {
-        "latitude": coords.lat,
-        "longitude": coords.lon,
-        "hourly": "temperature_2m",
-        "timezone": "UTC",
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
-    }
-    data = _get_json(_ERA5_URL, params, session, "ERA5 verification")
-    return _hourly_to_daily_mean(data, "temperature_2m")
-
-
-def _get_json(
-    url: str,
-    params: dict,
-    session: requests.Session,
-    label: str,
-) -> dict:
-    try:
-        resp = session.get(url, params=params)
-    except requests.RequestException as exc:
-        raise SatelliteAPIError(f"{label} request failed: {exc}") from exc
-    if resp.status_code != 200:
-        raise SatelliteAPIError(
-            f"{label} returned HTTP {resp.status_code}: {resp.text[:200]}"
-        )
-    try:
-        return resp.json()
-    except ValueError as exc:
-        raise SatelliteAPIError(f"{label} JSON parse error: {exc}") from exc
-
-
-def _hourly_to_daily_mean(data: dict, variable: str) -> Dict[date, float]:
-    """Average hourly values into daily means, skipping None entries."""
-    try:
-        times = data["hourly"]["time"]
-        values = data["hourly"][variable]
-    except KeyError as exc:
-        raise SatelliteAPIError(
-            f"Unexpected response shape (missing {exc})"
-        ) from exc
-
-    daily: Dict[date, List[float]] = defaultdict(list)
-    for ts_str, val in zip(times, values):
-        if val is None:
-            continue
-        d = datetime.fromisoformat(ts_str).date()
-        daily[d].append(val)
-
-    return {d: sum(vals) / len(vals) for d, vals in daily.items()}
+    return fetch_era5_daily(coords, start, end, session)
