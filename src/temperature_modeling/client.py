@@ -10,6 +10,7 @@ from .nws import get_forecast_periods, get_gridpoint_metadata, get_hourly_foreca
 from .pjm import STATE_NAME_TO_ABBR, validate_pjm_state
 from . import open_meteo as _open_meteo
 from . import nasa_power as _nasa_power
+from . import graphcast as _graphcast
 
 _USER_AGENT = (
     "temperature-modeling-library/0.1.0 "
@@ -95,7 +96,9 @@ class WeatherClient:
             source. Requires both start_date and end_date.
         satellite_source:
             Which source to use for satellite data: ``"open-meteo"`` (default,
-            hourly ERA5/NWP, no auth) or ``"nasa-power"`` (daily MERRA-2, no auth).
+            hourly ERA5/NWP, no auth), ``"nasa-power"`` (daily MERRA-2, no auth),
+            or ``"graphcast"`` (hourly Google GraphCast 2m air temp, no auth;
+            available from 2024-02-05).
 
         Returns
         -------
@@ -112,7 +115,7 @@ class WeatherClient:
         NCEIAPIError / NCEIAuthError / NoStationFoundError
             NCEI API request failed.
         SatelliteAPIError
-            Open-Meteo or NASA POWER request failed.
+            Open-Meteo, NASA POWER, or GraphCast request failed.
         ValueError
             include_historical=True but ncei_token, start_date, or
             end_date is missing; or include_satellite=True but dates are missing;
@@ -134,10 +137,10 @@ class WeatherClient:
                 raise ValueError(
                     "Both start_date and end_date are required for satellite data."
                 )
-            if satellite_source not in ("open-meteo", "nasa-power"):
+            if satellite_source not in ("open-meteo", "nasa-power", "graphcast"):
                 raise ValueError(
                     f"Unknown satellite_source '{satellite_source}'. "
-                    "Choose 'open-meteo' or 'nasa-power'."
+                    "Choose 'open-meteo', 'nasa-power', or 'graphcast'."
                 )
 
         # Resolve location; for tuple inputs also fetch NWS metadata once so
@@ -170,8 +173,12 @@ class WeatherClient:
                 result.satellite = _open_meteo.get_surface_temperatures(
                     coords, start_date, end_date, self._session  # type: ignore[arg-type]
                 )
-            else:  # "nasa-power"
+            elif satellite_source == "nasa-power":
                 result.satellite = _nasa_power.get_surface_temperatures(
+                    coords, start_date, end_date, self._session  # type: ignore[arg-type]
+                )
+            else:  # "graphcast"
+                result.satellite = _graphcast.get_surface_temperatures(
                     coords, start_date, end_date, self._session  # type: ignore[arg-type]
                 )
 

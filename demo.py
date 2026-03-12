@@ -167,6 +167,27 @@ OPEN_METEO_RESPONSE = {
     }
 }
 
+# GraphCast (gfs_graphcast025) hourly 2m air temp — 28 days × 24 hours
+_GC_TEMPS_C = [
+    -0.8, -1.1, -1.4, -1.6, -1.7, -1.6, -1.0, 0.6, 2.4, 4.0, 5.1, 5.7,
+     5.9,  5.6,  5.0,  4.3,  3.4,  2.5,  1.7, 1.1, 0.6, 0.2, -0.2, -0.6,
+]  # one representative day repeated for simplicity
+
+GRAPHCAST_RESPONSE = {
+    "hourly": {
+        "time": [
+            f"2026-02-{day:02d}T{h:02d}:00"
+            for day in range(1, 29)
+            for h in range(24)
+        ],
+        "temperature_2m": [
+            _GC_TEMPS_C[h % 24] + (day - 1) * 0.06
+            for day in range(1, 29)
+            for h in range(24)
+        ],
+    }
+}
+
 # NASA POWER daily Earth Skin Temp (TS) — 28 days
 NASA_POWER_RESPONSE = {
     "properties": {
@@ -195,15 +216,21 @@ def mock_session_get(url, **kwargs):
         return _make_response(NOMINATIM_RESPONSE)
     if "/points/" in url:
         return _make_response(NWS_POINTS_RESPONSE)
-    if "forecast/hourly" in url:
+    if "weather.gov" in url and "forecast/hourly" in url:
         return _make_response(NWS_HOURLY_RESPONSE)
-    if "forecast" in url:
+    if "weather.gov" in url and "forecast" in url:
         return _make_response(NWS_FORECAST_RESPONSE)
     if "/stations" in url:
         return _make_response(NCEI_STATIONS_RESPONSE)
     if "ncei" in url or "noaa.gov/cdo-web" in url:
         return _make_response(NCEI_DATA_RESPONSE)
+    if "historical-forecast-api.open-meteo" in url:
+        return _make_response(GRAPHCAST_RESPONSE)
     if "open-meteo" in url:
+        # Distinguish GraphCast (models=gfs_graphcast025) from plain ERA5 requests.
+        params = kwargs.get("params", {})
+        if params.get("models") == "gfs_graphcast025":
+            return _make_response(GRAPHCAST_RESPONSE)
         return _make_response(OPEN_METEO_RESPONSE)
     if "power.larc.nasa.gov" in url:
         return _make_response(NASA_POWER_RESPONSE)
@@ -235,6 +262,15 @@ def main():
             include_historical=False,
             include_satellite=True,
             satellite_source="nasa-power",
+        )
+        result_gc = client.get_weather(
+            "Columbus, OH",
+            start_date=date(2026, 2, 1),
+            end_date=date(2026, 2, 28),
+            include_forecast=False,
+            include_historical=False,
+            include_satellite=True,
+            satellite_source="graphcast",
         )
 
     # ── Print results ────────────────────────────────────────────────────────
@@ -299,6 +335,17 @@ def main():
     print(f"  {'-'*12} {'-'*14} {'-'*14}")
     for obs in result_nasa.satellite:
         print(f"  {obs.timestamp.strftime('%Y-%m-%d'):<12} {obs.surface_temp_c:>14.2f} {obs.surface_temp_f:>14.2f}")
+
+    print(f"\n{'─'*60}")
+    src_gc = result_gc.satellite[0].source if result_gc.satellite else "n/a"
+    print(f"  GRAPHCAST 2M AIR TEMP  ({len(result_gc.satellite)} readings, source: {src_gc})")
+    print(f"{'─'*60}")
+    print(f"  {'Timestamp':<20} {'Temp 2m (°C)':>13} {'Temp 2m (°F)':>13}")
+    print(f"  {'-'*20} {'-'*13} {'-'*13}")
+    for obs in result_gc.satellite[:12]:  # first 12 hours
+        print(f"  {obs.timestamp.strftime('%Y-%m-%d %H:%M'):<20} {obs.surface_temp_c:>13.2f} {obs.surface_temp_f:>13.2f}")
+    if len(result_gc.satellite) > 12:
+        print(f"  ... ({len(result_gc.satellite) - 12} more hourly readings)")
 
     print()
 
