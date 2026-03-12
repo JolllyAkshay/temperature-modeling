@@ -25,9 +25,17 @@ from .models import (
 from .verification import collect_verification_records, score_by_lead
 from .features import (
     ClimateNormals,
+    FEATURE_FIELDS,
     FeatureVector,
     build_climate_normals,
     extract_features,
+)
+from .correction import (
+    CorrectionModel,
+    CorrectionResult,
+    ModelEvaluation,
+    train_correction_model,
+    train_and_evaluate,
 )
 
 __all__ = [
@@ -44,9 +52,15 @@ __all__ = [
     "collect_verification_records",
     "score_by_lead",
     "ClimateNormals",
+    "FEATURE_FIELDS",
     "FeatureVector",
     "build_climate_normals",
     "extract_features",
+    "CorrectionModel",
+    "CorrectionResult",
+    "ModelEvaluation",
+    "train_correction_model",
+    "train_and_evaluate",
     "TemperatureModelingError",
     "GeocodingError",
     "LocationNotInPJMError",

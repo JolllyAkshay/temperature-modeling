@@ -437,6 +437,62 @@ def main():
         ]:
             print(f"    {name:<24} {val:>10.4f}")
 
+    # ── Correction models ─────────────────────────────────────────────────────
+    from temperature_modeling import train_and_evaluate
+
+    MODEL_TYPES = ["mean_bias", "linear", "ridge", "random_forest", "xgboost"]
+
+    print(f"\n{'─'*60}")
+    print(f"  CORRECTION MODEL COMPARISON  (train/test split, 80/20)")
+    print(f"{'─'*60}")
+    print(
+        f"  {'Model':<16} {'Train n':>7} {'Test n':>7} "
+        f"{'Raw RMSE':>9} {'Corr RMSE':>10} {'Skill':>7}"
+    )
+    print(
+        f"  {'─'*16} {'───────':>7} {'───────':>7} "
+        f"{'─────────':>9} {'──────────':>10} {'───────':>7}"
+    )
+
+    best_model = None
+    best_eval = None
+
+    for mtype in MODEL_TYPES:
+        try:
+            model, ev = train_and_evaluate(vectors, model_type=mtype)
+            skill_pct = f"{ev.window_skill_score:+.1%}"
+            print(
+                f"  {ev.model_type:<16} {ev.n_train:>7} {ev.n_test:>7} "
+                f"{ev.window_raw_rmse:>9.3f} {ev.window_corrected_rmse:>10.3f} {skill_pct:>7}"
+            )
+            if best_eval is None or ev.window_corrected_rmse < best_eval.window_corrected_rmse:
+                best_model = model
+                best_eval = ev
+        except Exception as exc:
+            print(f"  {mtype:<16}  [skipped: {exc}]")
+
+    print(f"\n  ◄ Window = lead days 10–15 (target correction zone)")
+
+    # Per-lead breakdown for the best model.
+    if best_eval is not None:
+        print(f"\n{'─'*60}")
+        print(f"  PER-LEAD BREAKDOWN — best model: {best_eval.model_type}")
+        print(f"{'─'*60}")
+        print(f"  {'Lead':>4}  {'Raw RMSE':>9}  {'Corr RMSE':>10}  {'Δ RMSE':>8}  {'Skill':>7}")
+        print(f"  {'────':>4}  {'─────────':>9}  {'──────────':>10}  {'────────':>8}  {'───────':>7}")
+        all_leads = sorted(
+            set(best_eval.per_lead_raw_rmse) | set(best_eval.per_lead_corrected_rmse)
+        )
+        for ld in all_leads:
+            raw = best_eval.per_lead_raw_rmse.get(ld, float("nan"))
+            corr = best_eval.per_lead_corrected_rmse.get(ld, float("nan"))
+            delta = corr - raw
+            skill_ld = (1.0 - corr / raw) if raw else float("nan")
+            marker = " ◄" if 10 <= ld <= 15 else ""
+            print(
+                f"  {ld:>4}  {raw:>9.3f}  {corr:>10.3f}  {delta:>+8.3f}  {skill_ld:>+7.1%}{marker}"
+            )
+
     print()
 
 

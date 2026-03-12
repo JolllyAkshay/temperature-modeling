@@ -47,6 +47,21 @@ from .models import Coordinates, ForecastSample
 # Number of ERA5 years used to compute the climatological baseline.
 _DEFAULT_CLIM_YEARS = 5
 
+# Ordered list of FeatureVector predictor field names (excludes the target
+# ``error_c``).  Used by correction.py to build X matrices reproducibly.
+FEATURE_FIELDS: List[str] = [
+    "lead_days",
+    "lead_days_sq",
+    "valid_sin_doy",
+    "valid_cos_doy",
+    "init_sin_doy",
+    "init_cos_doy",
+    "forecast_temp_c",
+    "clim_mean_c",
+    "clim_std_c",
+    "forecast_anomaly_c",
+]
+
 
 @dataclass
 class FeatureVector:
