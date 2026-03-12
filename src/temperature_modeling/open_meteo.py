@@ -36,7 +36,7 @@ def get_surface_temperatures(
     Returns
     -------
     list[SatelliteObservation]
-        Hourly surface skin temperature readings (soil_temperature_0cm).
+        Hourly surface skin temperature readings (skin_temperature).
 
     Raises
     ------
@@ -60,7 +60,7 @@ def get_surface_temperatures(
             _fetch_chunk(coords, forecast_start, end_date, _FORECAST_URL, session)
         )
 
-    return observations
+    return sorted(observations, key=lambda o: o.timestamp)
 
 
 def _fetch_chunk(
@@ -74,7 +74,7 @@ def _fetch_chunk(
     params = {
         "latitude": coords.lat,
         "longitude": coords.lon,
-        "hourly": "soil_temperature_0cm",
+        "hourly": "skin_temperature",
         "timezone": "UTC",
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
@@ -93,7 +93,7 @@ def _fetch_chunk(
     try:
         data = response.json()
         times = data["hourly"]["time"]
-        temps_c = data["hourly"]["soil_temperature_0cm"]
+        temps_c = data["hourly"]["skin_temperature"]
     except (KeyError, ValueError) as exc:
         raise SatelliteAPIError(
             f"Unexpected Open-Meteo response shape: {exc}"

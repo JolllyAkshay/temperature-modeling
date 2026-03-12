@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import requests
 
@@ -6,13 +6,12 @@ from .exceptions import SatelliteAPIError
 from .models import Coordinates, SatelliteObservation
 
 _POWER_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
-_FILL_VALUE = -999.0  # NASA POWER sentinel for missing data
 
 
 def get_surface_temperatures(
     coords: Coordinates,
-    start_date,
-    end_date,
+    start_date: date,
+    end_date: date,
     session: requests.Session,
 ) -> list:
     """
@@ -66,7 +65,7 @@ def get_surface_temperatures(
 
     observations = []
     for date_str, temp_c in ts_data.items():
-        if temp_c is None or temp_c <= _FILL_VALUE:
+        if temp_c is None or temp_c < -990:
             continue
         # date_str format: "YYYYMMDD"
         ts = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=timezone.utc)

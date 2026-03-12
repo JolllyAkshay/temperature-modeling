@@ -146,7 +146,7 @@ NCEI_DATA_RESPONSE = {
     ]
 }
 
-# Open-Meteo hourly surface skin temp (soil_temperature_0cm) — 28 days × 24 hours
+# Open-Meteo hourly surface skin temp (skin_temperature) — 28 days × 24 hours
 _SKIN_TEMPS_C = [
     -1.2, -1.5, -1.8, -2.0, -2.1, -2.0, -1.4, 0.3, 2.1, 3.8, 4.9, 5.4,
      5.6,  5.3,  4.8,  4.1,  3.2,  2.3,  1.5, 0.9, 0.4, 0.0,-0.4,-0.8,
@@ -159,7 +159,7 @@ OPEN_METEO_RESPONSE = {
             for day in range(1, 29)
             for h in range(24)
         ],
-        "soil_temperature_0cm": [
+        "skin_temperature": [
             _SKIN_TEMPS_C[h % 24] + (day - 1) * 0.05
             for day in range(1, 29)
             for h in range(24)
@@ -207,8 +207,6 @@ def mock_session_get(url, **kwargs):
         return _make_response(OPEN_METEO_RESPONSE)
     if "power.larc.nasa.gov" in url:
         return _make_response(NASA_POWER_RESPONSE)
-    if "/data" in url:
-        return _make_response(NCEI_DATA_RESPONSE)
     raise ValueError(f"Unexpected URL in mock: {url}")
 
 
@@ -228,6 +226,15 @@ def main():
             end_date=date(2026, 2, 28),
             include_satellite=True,
             satellite_source="open-meteo",
+        )
+        result_nasa = client.get_weather(
+            "Columbus, OH",
+            start_date=date(2026, 2, 1),
+            end_date=date(2026, 2, 28),
+            include_forecast=False,
+            include_historical=False,
+            include_satellite=True,
+            satellite_source="nasa-power",
         )
 
     # ── Print results ────────────────────────────────────────────────────────
@@ -284,6 +291,14 @@ def main():
         print(f"  {obs.timestamp.strftime('%Y-%m-%d %H:%M'):<20} {obs.surface_temp_c:>14.2f} {obs.surface_temp_f:>14.2f}")
     if len(result.satellite) > 12:
         print(f"  ... ({len(result.satellite) - 12} more hourly readings)")
+
+    print(f"\n{'─'*60}")
+    print(f"  NASA POWER SURFACE TEMP  ({len(result_nasa.satellite)} daily readings)")
+    print(f"{'─'*60}")
+    print(f"  {'Date':<12} {'Skin Temp (°C)':>14} {'Skin Temp (°F)':>14}")
+    print(f"  {'-'*12} {'-'*14} {'-'*14}")
+    for obs in result_nasa.satellite:
+        print(f"  {obs.timestamp.strftime('%Y-%m-%d'):<12} {obs.surface_temp_c:>14.2f} {obs.surface_temp_f:>14.2f}")
 
     print()
 
