@@ -40,6 +40,26 @@ STATE_NAME_TO_ABBR: dict = {
 }
 
 
+# PJM grid monitoring locations with population-based load weights.
+# Weights are proportional to the metro-area population within each grid cell
+# and sum to 1.0. Used to compute a single population-weighted temperature
+# representative of the PJM footprint.
+PJM_LOAD_LOCATIONS: list[dict] = [
+    {"label": "Philadelphia PA", "lat": 40.0, "lon": -75.5, "weight": 0.14},
+    {"label": "Frederick MD",    "lat": 39.5, "lon": -77.5, "weight": 0.08},
+    {"label": "NE Pennsylvania", "lat": 41.0, "lon": -75.5, "weight": 0.06},
+    {"label": "Shenandoah VA",   "lat": 38.5, "lon": -78.5, "weight": 0.04},
+    {"label": "Roanoke VA",      "lat": 37.5, "lon": -80.0, "weight": 0.05},
+    {"label": "SW Virginia",     "lat": 36.5, "lon": -82.0, "weight": 0.03},
+    {"label": "E Kentucky",      "lat": 37.5, "lon": -84.5, "weight": 0.04},
+    {"label": "Columbus OH",     "lat": 40.0, "lon": -83.0, "weight": 0.12},
+    {"label": "Toledo OH",       "lat": 41.5, "lon": -83.5, "weight": 0.06},
+    {"label": "Indianapolis IN", "lat": 39.5, "lon": -86.5, "weight": 0.10},
+    {"label": "Charlotte NC",    "lat": 35.0, "lon": -80.5, "weight": 0.09},
+    {"label": "Pittsburgh PA",   "lat": 40.5, "lon": -80.0, "weight": 0.09},
+]
+
+
 def validate_pjm_state(state: str) -> None:
     """
     Raise LocationNotInPJMError if state is not in PJM territory.

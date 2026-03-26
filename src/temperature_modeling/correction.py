@@ -40,10 +40,16 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
-from .features import FEATURE_FIELDS, FeatureVector
+from .features import FEATURE_FIELDS, FEATURE_FIELDS_SAT, FeatureVector
 
 # Lead-time window of primary interest.
 _WINDOW = range(10, 16)  # days 10–15 inclusive
+
+# Lead-time bands for per-band model training.
+# Each band gets its own XGBoost model so hyper-parameters can specialise
+# for short-lead (high signal) vs long-lead (high noise) regimes.
+# Finer 3-day bands give each model a more homogeneous error structure.
+LEAD_BANDS = [(1, 3), (4, 6), (7, 9), (10, 12), (13, 15)]
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -87,13 +93,14 @@ class CorrectionModel:
     :func:`train_and_evaluate`.
     """
 
-    def __init__(self, estimator, model_type: str) -> None:
+    def __init__(self, estimator, model_type: str, feature_fields: List[str] = None) -> None:
         self._est = estimator
         self.model_type = model_type
+        self._feature_fields = feature_fields or FEATURE_FIELDS
 
     def predict_errors(self, vectors: List[FeatureVector]) -> List[float]:
         """Return predicted error_c for each vector."""
-        X = _to_matrix(vectors)
+        X = _to_matrix(vectors, self._feature_fields)
         return list(self._est.predict(X))
 
     def correct(self, vectors: List[FeatureVector]) -> List[float]:
@@ -110,6 +117,7 @@ class CorrectionModel:
 def train_correction_model(
     vectors: List[FeatureVector],
     model_type: str = "xgboost",
+    feature_fields: List[str] = None,
 ) -> "CorrectionModel":
     """
     Fit a correction model on *all* supplied vectors.
@@ -121,22 +129,28 @@ def train_correction_model(
     model_type:
         One of ``"mean_bias"``, ``"linear"``, ``"ridge"``,
         ``"random_forest"``, ``"xgboost"``.
+    feature_fields:
+        Ordered list of FeatureVector field names to use as predictors.
+        Defaults to ``FEATURE_FIELDS``; pass ``FEATURE_FIELDS_SAT`` to
+        include satellite surface-state features.
 
     Returns
     -------
     CorrectionModel
     """
+    fields = feature_fields or FEATURE_FIELDS
     estimator = _build_estimator(model_type)
-    X = _to_matrix(vectors)
+    X = _to_matrix(vectors, fields)
     y = [v.error_c for v in vectors]
     estimator.fit(X, y)
-    return CorrectionModel(estimator, model_type)
+    return CorrectionModel(estimator, model_type, fields)
 
 
 def train_and_evaluate(
     vectors: List[FeatureVector],
     model_type: str = "xgboost",
     test_fraction: float = 0.2,
+    feature_fields: List[str] = None,
 ) -> Tuple["CorrectionModel", ModelEvaluation]:
     """
     Chronological train/test split, fit, and evaluate.
@@ -172,7 +186,7 @@ def train_and_evaluate(
     if not test_vecs:
         raise ValueError("test_fraction too small; test set is empty")
 
-    model = train_correction_model(train_vecs, model_type)
+    model = train_correction_model(train_vecs, model_type, feature_fields)
 
     # Evaluate on hold-out set.
     pred_errors = model.predict_errors(test_vecs)
@@ -192,12 +206,103 @@ def train_and_evaluate(
     return model, evaluation
 
 
+def train_and_evaluate_banded(
+    vectors: List[FeatureVector],
+    model_type: str = "xgboost",
+    test_fraction: float = 0.2,
+    feature_fields: List[str] = None,
+    lead_bands: List[Tuple[int, int]] = None,
+) -> Tuple[None, "ModelEvaluation"]:
+    """
+    Train one model per lead-time band and return a combined evaluation.
+
+    Each band ``(low, high)`` gets its own independently fitted model so
+    that XGBoost can specialise: short-lead models learn high-signal,
+    low-variance corrections; long-lead models focus on regime/teleconnection
+    patterns where the marginal predictors (z500, MJO) matter most.
+
+    The chronological 80/20 split is applied independently within each band
+    so test dates are consistent across bands.
+
+    Parameters
+    ----------
+    vectors:
+        Chronologically sorted feature vectors (all lead times mixed).
+    model_type, test_fraction, feature_fields:
+        Same as :func:`train_and_evaluate`.
+    lead_bands:
+        List of ``(low, high)`` inclusive lead-day ranges.
+        Defaults to ``[(1, 5), (6, 10), (11, 15)]``.
+
+    Returns
+    -------
+    tuple[None, ModelEvaluation]
+        The first element is ``None`` because inference requires routing
+        each sample to the correct band model; use :func:`train_and_evaluate`
+        when you need a single deployable model.
+    """
+    if lead_bands is None:
+        lead_bands = LEAD_BANDS
+
+    all_test_results: List[CorrectionResult] = []
+    total_train = 0
+
+    for band_idx, (low, high) in enumerate(lead_bands):
+        band = [v for v in vectors if low <= int(v.lead_days) <= high]
+        if len(band) < 10:
+            continue
+        split = max(1, int(len(band) * (1 - test_fraction)))
+        train_vecs, test_vecs = band[:split], band[split:]
+        if not test_vecs:
+            continue
+
+        # Regularisation tightens progressively as lead increases.
+        _BAND_OVERRIDES = [
+            {"max_depth": 5, "reg_lambda": 0.5, "min_child_weight": 2},  # [1-3]
+            {"max_depth": 5, "reg_lambda": 1.0, "min_child_weight": 3},  # [4-6]
+            {"max_depth": 4, "reg_lambda": 2.0, "min_child_weight": 5},  # [7-9]
+            {"max_depth": 3, "reg_lambda": 3.0, "min_child_weight": 6},  # [10-12]
+            {"max_depth": 3, "reg_lambda": 4.0, "min_child_weight": 8},  # [13-15]
+        ]
+        band_model = _build_estimator_with_overrides(
+            model_type, _BAND_OVERRIDES[band_idx] if band_idx < len(_BAND_OVERRIDES) else {}
+        )
+        fields = feature_fields or FEATURE_FIELDS
+        X_train = _to_matrix(train_vecs, fields)
+        y_train = [v.error_c for v in train_vecs]
+        band_model.fit(X_train, y_train)
+        band_model = CorrectionModel(band_model, model_type, fields)
+        pred_errors = band_model.predict_errors(test_vecs)
+        total_train += len(train_vecs)
+
+        for v, pred_err in zip(test_vecs, pred_errors):
+            all_test_results.append(
+                CorrectionResult(
+                    lead_days=int(v.lead_days),
+                    raw_forecast_c=v.forecast_temp_c,
+                    corrected_forecast_c=v.forecast_temp_c - pred_err,
+                    observed_c=v.forecast_temp_c - v.error_c,
+                    raw_error_c=v.error_c,
+                    corrected_error_c=v.error_c - pred_err,
+                )
+            )
+
+    if not all_test_results:
+        raise ValueError("No band had enough samples to evaluate.")
+
+    evaluation = _compute_evaluation(
+        model_type + "_banded", total_train, all_test_results
+    )
+    return None, evaluation
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _to_matrix(vectors: List[FeatureVector]):
+def _to_matrix(vectors: List[FeatureVector], feature_fields: List[str] = None):
     """Convert FeatureVectors to a 2-D list (or numpy array if available)."""
+    fields = feature_fields or FEATURE_FIELDS
     rows = [
-        [getattr(v, f) for f in FEATURE_FIELDS]
+        [getattr(v, f) for f in fields]
         for v in vectors
     ]
     try:
@@ -233,6 +338,8 @@ def _build_estimator(model_type: str):
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
+            reg_lambda=2.0,   # L2 regularisation — reduces overfitting on small bands
+            min_child_weight=5,
             random_state=42,
             verbosity=0,
         )
@@ -240,6 +347,26 @@ def _build_estimator(model_type: str):
         f"Unknown model_type {model_type!r}. "
         "Choose from: mean_bias, linear, ridge, random_forest, xgboost"
     )
+
+
+def _build_estimator_with_overrides(model_type: str, overrides: dict):
+    """Build an estimator and apply hyperparameter overrides (XGBoost only)."""
+    if model_type == "xgboost" and overrides:
+        from xgboost import XGBRegressor
+        base_params = dict(
+            n_estimators=300,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=2.0,
+            min_child_weight=5,
+            random_state=42,
+            verbosity=0,
+        )
+        base_params.update(overrides)
+        return XGBRegressor(**base_params)
+    return _build_estimator(model_type)
 
 
 def _rmse(errors: List[float]) -> float:
