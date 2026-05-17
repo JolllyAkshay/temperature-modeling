@@ -1,6 +1,15 @@
-# Temperature Modeling
+---
+title: Grid Load & Price Dashboard
+emoji: ⚡
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+pinned: false
+---
 
-A Python library for temperature modeling.
+# Grid Load & Price Dashboard
+
+15-day electricity load forecast and day-ahead price analysis for PJM and CAISO ISO territories.
 
 ## Installation
 

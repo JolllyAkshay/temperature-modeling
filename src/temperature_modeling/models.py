@@ -113,8 +113,10 @@ class LoadObservation:
     day_of_week: int        # 0=Monday … 6=Sunday
     is_holiday: bool        # US federal holiday
     day_of_year: int
-    temp_lag1_f: Optional[float] = None   # yesterday's avg temp (°F)
-    temp_lag2_f: Optional[float] = None   # 2 days ago avg temp (°F)
+    temp_lag1_f: Optional[float] = None    # yesterday's avg temp (°F)
+    temp_lag2_f: Optional[float] = None    # 2 days ago avg temp (°F)
+    temp_lag7_f: Optional[float] = None    # same weekday last week avg temp (°F)
+    rolling7_avg_f: Optional[float] = None # 7-day trailing avg temp (°F)
 
 
 @dataclass
