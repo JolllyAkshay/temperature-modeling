@@ -42,153 +42,29 @@ from temperature_modeling.caiso_load import (
     fetch_caiso_official_comparison, fetch_caiso_oasis_7day,
     weighted_avg_temp_f_caiso, _CAISO_MODEL_PATH,
 )
+from temperature_modeling.ercot import ERCOT_LOAD_LOCATIONS
+from temperature_modeling.ercot_load import (
+    ERCOTLoadModel, load_ercot_model,
+    fetch_ercot_official_comparison, fetch_ercot_7day,
+    weighted_avg_temp_f_ercot,
+)
+from temperature_modeling.miso import MISO_LOAD_LOCATIONS
+from temperature_modeling.miso_load import (
+    MISOLoadModel, load_miso_model,
+    fetch_miso_official_comparison, fetch_miso_7day,
+    weighted_avg_temp_f_miso,
+)
 
 FORECAST_CACHE_TTL_HOURS = 3
-_PRICE_CACHE_TTL_HOURS   = 6
 
-_LOAD_FORECAST_CACHE_FILE  = _HERE / "api_cache" / "load_forecast_cache.json"
-_LOAD_TRAINING_DATA_PATH   = _HERE / "api_cache" / "pjm_load_training.json"
-_CAISO_FORECAST_CACHE_FILE = _HERE / "api_cache" / "caiso_forecast_cache.json"
-_CAISO_TRAINING_DATA_PATH  = _HERE / "api_cache" / "caiso_load_training.json"
-_PJM_PRICE_CACHE           = _HERE / "api_cache" / "pjm_price_cache.json"
-_CAISO_PRICE_CACHE         = _HERE / "api_cache" / "caiso_price_cache.json"
-
-
-# ---------------------------------------------------------------------------
-# Price helpers
-# ---------------------------------------------------------------------------
-def _fetch_pjm_prices(session):
-    """PJM day-ahead system energy prices from DataMiner → {date_str: avg $/MWh}."""
-    if _PJM_PRICE_CACHE.exists():
-        if (time.time() - _PJM_PRICE_CACHE.stat().st_mtime) / 3600 < _PRICE_CACHE_TTL_HOURS:
-            try:
-                return json.loads(_PJM_PRICE_CACHE.read_text())
-            except Exception:
-                pass
-    key = os.environ.get("PJM_API_KEY", "")
-    if not key:
-        return {}
-    end_dt   = date.today()
-    start_dt = end_dt - timedelta(days=60)
-    try:
-        r = session.get(
-            "https://api.pjm.com/api/v1/da_hrl_lmps",
-            headers={"Ocp-Apim-Subscription-Key": key},
-            params={
-                "startRow": 1, "rowCount": 50000,
-                "fields": "datetime_beginning_ept,system_energy_price_da",
-                "datetime_beginning_ept": f"{start_dt} 00:00 to {end_dt} 23:00",
-                "type": "ZONE",
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        # system_energy_price_da is the same across all zones per hour — deduplicate by hour
-        seen_hours: set = set()
-        hourly: dict = {}
-        for item in r.json().get("items", []):
-            hr = str(item.get("datetime_beginning_ept", ""))
-            p  = item.get("system_energy_price_da")
-            if hr and p is not None and hr not in seen_hours:
-                seen_hours.add(hr)
-                d = hr[:10]
-                hourly.setdefault(d, []).append(float(p))
-        result = {d: round(sum(v) / len(v), 2) for d, v in hourly.items() if v}
-        _PJM_PRICE_CACHE.write_text(json.dumps(result))
-        return result
-    except Exception:
-        try:
-            return json.loads(_PJM_PRICE_CACHE.read_text())
-        except Exception:
-            return {}
-
-
-def _fetch_caiso_prices(session):
-    """CAISO day-ahead LMPs (SP15 hub) from OASIS → {date_str: avg $/MWh}."""
-    if _CAISO_PRICE_CACHE.exists():
-        if (time.time() - _CAISO_PRICE_CACHE.stat().st_mtime) / 3600 < _PRICE_CACHE_TTL_HOURS:
-            try:
-                return json.loads(_CAISO_PRICE_CACHE.read_text())
-            except Exception:
-                pass
-    import zipfile, io, xml.etree.ElementTree as _ET
-    end_dt   = date.today()
-    start_dt = end_dt - timedelta(days=31)   # CAISO OASIS max 31 days per query
-    try:
-        r = session.get(
-            "http://oasis.caiso.com/oasisapi/SingleZip",
-            params={
-                "queryname":     "PRC_LMP",
-                "startdatetime": start_dt.strftime("%Y%m%dT07:00-0000"),
-                "enddatetime":   end_dt.strftime("%Y%m%dT07:00-0000"),
-                "version":       1,
-                "market_run_id": "DAM",
-                "node":          "TH_SP15_GEN-APND",
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        daily: dict = {}
-        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-            fname = next((n for n in zf.namelist() if n.endswith(".xml")), zf.namelist()[0])
-            with zf.open(fname) as f:
-                root = _ET.parse(f).getroot()
-                for rd in root.iter():
-                    if not rd.tag.endswith("REPORT_DATA"):
-                        continue
-                    d_el = next((c for c in rd if c.tag.endswith("OPR_DATE")), None)
-                    v_el = next((c for c in rd if c.tag.endswith("VALUE")), None)
-                    if d_el is not None and v_el is not None and d_el.text and v_el.text:
-                        try:
-                            daily.setdefault(d_el.text, []).append(float(v_el.text))
-                        except (ValueError, TypeError):
-                            pass
-        result = {d: round(sum(v) / len(v), 2) for d, v in daily.items() if v}
-        _CAISO_PRICE_CACHE.write_text(json.dumps(result))
-        return result
-    except Exception:
-        try:
-            return json.loads(_CAISO_PRICE_CACHE.read_text())
-        except Exception:
-            return {}
-
-
-def _caiso_solar_gw(date_str: str) -> float:
-    """Seasonal solar generation estimate for CAISO.
-    ~47 GW installed (utility + rooftop); daily capacity factor 18–28%, peak near summer solstice."""
-    import math
-    from datetime import date as _date
-    doy = _date.fromisoformat(date_str).timetuple().tm_yday
-    cf  = 0.23 + 0.05 * math.cos(2 * math.pi * (doy - 172) / 365)
-    return round(47.0 * cf, 2)
-
-
-def _price_regression(price_dict, load_dict, solar_fn=None):
-    """OLS: price = slope * net_load + intercept.
-    solar_fn(date_str) → GW subtracted from gross load before regression (CAISO only).
-    Returns (slope, intercept, sigma, r2) or (None,)*4."""
-    pairs = [(load_dict[d], price_dict[d]) for d in price_dict if d in load_dict]
-    if len(pairs) < 10:
-        return None, None, None, None
-    if solar_fn is not None:
-        net_loads = [load_dict[d] - solar_fn(d) for d in price_dict if d in load_dict]
-    else:
-        net_loads = [p[0] for p in pairs]
-    prices = [p[1] for p in pairs]
-    n      = len(net_loads)
-    ml, mp = sum(net_loads) / n, sum(prices) / n
-    num    = sum((l - ml) * (p - mp) for l, p in zip(net_loads, prices))
-    den    = sum((l - ml) ** 2 for l in net_loads)
-    if den == 0:
-        return None, None, None, None
-    slope     = num / den
-    intercept = mp - slope * ml
-    residuals = [p - (slope * l + intercept) for l, p in zip(net_loads, prices)]
-    ss_res    = sum(r ** 2 for r in residuals)
-    ss_tot    = sum((p - mp) ** 2 for p in prices)
-    sigma     = (ss_res / max(n - 2, 1)) ** 0.5
-    r2        = round(1 - ss_res / ss_tot, 3) if ss_tot > 0 else 0.0
-    return round(slope, 4), round(intercept, 4), round(sigma, 4), r2
+_LOAD_FORECAST_CACHE_FILE   = _HERE / "api_cache" / "load_forecast_cache.json"
+_LOAD_TRAINING_DATA_PATH    = _HERE / "api_cache" / "pjm_load_training.json"
+_CAISO_FORECAST_CACHE_FILE  = _HERE / "api_cache" / "caiso_forecast_cache.json"
+_CAISO_TRAINING_DATA_PATH   = _HERE / "api_cache" / "caiso_load_training.json"
+_ERCOT_FORECAST_CACHE_FILE  = _HERE / "api_cache" / "ercot_forecast_cache.json"
+_ERCOT_TRAINING_DATA_PATH   = _HERE / "api_cache" / "ercot_load_training.json"
+_MISO_FORECAST_CACHE_FILE   = _HERE / "api_cache" / "miso_forecast_cache.json"
+_MISO_TRAINING_DATA_PATH    = _HERE / "api_cache" / "miso_load_training.json"
 
 # ---------------------------------------------------------------------------
 # Load models at startup
@@ -206,6 +82,20 @@ try:
     print("  CAISO load model loaded OK")
 except Exception as e:
     print(f"  Warning: could not load CAISO load model: {e}")
+
+_ERCOT_MODEL: ERCOTLoadModel | None = None
+try:
+    _ERCOT_MODEL = load_ercot_model()
+    print("  ERCOT load model loaded OK")
+except Exception as e:
+    print(f"  Warning: could not load ERCOT load model: {e}")
+
+_MISO_MODEL: MISOLoadModel | None = None
+try:
+    _MISO_MODEL = load_miso_model()
+    print("  MISO load model loaded OK")
+except Exception as e:
+    print(f"  Warning: could not load MISO load model: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +147,46 @@ _DC_PROJECTS = {
         {"id": "qts_richmond",    "name": "QTS Richmond Campus",
          "operator": "QTS / Blackstone",        "location": "Richmond, CA",
          "mw": 180,  "status": "Under Construction"},
+    ],
+    "ercot": [
+        {"id": "msft_abilene",    "name": "Microsoft Abilene AI Campus",
+         "operator": "Microsoft",               "location": "Abilene, TX",
+         "mw": 800,  "status": "Under Construction"},
+        {"id": "meta_fw",         "name": "Meta Fort Worth Campus",
+         "operator": "Meta",                    "location": "Fort Worth, TX",
+         "mw": 700,  "status": "Approved"},
+        {"id": "tiktok_temple",   "name": "TikTok Temple Data Center",
+         "operator": "ByteDance / TikTok",      "location": "Temple, TX",
+         "mw": 1200, "status": "Announced"},
+        {"id": "google_rich",     "name": "Google Richardson Campus",
+         "operator": "Google",                  "location": "Richardson, TX",
+         "mw": 300,  "status": "Announced"},
+        {"id": "qts_irving",      "name": "QTS Irving Campus",
+         "operator": "QTS / Blackstone",        "location": "Irving, TX",
+         "mw": 500,  "status": "Operating / Expanding"},
+        {"id": "amazon_sa",       "name": "Amazon AWS San Antonio",
+         "operator": "Amazon",                  "location": "San Antonio, TX",
+         "mw": 400,  "status": "Operating / Expanding"},
+    ],
+    "miso": [
+        {"id": "msft_racine",     "name": "Microsoft Racine County Campus",
+         "operator": "Microsoft",               "location": "Racine County, WI",
+         "mw": 500,  "status": "Under Construction"},
+        {"id": "google_cb",       "name": "Google Council Bluffs Campus",
+         "operator": "Google",                  "location": "Council Bluffs, IA",
+         "mw": 600,  "status": "Operating / Expanding"},
+        {"id": "amazon_dmi",      "name": "Amazon AWS Des Moines",
+         "operator": "Amazon",                  "location": "Des Moines, IA",
+         "mw": 250,  "status": "Operating"},
+        {"id": "msft_chicago",    "name": "Microsoft Chicago Campus",
+         "operator": "Microsoft",               "location": "Chicago, IL",
+         "mw": 300,  "status": "Announced"},
+        {"id": "meta_dekalb_il",  "name": "Meta DeKalb Illinois Campus",
+         "operator": "Meta",                    "location": "DeKalb, IL",
+         "mw": 800,  "status": "Approved"},
+        {"id": "switch_mpls",     "name": "Switch Minneapolis Campus",
+         "operator": "Switch",                  "location": "Minneapolis, MN",
+         "mw": 150,  "status": "Operating / Expanding"},
     ],
 }
 
@@ -413,18 +343,9 @@ def fetch_pjm_load_forecast(force=False):
         backtest = run_load_backtest(_LOAD_MODEL, str(_LOAD_TRAINING_DATA_PATH))
     except Exception:
         backtest = {}
-    try:
-        prices = _fetch_pjm_prices(session)
-    except Exception:
-        prices = {}
-    actual_gw = comparison.get("actual", {})
-    p_slope, p_intercept, p_sigma, p_r2 = _price_regression(prices, actual_gw)
-
     result = {"load": load_data, "dates": forecast_dates_strs,
               "comparison": comparison, "pjm_7day": pjm_7day,
-              "backtest": backtest, "hindcast": hindcast,
-              "prices": prices,
-              "price_model": {"slope": p_slope, "intercept": p_intercept, "sigma": p_sigma, "r2": p_r2}}
+              "backtest": backtest, "hindcast": hindcast}
     _LOAD_FORECAST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _LOAD_FORECAST_CACHE_FILE.write_text(json.dumps(result))
     return result
@@ -553,22 +474,273 @@ def fetch_caiso_load_forecast(force=False):
         backtest = run_load_backtest(_CAISO_MODEL, str(_CAISO_TRAINING_DATA_PATH))
     except Exception:
         backtest = {}
-    try:
-        prices = _fetch_caiso_prices(session)
-    except Exception:
-        prices = {}
-    actual_gw = comparison.get("actual", {})
-    p_slope, p_intercept, p_sigma, p_r2 = _price_regression(
-        prices, actual_gw, solar_fn=_caiso_solar_gw)
-
     result = {"load": load_data, "dates": forecast_dates_strs,
               "comparison": comparison, "oasis_7day": oasis_7day,
-              "backtest": backtest, "hindcast": hindcast,
-              "prices": prices,
-              "price_model": {"slope": p_slope, "intercept": p_intercept,
-                              "sigma": p_sigma, "r2": p_r2, "use_solar": True}}
+              "backtest": backtest, "hindcast": hindcast}
     _CAISO_FORECAST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _CAISO_FORECAST_CACHE_FILE.write_text(json.dumps(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ERCOT load forecast
+# ---------------------------------------------------------------------------
+def fetch_ercot_load_forecast(force=False):
+    if _ERCOT_MODEL is None:
+        return {}
+
+    if not force and _ERCOT_FORECAST_CACHE_FILE.exists():
+        age_h = (time.time() - _ERCOT_FORECAST_CACHE_FILE.stat().st_mtime) / 3600
+        if age_h < FORECAST_CACHE_TTL_HOURS:
+            try:
+                cached = json.loads(_ERCOT_FORECAST_CACHE_FILE.read_text())
+                if isinstance(cached, dict) and cached.get("load"):
+                    if cached["load"][0]["date"] == date.today().isoformat():
+                        return cached
+            except Exception:
+                pass
+
+    session = requests.Session()
+    session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
+
+    ercot_avg_c: dict = {}
+    ercot_hi_c:  dict = {}
+    ercot_lo_c:  dict = {}
+    forecast_dates_strs = None
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(_fetch_one, loc["label"], loc["lat"], loc["lon"], session): loc
+                for loc in ERCOT_LOAD_LOCATIONS}
+        for fut in as_completed(futs):
+            res = fut.result()
+            if not res:
+                continue
+            label = res["label"]
+            def f_to_c(lst):
+                return [(v - 32) * 5 / 9 if v is not None else None for v in lst]
+            hi_c  = f_to_c(res["hi"])
+            lo_c  = f_to_c(res["lo"])
+            avg_c = [(h + l) / 2 if h and l else None for h, l in zip(hi_c, lo_c)]
+            ercot_avg_c[label] = avg_c
+            ercot_hi_c[label]  = hi_c
+            ercot_lo_c[label]  = lo_c
+            if forecast_dates_strs is None:
+                forecast_dates_strs = res["dates"][:15]
+
+    if not ercot_avg_c or not forecast_dates_strs:
+        return {}
+
+    forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
+
+    from temperature_modeling._era5 import fetch_era5_daily
+    from temperature_modeling.pjm_load import _build_features as _bf
+    from temperature_modeling.models import Coordinates as _C
+
+    era5_session = requests.Session()
+    era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
+    today = date.today()
+    era5_avg_hist: dict = {}
+    recent_avg_f = []
+    try:
+        per_label = {}
+        for loc in ERCOT_LOAD_LOCATIONS:
+            per_label[loc["label"]] = fetch_era5_daily(
+                _C(loc["lat"], loc["lon"]), today - timedelta(days=16),
+                today - timedelta(days=1), era5_session,
+            )
+        era5_avg_hist = per_label
+        for lag_d in sorted([today - timedelta(days=k) for k in range(8, 0, -1)]):
+            c_map = {loc["label"]: per_label[loc["label"]][lag_d]
+                     for loc in ERCOT_LOAD_LOCATIONS
+                     if lag_d in per_label.get(loc["label"], {})}
+            if c_map:
+                recent_avg_f.append(weighted_avg_temp_f_ercot(c_map))
+    except Exception:
+        recent_avg_f = []
+
+    hindcast: dict = {}
+    if era5_avg_hist:
+        try:
+            avg_f_hist: dict = {}
+            for off in range(16):
+                d2 = today - timedelta(days=off + 1)
+                c_map = {loc["label"]: era5_avg_hist[loc["label"]][d2]
+                         for loc in ERCOT_LOAD_LOCATIONS
+                         if d2 in era5_avg_hist.get(loc["label"], {})}
+                if c_map:
+                    avg_f_hist[d2] = weighted_avg_temp_f_ercot(c_map)
+            for d2, avg_f in avg_f_hist.items():
+                lag1 = avg_f_hist.get(d2 - timedelta(days=1))
+                lag2 = avg_f_hist.get(d2 - timedelta(days=2))
+                lag7 = avg_f_hist.get(d2 - timedelta(days=7))
+                rv = [avg_f_hist.get(d2 - timedelta(days=k)) for k in range(7)]
+                roll7 = sum(v for v in rv if v) / max(sum(1 for v in rv if v), 1)
+                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7)
+                hindcast[d2.isoformat()] = round(_ERCOT_MODEL.predict([feats])[0] / 1000, 2)
+        except Exception:
+            hindcast = {}
+
+    load_forecasts = _ERCOT_MODEL.predict_with_uncertainty(
+        forecast_temps_c=ercot_avg_c, forecast_hi_c=ercot_hi_c, forecast_lo_c=ercot_lo_c,
+        gefs_spread_c={}, forecast_dates=forecast_dates_list,
+        recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
+    )
+
+    load_data = [{"date": lf.valid_date.isoformat(),
+                  "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
+                  "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
+                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
+                 for lf in load_forecasts]
+
+    try:
+        comparison = fetch_ercot_official_comparison(session)
+    except Exception:
+        comparison = {"actual": {}, "da_fcst": {}}
+    try:
+        ercot_7day_data = fetch_ercot_7day(session)
+    except Exception:
+        ercot_7day_data = {}
+    try:
+        backtest = run_load_backtest(_ERCOT_MODEL, str(_ERCOT_TRAINING_DATA_PATH))
+    except Exception:
+        backtest = {}
+
+    result = {"load": load_data, "dates": forecast_dates_strs,
+              "comparison": comparison, "ercot_7day": ercot_7day_data,
+              "backtest": backtest, "hindcast": hindcast}
+    _ERCOT_FORECAST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _ERCOT_FORECAST_CACHE_FILE.write_text(json.dumps(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# MISO load forecast
+# ---------------------------------------------------------------------------
+def fetch_miso_load_forecast(force=False):
+    if _MISO_MODEL is None:
+        return {}
+
+    if not force and _MISO_FORECAST_CACHE_FILE.exists():
+        age_h = (time.time() - _MISO_FORECAST_CACHE_FILE.stat().st_mtime) / 3600
+        if age_h < FORECAST_CACHE_TTL_HOURS:
+            try:
+                cached = json.loads(_MISO_FORECAST_CACHE_FILE.read_text())
+                if isinstance(cached, dict) and cached.get("load"):
+                    if cached["load"][0]["date"] == date.today().isoformat():
+                        return cached
+            except Exception:
+                pass
+
+    session = requests.Session()
+    session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
+
+    miso_avg_c: dict = {}
+    miso_hi_c:  dict = {}
+    miso_lo_c:  dict = {}
+    forecast_dates_strs = None
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(_fetch_one, loc["label"], loc["lat"], loc["lon"], session): loc
+                for loc in MISO_LOAD_LOCATIONS}
+        for fut in as_completed(futs):
+            res = fut.result()
+            if not res:
+                continue
+            label = res["label"]
+            def f_to_c(lst):
+                return [(v - 32) * 5 / 9 if v is not None else None for v in lst]
+            hi_c  = f_to_c(res["hi"])
+            lo_c  = f_to_c(res["lo"])
+            avg_c = [(h + l) / 2 if h and l else None for h, l in zip(hi_c, lo_c)]
+            miso_avg_c[label] = avg_c
+            miso_hi_c[label]  = hi_c
+            miso_lo_c[label]  = lo_c
+            if forecast_dates_strs is None:
+                forecast_dates_strs = res["dates"][:15]
+
+    if not miso_avg_c or not forecast_dates_strs:
+        return {}
+
+    forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
+
+    from temperature_modeling._era5 import fetch_era5_daily
+    from temperature_modeling.pjm_load import _build_features as _bf
+    from temperature_modeling.models import Coordinates as _C
+
+    era5_session = requests.Session()
+    era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
+    today = date.today()
+    era5_avg_hist: dict = {}
+    recent_avg_f = []
+    try:
+        per_label = {}
+        for loc in MISO_LOAD_LOCATIONS:
+            per_label[loc["label"]] = fetch_era5_daily(
+                _C(loc["lat"], loc["lon"]), today - timedelta(days=16),
+                today - timedelta(days=1), era5_session,
+            )
+        era5_avg_hist = per_label
+        for lag_d in sorted([today - timedelta(days=k) for k in range(8, 0, -1)]):
+            c_map = {loc["label"]: per_label[loc["label"]][lag_d]
+                     for loc in MISO_LOAD_LOCATIONS
+                     if lag_d in per_label.get(loc["label"], {})}
+            if c_map:
+                recent_avg_f.append(weighted_avg_temp_f_miso(c_map))
+    except Exception:
+        recent_avg_f = []
+
+    hindcast: dict = {}
+    if era5_avg_hist:
+        try:
+            avg_f_hist: dict = {}
+            for off in range(16):
+                d2 = today - timedelta(days=off + 1)
+                c_map = {loc["label"]: era5_avg_hist[loc["label"]][d2]
+                         for loc in MISO_LOAD_LOCATIONS
+                         if d2 in era5_avg_hist.get(loc["label"], {})}
+                if c_map:
+                    avg_f_hist[d2] = weighted_avg_temp_f_miso(c_map)
+            for d2, avg_f in avg_f_hist.items():
+                lag1 = avg_f_hist.get(d2 - timedelta(days=1))
+                lag2 = avg_f_hist.get(d2 - timedelta(days=2))
+                lag7 = avg_f_hist.get(d2 - timedelta(days=7))
+                rv = [avg_f_hist.get(d2 - timedelta(days=k)) for k in range(7)]
+                roll7 = sum(v for v in rv if v) / max(sum(1 for v in rv if v), 1)
+                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7)
+                hindcast[d2.isoformat()] = round(_MISO_MODEL.predict([feats])[0] / 1000, 2)
+        except Exception:
+            hindcast = {}
+
+    load_forecasts = _MISO_MODEL.predict_with_uncertainty(
+        forecast_temps_c=miso_avg_c, forecast_hi_c=miso_hi_c, forecast_lo_c=miso_lo_c,
+        gefs_spread_c={}, forecast_dates=forecast_dates_list,
+        recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
+    )
+
+    load_data = [{"date": lf.valid_date.isoformat(),
+                  "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
+                  "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
+                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
+                 for lf in load_forecasts]
+
+    try:
+        comparison = fetch_miso_official_comparison(session)
+    except Exception:
+        comparison = {"actual": {}, "da_fcst": {}}
+    try:
+        miso_7day_data = fetch_miso_7day(session)
+    except Exception:
+        miso_7day_data = {}
+    try:
+        backtest = run_load_backtest(_MISO_MODEL, str(_MISO_TRAINING_DATA_PATH))
+    except Exception:
+        backtest = {}
+
+    result = {"load": load_data, "dates": forecast_dates_strs,
+              "comparison": comparison, "miso_7day": miso_7day_data,
+              "backtest": backtest, "hindcast": hindcast}
+    _MISO_FORECAST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _MISO_FORECAST_CACHE_FILE.write_text(json.dumps(result))
     return result
 
 
@@ -670,8 +842,12 @@ app.layout = html.Div(
                                          "fontWeight": 500}),
                         dcc.RadioItems(
                             id="iso-selector",
-                            options=[{"label": "PJM (Eastern US)", "value": "pjm"},
-                                     {"label": "CAISO (California)", "value": "caiso"}],
+                            options=[
+                                {"label": "PJM (Eastern US)",   "value": "pjm"},
+                                {"label": "CAISO (California)", "value": "caiso"},
+                                {"label": "ERCOT (Texas)",      "value": "ercot"},
+                                {"label": "MISO (Midwest)",     "value": "miso"},
+                            ],
                             value="pjm", inline=True,
                             inputStyle={"marginRight": "5px"},
                             labelStyle={"marginRight": "20px", "fontSize": "14px",
@@ -704,30 +880,6 @@ app.layout = html.Div(
                             ],
                         ),
                         dcc.Graph(id="load-forecast-chart", style={"height": "320px"},
-                                  config={"displayModeBar": False}),
-                    ],
-                ),
-
-                # ── Price chart ────────────────────────────────────────────────
-                html.Div(
-                    id="price-section",
-                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
-                           "border": "1px solid #e2e8f0", "padding": "20px",
-                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
-                           "marginBottom": "20px"},
-                    children=[
-                        html.Div(
-                            style={"display": "flex", "justifyContent": "space-between",
-                                   "alignItems": "baseline", "marginBottom": "4px"},
-                            children=[
-                                html.Div("Day-Ahead Electricity Price",
-                                         style={"fontSize": "13px", "fontWeight": 600,
-                                                "color": "#0f172a"}),
-                                html.Div(id="price-subtitle",
-                                         style={"fontSize": "11px", "color": "#94a3b8"}),
-                            ],
-                        ),
-                        dcc.Graph(id="price-chart", style={"height": "240px"},
                                   config={"displayModeBar": False}),
                     ],
                 ),
@@ -835,6 +987,7 @@ app.layout = html.Div(
         # Store
         dcc.Store(id="load-forecast-store"),
         dcc.Store(id="dc-selected-mw", data=0),
+        dcc.Interval(id="daily-refresh", interval=24 * 60 * 60 * 1000, n_intervals=0),
     ],
 )
 
@@ -846,11 +999,16 @@ app.layout = html.Div(
     Output("load-forecast-store", "data"),
     Input("iso-selector", "value"),
     Input("refresh-btn", "n_clicks"),
+    Input("daily-refresh", "n_intervals"),
 )
-def load_forecast_data(iso, n_clicks):
+def load_forecast_data(iso, n_clicks, _n_intervals):
     force = n_clicks is not None and n_clicks > 0
     if iso == "caiso":
         return fetch_caiso_load_forecast(force=force)
+    if iso == "ercot":
+        return fetch_ercot_load_forecast(force=force)
+    if iso == "miso":
+        return fetch_miso_load_forecast(force=force)
     return fetch_pjm_load_forecast(force=force)
 
 
@@ -871,17 +1029,20 @@ def _empty_fig(msg="Loading…"):
     Output("load-cards", "children"),
     Output("forecast-subtitle", "children"),
     Output("load-forecast-chart", "figure"),
-    Output("price-chart", "figure"),
-    Output("price-subtitle", "children"),
-    Output("price-section", "style"),
     Input("load-forecast-store", "data"),
     Input("iso-selector", "value"),
 )
 def render(data, iso):
     if not data or not data.get("load"):
-        return ([], "", _empty_fig(), _empty_fig(), "")
+        return ([], "", _empty_fig())
 
-    iso_label = "CAISO (California ISO)" if iso == "caiso" else "PJM Interconnection"
+    _iso_labels = {
+        "pjm":   "PJM Interconnection",
+        "caiso": "CAISO (California ISO)",
+        "ercot": "ERCOT (Texas)",
+        "miso":  "MISO (Midcontinent ISO)",
+    }
+    iso_label = _iso_labels.get(iso, iso.upper())
     load_list  = data["load"]
     comparison = data.get("comparison", {})
     backtest   = data.get("backtest", {})
@@ -975,49 +1136,40 @@ def render(data, iso):
         hovertemplate="<b>%{x|%d %b}</b><br>Model: %{y:.1f} GW<extra></extra>",
     ))
 
-    # Official benchmark
-    if iso == "caiso":
-        oasis = data.get("oasis_7day", {})
-        oasis_dates = sorted(d for d in oasis if d in dates)
-        if oasis_dates:
-            fig.add_trace(go.Scatter(
-                x=oasis_dates, y=[oasis[d] for d in oasis_dates],
-                mode="lines+markers", name="CAISO Official 7-Day (OASIS)",
-                line=dict(color="#16a34a", width=2, dash="dash"),
-                marker=dict(size=7, color="#16a34a", symbol="diamond",
-                            line=dict(color="#ffffff", width=1.5)),
-                hovertemplate="<b>%{x|%d %b}</b><br>CAISO OASIS: %{y:.1f} GW<extra></extra>",
-            ))
-        da_in_fcst = sorted(d for d in da_dict if d in dates)
-        if da_in_fcst:
-            fig.add_trace(go.Scatter(
-                x=da_in_fcst, y=[da_dict[d] for d in da_in_fcst],
-                mode="markers", name="EIA Day-Ahead",
-                marker=dict(size=9, color="#0ea5e9", symbol="diamond",
-                            line=dict(color="#ffffff", width=1.5)),
-                hovertemplate="<b>%{x|%d %b}</b><br>EIA day-ahead: %{y:.1f} GW<extra></extra>",
-            ))
-    else:
-        pjm_7day = data.get("pjm_7day", {})
-        pjm7_dates = sorted(d for d in pjm_7day if d in dates)
-        if pjm7_dates:
-            fig.add_trace(go.Scatter(
-                x=pjm7_dates, y=[pjm_7day[d] for d in pjm7_dates],
-                mode="lines+markers", name="PJM Official 7-Day (DataMiner)",
-                line=dict(color="#2563eb", width=2, dash="dash"),
-                marker=dict(size=7, color="#2563eb", symbol="diamond",
-                            line=dict(color="#ffffff", width=1.5)),
-                hovertemplate="<b>%{x|%d %b}</b><br>PJM official: %{y:.1f} GW<extra></extra>",
-            ))
-        da_in_fcst = sorted(d for d in da_dict if d in dates)
-        if da_in_fcst:
-            fig.add_trace(go.Scatter(
-                x=da_in_fcst, y=[da_dict[d] for d in da_in_fcst],
-                mode="markers", name="EIA Day-Ahead",
-                marker=dict(size=9, color="#0ea5e9", symbol="diamond",
-                            line=dict(color="#ffffff", width=1.5)),
-                hovertemplate="<b>%{x|%d %b}</b><br>EIA day-ahead: %{y:.1f} GW<extra></extra>",
-            ))
+    # Official benchmark trace (ISO-specific)
+    _bench_cfg = {
+        "caiso": ("oasis_7day",  "CAISO Official 7-Day (OASIS)",        "#16a34a",
+                  "CAISO OASIS"),
+        "pjm":   ("pjm_7day",   "PJM Official 7-Day (DataMiner)",       "#2563eb",
+                  "PJM official"),
+        "ercot": ("ercot_7day",  "ERCOT Official 7-Day",                 "#7c3aed",
+                  "ERCOT official"),
+        "miso":  ("miso_7day",   "MISO Official 7-Day",                  "#0891b2",
+                  "MISO official"),
+    }
+    bench_key, bench_name, bench_color, bench_hover = _bench_cfg.get(
+        iso, ("pjm_7day", "Official 7-Day", "#2563eb", "Official")
+    )
+    bench_data  = data.get(bench_key, {})
+    bench_dates = sorted(d for d in bench_data if d in dates)
+    if bench_dates:
+        fig.add_trace(go.Scatter(
+            x=bench_dates, y=[bench_data[d] for d in bench_dates],
+            mode="lines+markers", name=bench_name,
+            line=dict(color=bench_color, width=2, dash="dash"),
+            marker=dict(size=7, color=bench_color, symbol="diamond",
+                        line=dict(color="#ffffff", width=1.5)),
+            hovertemplate=f"<b>%{{x|%d %b}}</b><br>{bench_hover}: %{{y:.1f}} GW<extra></extra>",
+        ))
+    da_in_fcst = sorted(d for d in da_dict if d in dates)
+    if da_in_fcst:
+        fig.add_trace(go.Scatter(
+            x=da_in_fcst, y=[da_dict[d] for d in da_in_fcst],
+            mode="markers", name="EIA Day-Ahead",
+            marker=dict(size=9, color="#0ea5e9", symbol="diamond",
+                        line=dict(color="#ffffff", width=1.5)),
+            hovertemplate="<b>%{x|%d %b}</b><br>EIA day-ahead: %{y:.1f} GW<extra></extra>",
+        ))
 
     fig.add_hline(y=avg_gw, line_dash="dot", line_color="#cbd5e1", line_width=1.5,
                   annotation_text=f"15-day avg: {avg_gw:.1f} GW",
@@ -1038,106 +1190,7 @@ def render(data, iso):
         height=320,
     )
 
-    # ── Price chart ───────────────────────────────────────────────────────────
-    prices    = data.get("prices", {})
-    pm        = data.get("price_model", {})
-    p_slope   = pm.get("slope")
-    p_int     = pm.get("intercept")
-    p_sigma   = pm.get("sigma")
-    p_r2      = pm.get("r2")
-    use_solar = pm.get("use_solar", False)
-
-    hist_p_dates = sorted(d for d in hist_dates_raw if d in prices)
-    hist_p_vals  = [prices[d] for d in hist_p_dates]
-
-    # For CAISO, drive projection from net load (gross load − estimated solar)
-    if use_solar and p_slope is not None:
-        proj_x = [gw - _caiso_solar_gw(d) for gw, d in zip(means, dates)]
-    else:
-        proj_x = means
-
-    fwd_p_vals  = (
-        [round(p_slope * x + p_int, 1) for x in proj_x]
-        if p_slope is not None else []
-    )
-    fwd_p_lows  = (
-        [round(v - p_sigma, 1) for v in fwd_p_vals]
-        if fwd_p_vals and p_sigma is not None else []
-    )
-    fwd_p_highs = (
-        [round(v + p_sigma, 1) for v in fwd_p_vals]
-        if fwd_p_vals and p_sigma is not None else []
-    )
-    price_subtitle = "PJM DataMiner (DA LMP)"
-
-    # When load explains almost nothing, anchor projection to historical mean (R²<0.15)
-    if fwd_p_vals and p_r2 is not None and p_r2 < 0.15 and hist_p_vals:
-        hist_mean = sum(hist_p_vals) / len(hist_p_vals)
-        fwd_p_vals  = [round(hist_mean, 1)] * len(dates)
-        fwd_p_lows  = [round(hist_mean - p_sigma, 1)] * len(dates) if p_sigma else fwd_p_lows
-        fwd_p_highs = [round(hist_mean + p_sigma, 1)] * len(dates) if p_sigma else fwd_p_highs
-
-    pfig = go.Figure()
-    if hist_p_vals:
-        pfig.add_trace(go.Scatter(
-            x=hist_p_dates, y=hist_p_vals, mode="lines+markers",
-            name="Historical DA Price",
-            line=dict(color="#7c3aed", width=2),
-            marker=dict(size=4, color="#7c3aed"),
-            hovertemplate="<b>%{x|%d %b}</b><br>Price: $%{y:.1f}/MWh<extra></extra>",
-        ))
-    if fwd_p_vals:
-        if fwd_p_highs and fwd_p_lows:
-            pfig.add_trace(go.Scatter(
-                x=dates, y=fwd_p_highs,
-                mode="lines", line=dict(color="rgba(0,0,0,0)"),
-                showlegend=False, hoverinfo="skip",
-            ))
-            pfig.add_trace(go.Scatter(
-                x=dates, y=fwd_p_lows,
-                mode="lines", line=dict(color="rgba(0,0,0,0)"),
-                fill="tonexty", fillcolor="rgba(167,139,250,0.25)",
-                showlegend=False, hoverinfo="skip",
-            ))
-        pfig.add_trace(go.Scatter(
-            x=dates, y=fwd_p_vals, mode="lines+markers",
-            name="Projected Price (model)",
-            line=dict(color="#a78bfa", width=2, dash="dash"),
-            marker=dict(size=4, color="#a78bfa"),
-            hovertemplate="<b>%{x|%d %b}</b><br>Projected: $%{y:.1f}/MWh<extra></extra>",
-        ))
-    if hist_p_vals or fwd_p_vals:
-        all_p = hist_p_vals + fwd_p_vals
-        avg_p = sum(all_p) / len(all_p)
-        pfig.add_hline(y=avg_p, line_dash="dot", line_color="#cbd5e1", line_width=1.5,
-                       annotation_text=f"avg: ${avg_p:.0f}/MWh",
-                       annotation_font_size=10, annotation_font_color="#94a3b8",
-                       annotation_position="top left")
-    else:
-        pfig = _empty_fig("Price data unavailable")
-        price_subtitle = "Fetching…"
-
-    pfig.update_layout(
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        font=dict(color="#334155", size=11),
-        legend=dict(orientation="h", y=-0.32, font=dict(size=10),
-                    bgcolor="rgba(0,0,0,0)", x=0),
-        margin=dict(l=60, r=20, t=10, b=80),
-        xaxis=dict(type="date", tickformat="%d %b", gridcolor="#f8fafc",
-                   tickangle=-30, tickfont=dict(size=10), linecolor="#e2e8f0",
-                   dtick="D1"),
-        yaxis=dict(gridcolor="#f1f5f9", tickformat=".0f", tickprefix="$",
-                   title=dict(text="Price ($/MWh)", font=dict(size=11, color="#64748b")),
-                   linecolor="#e2e8f0"),
-        height=240,
-    )
-
-    price_section_style = {"display": "none"} if iso == "caiso" else {
-        "backgroundColor": "#ffffff", "borderRadius": "10px",
-        "border": "1px solid #e2e8f0", "padding": "20px",
-        "boxShadow": "0 1px 3px rgba(0,0,0,0.05)", "marginBottom": "20px",
-    }
-    return summary_cards, subtitle, fig, pfig, price_subtitle, price_section_style
+    return summary_cards, subtitle, fig
 
 
 # ---------------------------------------------------------------------------
@@ -1245,10 +1298,11 @@ def render_datacenter(data, iso, check_values):
     augmented       = [gw + dc_gw for gw in means]
 
     # ── Non-linear merit-order price sensitivity ───────────────────────────────
-    # Calibrated from PJM/CAISO market data: price sensitivity rises exponentially
+    # Calibrated from ISO market data: price sensitivity rises exponentially
     # as load approaches grid capacity (peakers progressively more expensive).
-    # Sensitivity at 70% load ≈ $5/GW, at 90% ≈ $12/GW, at 100% ≈ $30/GW
-    base_sens = 5.5 if iso == "pjm" else 7.0   # $/MWh per GW at reference load
+    # ERCOT uses scarcity pricing (ORDC) so sensitivity is higher near peak.
+    _base_sens_map = {"pjm": 5.5, "caiso": 7.0, "ercot": 8.0, "miso": 5.0}
+    base_sens = _base_sens_map.get(iso, 5.5)   # $/MWh per GW at reference load
     nl_exp    = 4.4                              # exponential steepness
     ref_ratio = 0.70                             # reference load ratio
 
@@ -1274,32 +1328,44 @@ def render_datacenter(data, iso, check_values):
     peak_delta = max(daily_price_delta_base)
 
     # ── Emissions (EPA eGRID 2023 marginal rates) ─────────────────────────────
-    # PJM marginal: 1,264 lbs CO2/MWh  |  CAISO: 876 lbs CO2/MWh
-    lbs_per_mwh   = 1264 if iso == "pjm" else 876
+    # PJM: 1,264 | CAISO: 876 | ERCOT (ERCT): 1,050 | MISO (MROW/SRSO): 1,580
+    _lbs_map = {"pjm": 1264, "caiso": 876, "ercot": 1050, "miso": 1580}
+    lbs_per_mwh   = _lbs_map.get(iso, 1264)
     tons_per_mwh  = lbs_per_mwh / 2204.62
     ann_co2_ktons = ann_gwh * 1000 * tons_per_mwh / 1000   # kilotonnes
     ann_co2_mtons = ann_co2_ktons / 1000                   # megatonnes
 
     # ── Reserve margin impact ─────────────────────────────────────────────────
-    # PJM target 20%, current delivered 14.8% (Dec 2025 auction).
-    # We show how much the new DC shaves from the reserve margin at peak.
-    rm_target = 20.0 if iso == "pjm" else 15.0
-    rm_current = 14.8 if iso == "pjm" else 16.0
+    # PJM target 20% (current 14.8%) | CAISO 15% (current 16.0%)
+    # ERCOT target 10.75% (current ~10.5%, historically tight)
+    # MISO target 18.1% (current ~20.3%)
+    _rm_target_map  = {"pjm": 20.0, "caiso": 15.0, "ercot": 10.75, "miso": 18.1}
+    _rm_current_map = {"pjm": 14.8, "caiso": 16.0, "ercot": 10.5,  "miso": 20.3}
+    rm_target  = _rm_target_map.get(iso, 20.0)
+    rm_current = _rm_current_map.get(iso, 14.8)
     rm_delta   = dc_gw / (peak_historical + dc_gw) * 100   # % reduction in reserve
 
     # ── Capacity market cost ──────────────────────────────────────────────────
-    # PJM Dec 2025 auction: $333.44/MW-day; CAISO Resource Adequacy ≈ $80/MW-day
-    cap_price_per_mw_day = 333.44 if iso == "pjm" else 80.0
+    # PJM Dec-2025: $333.44/MW-day | CAISO RA: ~$80/MW-day
+    # ERCOT: energy-only market, no capacity payment ($0) but high scarcity pricing
+    # MISO Planning Resource Auction: ~$35/MW-day (zone-dependent)
+    _cap_map = {"pjm": 333.44, "caiso": 80.0, "ercot": 0.0, "miso": 35.0}
+    cap_price_per_mw_day = _cap_map.get(iso, 333.44)
     ann_cap_cost_m       = dc_mw * cap_price_per_mw_day * 365 / 1e6
 
     # ── Interconnection cost estimate ─────────────────────────────────────────
-    # PJM 2024: $4.36B for ~30 GW of datacenter queue ≈ $145M/GW
-    # CAISO: $2B+ for large-load upgrades, assume similar $/GW
-    intercon_cost_m = dc_gw * 145
+    # PJM 2024: ~$145M/GW | CAISO: ~$145M/GW
+    # ERCOT: large queue backlog, ~$160M/GW (ERCOT nodal interconnection)
+    # MISO: less congested queue, ~$120M/GW (MISO Generator Interconnection Process)
+    _intercon_map = {"pjm": 145, "caiso": 145, "ercot": 160, "miso": 120}
+    intercon_cost_m = dc_gw * _intercon_map.get(iso, 145)
 
     # ── REC / Carbon neutrality cost ─────────────────────────────────────────
-    # PJM Class I RECs ≈ $40/MWh (2024 high); CAISO ≈ $15/MWh (lower solar cost)
-    rec_mwh = 40 if iso == "pjm" else 15
+    # PJM Class I RECs: ~$40/MWh | CAISO: ~$15/MWh (abundant solar)
+    # ERCOT: ~$8/MWh (abundant wind, cheapest RECs in US)
+    # MISO: ~$20/MWh (growing wind but coal-heavy grid → higher offset needed)
+    _rec_map = {"pjm": 40, "caiso": 15, "ercot": 8, "miso": 20}
+    rec_mwh = _rec_map.get(iso, 40)
     ann_rec_cost_m = ann_gwh * rec_mwh / 1e3
 
     # ── Summary cards ─────────────────────────────────────────────────────────
@@ -1409,7 +1475,8 @@ def render_datacenter(data, iso, check_values):
     # ── Emissions text block ───────────────────────────────────────────────────
     carbon_price_usd = 50   # $/tonne CO2 (EU ETS reference)
     social_cost_m = ann_co2_ktons * carbon_price_usd / 1e3  # $M/yr social cost
-    iso_label = "PJM" if iso == "pjm" else "CAISO"
+    _dc_iso_labels = {"pjm": "PJM", "caiso": "CAISO", "ercot": "ERCOT", "miso": "MISO"}
+    iso_label = _dc_iso_labels.get(iso, iso.upper())
     emissions_text = [
         html.Span(f"Annual marginal CO₂ emissions: "),
         html.Strong(f"{ann_co2_ktons:.0f} kt CO₂/yr"),

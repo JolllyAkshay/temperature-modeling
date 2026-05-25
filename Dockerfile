@@ -5,12 +5,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY pyproject.toml .
 COPY src/ src/
-RUN pip install --no-cache-dir -e src/. --no-deps
+RUN pip install --no-cache-dir -e . --no-deps
 
 COPY dashboard.py .
-COPY api_cache/pjm_load_model.pkl api_cache/pjm_load_model.pkl
+COPY api_cache/pjm_load_model.pkl   api_cache/pjm_load_model.pkl
 COPY api_cache/caiso_load_model.pkl api_cache/caiso_load_model.pkl
+COPY api_cache/ercot_load_model.pkl api_cache/ercot_load_model.pkl
+COPY api_cache/miso_load_model.pkl  api_cache/miso_load_model.pkl
 
 RUN mkdir -p api_cache
 
