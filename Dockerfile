@@ -15,6 +15,11 @@ COPY api_cache/caiso_load_model.pkl api_cache/caiso_load_model.pkl
 COPY api_cache/ercot_load_model.pkl api_cache/ercot_load_model.pkl
 COPY api_cache/miso_load_model.pkl  api_cache/miso_load_model.pkl
 
+COPY api_cache/pjm_load_training.json   api_cache/pjm_load_training.json
+COPY api_cache/caiso_load_training.json api_cache/caiso_load_training.json
+COPY api_cache/ercot_load_training.json api_cache/ercot_load_training.json
+COPY api_cache/miso_load_training.json  api_cache/miso_load_training.json
+
 RUN mkdir -p api_cache
 
 ENV PYTHONUNBUFFERED=1

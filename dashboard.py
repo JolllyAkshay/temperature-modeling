@@ -5,6 +5,8 @@ Open: http://127.0.0.1:8050
 """
 
 import json
+import logging
+import logging.config
 import os
 import sys
 import time
@@ -16,6 +18,23 @@ import requests
 import dash
 from dash import dcc, html, Input, Output, ALL
 import plotly.graph_objects as go
+
+# ---------------------------------------------------------------------------
+# Logging — configure before any module imports so child loggers inherit
+# ---------------------------------------------------------------------------
+logging.config.dictConfig({
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {"format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                     "datefmt": "%Y-%m-%d %H:%M:%S"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "standard"},
+    },
+    "root": {"level": "INFO", "handlers": ["console"]},
+})
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -54,6 +73,9 @@ from temperature_modeling.miso_load import (
     fetch_miso_official_comparison, fetch_miso_7day,
     weighted_avg_temp_f_miso,
 )
+from temperature_modeling.ai_brief import generate_forecast_brief, generate_chat_response
+from temperature_modeling.datacenter_agent import load_datacenter_projects
+from temperature_modeling.ensemble import get_ensemble_forecast
 
 FORECAST_CACHE_TTL_HOURS = 3
 
@@ -72,123 +94,44 @@ _MISO_TRAINING_DATA_PATH    = _HERE / "api_cache" / "miso_load_training.json"
 _LOAD_MODEL: LoadCorrectionModel | None = None
 try:
     _LOAD_MODEL = load_load_model()
-    print("  PJM load model loaded OK")
-except Exception as e:
-    print(f"  Warning: could not load PJM load model: {e}")
+    log.info("PJM load model loaded OK")
+except FileNotFoundError:
+    log.error("PJM load model not found — run training script first")
+except Exception:
+    log.exception("Failed to load PJM load model")
 
 _CAISO_MODEL: CAISOLoadModel | None = None
 try:
     _CAISO_MODEL = load_caiso_model()
-    print("  CAISO load model loaded OK")
-except Exception as e:
-    print(f"  Warning: could not load CAISO load model: {e}")
+    log.info("CAISO load model loaded OK")
+except FileNotFoundError:
+    log.error("CAISO load model not found — run training script first")
+except Exception:
+    log.exception("Failed to load CAISO load model")
 
 _ERCOT_MODEL: ERCOTLoadModel | None = None
 try:
     _ERCOT_MODEL = load_ercot_model()
-    print("  ERCOT load model loaded OK")
-except Exception as e:
-    print(f"  Warning: could not load ERCOT load model: {e}")
+    log.info("ERCOT load model loaded OK")
+except FileNotFoundError:
+    log.error("ERCOT load model not found — run training script first")
+except Exception:
+    log.exception("Failed to load ERCOT load model")
 
 _MISO_MODEL: MISOLoadModel | None = None
 try:
     _MISO_MODEL = load_miso_model()
-    print("  MISO load model loaded OK")
-except Exception as e:
-    print(f"  Warning: could not load MISO load model: {e}")
+    log.info("MISO load model loaded OK")
+except FileNotFoundError:
+    log.error("MISO load model not found — run training script first")
+except Exception:
+    log.exception("Failed to load MISO load model")
 
 
 # ---------------------------------------------------------------------------
-# Real approved / announced datacenter projects (public sources, 2024-2025)
+# Datacenter projects — loaded from agent-maintained cache (falls back to baseline)
 # ---------------------------------------------------------------------------
-_DC_PROJECTS = {
-    "pjm": [
-        {"id": "stack_stafford",  "name": "STACK Stafford Technology Campus",
-         "operator": "STACK Infrastructure",    "location": "Stafford County, VA",
-         "mw": 1800, "status": "Approved"},
-        {"id": "pax_carlisle",    "name": "Pennsylvania Digital I (PAX)",
-         "operator": "PowerHouse / PA Data Center Partners", "location": "Carlisle, PA",
-         "mw": 1350, "status": "Announced"},
-        {"id": "edgecore_louisa", "name": "EdgeCore Louisa County Campus",
-         "operator": "EdgeCore Data Centers",   "location": "Louisa County, VA",
-         "mw": 1100, "status": "Announced"},
-        {"id": "cleanarc_va1",    "name": "CleanArc VA1 Campus",
-         "operator": "CleanArc Data Centers",   "location": "Caroline County, VA",
-         "mw": 900,  "status": "Under Construction"},
-        {"id": "msft_mt_pleasant","name": "Microsoft Mt. Pleasant",
-         "operator": "Microsoft",               "location": "Mt. Pleasant, WI",
-         "mw": 1000, "status": "Under Construction"},
-        {"id": "meta_dekalb",     "name": "Meta DeKalb County",
-         "operator": "Meta",                    "location": "DeKalb County, GA",
-         "mw": 500,  "status": "Approved"},
-        {"id": "amazon_nova",     "name": "Amazon AWS Northern Virginia",
-         "operator": "Amazon",                  "location": "Northern Virginia",
-         "mw": 800,  "status": "Operating / Expanding"},
-        {"id": "coreweave_lanc",  "name": "CoreWeave Lancaster",
-         "operator": "CoreWeave",               "location": "Lancaster, PA",
-         "mw": 300,  "status": "Announced"},
-    ],
-    "caiso": [
-        {"id": "google_sj",       "name": "Google San Jose Campus",
-         "operator": "Google",                  "location": "San Jose, CA",
-         "mw": 400,  "status": "Announced"},
-        {"id": "meta_sac",        "name": "Meta Sacramento Campus",
-         "operator": "Meta",                    "location": "Sacramento, CA",
-         "mw": 250,  "status": "Operating"},
-        {"id": "msft_sv",         "name": "Microsoft Silicon Valley",
-         "operator": "Microsoft",               "location": "San Jose, CA",
-         "mw": 200,  "status": "Announced"},
-        {"id": "amazon_elk",      "name": "Amazon AWS Elk Grove",
-         "operator": "Amazon",                  "location": "Elk Grove, CA",
-         "mw": 150,  "status": "Operating"},
-        {"id": "vantage_sd2",     "name": "Vantage SD2 Campus",
-         "operator": "Vantage Data Centers",    "location": "San Diego, CA",
-         "mw": 120,  "status": "Approved"},
-        {"id": "qts_richmond",    "name": "QTS Richmond Campus",
-         "operator": "QTS / Blackstone",        "location": "Richmond, CA",
-         "mw": 180,  "status": "Under Construction"},
-    ],
-    "ercot": [
-        {"id": "msft_abilene",    "name": "Microsoft Abilene AI Campus",
-         "operator": "Microsoft",               "location": "Abilene, TX",
-         "mw": 800,  "status": "Under Construction"},
-        {"id": "meta_fw",         "name": "Meta Fort Worth Campus",
-         "operator": "Meta",                    "location": "Fort Worth, TX",
-         "mw": 700,  "status": "Approved"},
-        {"id": "tiktok_temple",   "name": "TikTok Temple Data Center",
-         "operator": "ByteDance / TikTok",      "location": "Temple, TX",
-         "mw": 1200, "status": "Announced"},
-        {"id": "google_rich",     "name": "Google Richardson Campus",
-         "operator": "Google",                  "location": "Richardson, TX",
-         "mw": 300,  "status": "Announced"},
-        {"id": "qts_irving",      "name": "QTS Irving Campus",
-         "operator": "QTS / Blackstone",        "location": "Irving, TX",
-         "mw": 500,  "status": "Operating / Expanding"},
-        {"id": "amazon_sa",       "name": "Amazon AWS San Antonio",
-         "operator": "Amazon",                  "location": "San Antonio, TX",
-         "mw": 400,  "status": "Operating / Expanding"},
-    ],
-    "miso": [
-        {"id": "msft_racine",     "name": "Microsoft Racine County Campus",
-         "operator": "Microsoft",               "location": "Racine County, WI",
-         "mw": 500,  "status": "Under Construction"},
-        {"id": "google_cb",       "name": "Google Council Bluffs Campus",
-         "operator": "Google",                  "location": "Council Bluffs, IA",
-         "mw": 600,  "status": "Operating / Expanding"},
-        {"id": "amazon_dmi",      "name": "Amazon AWS Des Moines",
-         "operator": "Amazon",                  "location": "Des Moines, IA",
-         "mw": 250,  "status": "Operating"},
-        {"id": "msft_chicago",    "name": "Microsoft Chicago Campus",
-         "operator": "Microsoft",               "location": "Chicago, IL",
-         "mw": 300,  "status": "Announced"},
-        {"id": "meta_dekalb_il",  "name": "Meta DeKalb Illinois Campus",
-         "operator": "Meta",                    "location": "DeKalb, IL",
-         "mw": 800,  "status": "Approved"},
-        {"id": "switch_mpls",     "name": "Switch Minneapolis Campus",
-         "operator": "Switch",                  "location": "Minneapolis, MN",
-         "mw": 150,  "status": "Operating / Expanding"},
-    ],
-}
+_DC_PROJECTS = load_datacenter_projects()
 
 _STATUS_COLOR = {
     "Operating": "#22c55e", "Operating / Expanding": "#22c55e",
@@ -217,539 +160,305 @@ def _fetch_one(label, lat, lon, session, forecast_days=15):
         d = r.json()["daily"]
         return {"label": label, "dates": d["time"],
                 "hi": d["temperature_2m_max"], "lo": d["temperature_2m_min"]}
+    except requests.HTTPError as exc:
+        log.warning("Open-Meteo HTTP error for %s: %s", label, exc)
+    except requests.RequestException as exc:
+        log.warning("Open-Meteo network error for %s: %s", label, exc)
+    except (KeyError, ValueError) as exc:
+        log.warning("Open-Meteo unexpected response for %s: %s", label, exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Shared ISO forecast helper — replaces 4 nearly-identical blocks
+# ---------------------------------------------------------------------------
+
+# Per-ISO config: (locations_list, weighted_avg_fn, model, cache_file,
+#                  training_data_path, comparison_fn, bench_7day_fn, bench_key)
+_ISO_CONFIGS: dict = {}  # populated after imports above
+
+
+def _build_iso_configs():
+    from temperature_modeling.pjm_load import weighted_avg_temp_f
+    _ISO_CONFIGS.update({
+        "pjm": dict(
+            locations=PJM_LOAD_LOCATIONS,
+            weighted_avg_fn=weighted_avg_temp_f,
+            model_ref=lambda: _LOAD_MODEL,
+            cache_file=_LOAD_FORECAST_CACHE_FILE,
+            training_path=_LOAD_TRAINING_DATA_PATH,
+            comparison_fn=fetch_pjm_official_comparison,
+            bench_fn=fetch_pjm_dataminer_7day,
+            bench_key="pjm_7day",
+        ),
+        "caiso": dict(
+            locations=CAISO_LOAD_LOCATIONS,
+            weighted_avg_fn=weighted_avg_temp_f_caiso,
+            model_ref=lambda: _CAISO_MODEL,
+            cache_file=_CAISO_FORECAST_CACHE_FILE,
+            training_path=_CAISO_TRAINING_DATA_PATH,
+            comparison_fn=fetch_caiso_official_comparison,
+            bench_fn=fetch_caiso_oasis_7day,
+            bench_key="oasis_7day",
+        ),
+        "ercot": dict(
+            locations=ERCOT_LOAD_LOCATIONS,
+            weighted_avg_fn=weighted_avg_temp_f_ercot,
+            model_ref=lambda: _ERCOT_MODEL,
+            cache_file=_ERCOT_FORECAST_CACHE_FILE,
+            training_path=_ERCOT_TRAINING_DATA_PATH,
+            comparison_fn=fetch_ercot_official_comparison,
+            bench_fn=fetch_ercot_7day,
+            bench_key="ercot_7day",
+        ),
+        "miso": dict(
+            locations=MISO_LOAD_LOCATIONS,
+            weighted_avg_fn=weighted_avg_temp_f_miso,
+            model_ref=lambda: _MISO_MODEL,
+            cache_file=_MISO_FORECAST_CACHE_FILE,
+            training_path=_MISO_TRAINING_DATA_PATH,
+            comparison_fn=fetch_miso_official_comparison,
+            bench_fn=fetch_miso_7day,
+            bench_key="miso_7day",
+        ),
+    })
+
+
+def _is_cache_valid(cache_file: Path) -> bool:
+    """Return True only if the cache file is fresh, from today, and has comparison data."""
+    if not cache_file.exists():
+        return False
+    age_h = (time.time() - cache_file.stat().st_mtime) / 3600
+    if age_h >= FORECAST_CACHE_TTL_HOURS:
+        return False
+    try:
+        cached = json.loads(cache_file.read_text())
+        load_list = cached.get("load") or []
+        if not load_list:
+            return False
+        if load_list[0].get("date") != date.today().isoformat():
+            return False
+        if not cached.get("comparison", {}).get("actual"):
+            return False
+        return True
+    except (json.JSONDecodeError, KeyError, IndexError):
+        log.debug("Cache %s is corrupt or incomplete — will refresh", cache_file.name)
+        return False
+
+
+def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
+    """
+    Shared forecast pipeline for all ISOs.
+    Fetches GFS temperatures, builds ERA5 hindcast, runs the load model,
+    and collects official benchmark data.
+    """
+    from temperature_modeling._era5 import fetch_era5_daily
+    from temperature_modeling.pjm_load import _build_features as _bf
+    from temperature_modeling.models import Coordinates as _C
+
+    cfg   = _ISO_CONFIGS[iso]
+    model = cfg["model_ref"]()
+    if model is None:
+        log.warning("%s model not loaded — skipping forecast", iso.upper())
+        return {}
+
+    cache_file = cfg["cache_file"]
+    if not force and _is_cache_valid(cache_file):
+        try:
+            return json.loads(cache_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            log.warning("Could not read %s cache — regenerating", iso.upper())
+
+    locations      = cfg["locations"]
+    weighted_avg_fn = cfg["weighted_avg_fn"]
+
+    session = requests.Session()
+    session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
+
+    avg_c: dict = {}
+    hi_c:  dict = {}
+    lo_c:  dict = {}
+    forecast_dates_strs = None
+
+    def _f_to_c(lst):
+        return [(v - 32) * 5 / 9 if v is not None else None for v in lst]
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(_fetch_one, loc["label"], loc["lat"], loc["lon"], session): loc
+                for loc in locations}
+        for fut in as_completed(futs):
+            res = fut.result()
+            if not res:
+                continue
+            label    = res["label"]
+            loc_hi   = _f_to_c(res["hi"])
+            loc_lo   = _f_to_c(res["lo"])
+            loc_avg  = [(h + l) / 2 if h and l else None for h, l in zip(loc_hi, loc_lo)]
+            avg_c[label] = loc_avg
+            hi_c[label]  = loc_hi
+            lo_c[label]  = loc_lo
+            if forecast_dates_strs is None:
+                forecast_dates_strs = res["dates"][:15]
+
+    if not avg_c or not forecast_dates_strs:
+        log.error("%s: no GFS temperature data returned — aborting forecast", iso.upper())
+        return {}
+
+    forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
+
+    # ERA5 hindcast (last 16 days)
+    era5_session = requests.Session()
+    era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
+    today = date.today()
+    era5_avg_hist: dict = {}
+    recent_avg_f: list = []
+    try:
+        per_label = {}
+        for loc in locations:
+            per_label[loc["label"]] = fetch_era5_daily(
+                _C(loc["lat"], loc["lon"]),
+                today - timedelta(days=16), today - timedelta(days=1),
+                era5_session,
+            )
+        era5_avg_hist = per_label
+        for lag_d in sorted(today - timedelta(days=k) for k in range(8, 0, -1)):
+            c_map = {loc["label"]: per_label[loc["label"]][lag_d]
+                     for loc in locations
+                     if lag_d in per_label.get(loc["label"], {})}
+            if c_map:
+                recent_avg_f.append(weighted_avg_fn(c_map))
     except Exception:
-        return None
+        log.exception("%s: ERA5 hindcast fetch failed — lags will use GFS-only fallback", iso.upper())
+        recent_avg_f = []
+
+    # Build hindcast GW series
+    hindcast: dict = {}
+    if era5_avg_hist:
+        try:
+            avg_f_hist: dict = {}
+            for off in range(16):
+                d2 = today - timedelta(days=off + 1)
+                c_map = {loc["label"]: era5_avg_hist[loc["label"]][d2]
+                         for loc in locations
+                         if d2 in era5_avg_hist.get(loc["label"], {})}
+                if c_map:
+                    avg_f_hist[d2] = weighted_avg_fn(c_map)
+            for d2, avg_f in avg_f_hist.items():
+                lag1  = avg_f_hist.get(d2 - timedelta(days=1))
+                lag2  = avg_f_hist.get(d2 - timedelta(days=2))
+                lag7  = avg_f_hist.get(d2 - timedelta(days=7))
+                rv    = [avg_f_hist.get(d2 - timedelta(days=k)) for k in range(7)]
+                roll7 = sum(v for v in rv if v) / max(sum(1 for v in rv if v), 1)
+                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7)
+                hindcast[d2.isoformat()] = round(model.predict([feats])[0] / 1000, 2)
+        except Exception:
+            log.exception("%s: hindcast computation failed", iso.upper())
+            hindcast = {}
+
+    # 15-day GFS forecast with uncertainty
+    load_forecasts = model.predict_with_uncertainty(
+        forecast_temps_c=avg_c, forecast_hi_c=hi_c, forecast_lo_c=lo_c,
+        gefs_spread_c={}, forecast_dates=forecast_dates_list,
+        recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
+    )
+    load_data = [{"date": lf.valid_date.isoformat(),
+                  "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
+                  "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
+                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
+                 for lf in load_forecasts]
+
+    # Official benchmark data
+    comparison: dict = {"actual": {}, "da_fcst": {}}
+    try:
+        comparison = cfg["comparison_fn"](session)
+    except Exception:
+        log.exception("%s: official comparison fetch failed — chart will show no actuals", iso.upper())
+
+    bench_data: dict = {}
+    try:
+        bench_data = cfg["bench_fn"](session)
+    except Exception:
+        log.exception("%s: 7-day benchmark fetch failed", iso.upper())
+
+    backtest: dict = {}
+    try:
+        backtest = run_load_backtest(model, str(cfg["training_path"]))
+    except Exception:
+        log.exception("%s: backtest computation failed", iso.upper())
+
+    result = {
+        "load":            load_data,
+        "dates":           forecast_dates_strs,
+        "comparison":      comparison,
+        cfg["bench_key"]:  bench_data,
+        "backtest":        backtest,
+        "hindcast":        hindcast,
+    }
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(result))
+    except OSError:
+        log.warning("%s: could not write forecast cache to %s", iso.upper(), cache_file)
+
+    log.info("%s: forecast complete — %d days, hindcast %d days, backtest MAPE test=%.1f%%",
+             iso.upper(), len(load_data), len(hindcast),
+             backtest.get("mape_test") or 0)
+    return result
 
 
-# ---------------------------------------------------------------------------
-# PJM load forecast
-# ---------------------------------------------------------------------------
 def fetch_pjm_load_forecast(force=False):
-    if _LOAD_MODEL is None:
-        return {}
-
-    if not force and _LOAD_FORECAST_CACHE_FILE.exists():
-        age_h = (time.time() - _LOAD_FORECAST_CACHE_FILE.stat().st_mtime) / 3600
-        if age_h < FORECAST_CACHE_TTL_HOURS:
-            try:
-                cached = json.loads(_LOAD_FORECAST_CACHE_FILE.read_text())
-                if isinstance(cached, dict) and cached.get("load"):
-                    if cached["load"][0]["date"] == date.today().isoformat():
-                        return cached
-            except Exception:
-                pass
-
-    session = requests.Session()
-    session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
-
-    pjm_avg_c: dict = {}
-    pjm_hi_c:  dict = {}
-    pjm_lo_c:  dict = {}
-    forecast_dates_strs = None
-
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(_fetch_one, loc["label"], loc["lat"], loc["lon"], session): loc
-                for loc in PJM_LOAD_LOCATIONS}
-        for fut in as_completed(futs):
-            res = fut.result()
-            if not res:
-                continue
-            label = res["label"]
-            def f_to_c(lst):
-                return [(v - 32) * 5 / 9 if v is not None else None for v in lst]
-            hi_c  = f_to_c(res["hi"])
-            lo_c  = f_to_c(res["lo"])
-            avg_c = [(h + l) / 2 if h and l else None for h, l in zip(hi_c, lo_c)]
-            pjm_avg_c[label] = avg_c
-            pjm_hi_c[label]  = hi_c
-            pjm_lo_c[label]  = lo_c
-            if forecast_dates_strs is None:
-                forecast_dates_strs = res["dates"][:15]
-
-    if not pjm_avg_c or not forecast_dates_strs:
-        return {}
-
-    forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
-
-    from temperature_modeling._era5 import fetch_era5_daily
-    from temperature_modeling.pjm_load import weighted_avg_temp_f, _build_features as _bf
-    from temperature_modeling.models import Coordinates as _C
-
-    era5_session = requests.Session()
-    era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
-    today = date.today()
-    era5_avg_hist: dict = {}
-    recent_avg_f = []
-    try:
-        per_label = {}
-        for loc in PJM_LOAD_LOCATIONS:
-            per_label[loc["label"]] = fetch_era5_daily(
-                _C(loc["lat"], loc["lon"]), today - timedelta(days=16),
-                today - timedelta(days=1), era5_session,
-            )
-        era5_avg_hist = per_label
-        for lag_d in sorted([today - timedelta(days=k) for k in range(8, 0, -1)]):
-            c_map = {loc["label"]: per_label[loc["label"]][lag_d]
-                     for loc in PJM_LOAD_LOCATIONS
-                     if lag_d in per_label.get(loc["label"], {})}
-            if c_map:
-                recent_avg_f.append(weighted_avg_temp_f(c_map))
-    except Exception:
-        recent_avg_f = []
-
-    hindcast: dict = {}
-    if era5_avg_hist:
-        try:
-            avg_f_hist: dict = {}
-            for off in range(16):
-                d2 = today - timedelta(days=off + 1)
-                c_map = {loc["label"]: era5_avg_hist[loc["label"]][d2]
-                         for loc in PJM_LOAD_LOCATIONS
-                         if d2 in era5_avg_hist.get(loc["label"], {})}
-                if c_map:
-                    avg_f_hist[d2] = weighted_avg_temp_f(c_map)
-            for d2, avg_f in avg_f_hist.items():
-                lag1 = avg_f_hist.get(d2 - timedelta(days=1))
-                lag2 = avg_f_hist.get(d2 - timedelta(days=2))
-                lag7 = avg_f_hist.get(d2 - timedelta(days=7))
-                rv = [avg_f_hist.get(d2 - timedelta(days=k)) for k in range(7)]
-                roll7 = sum(v for v in rv if v) / max(sum(1 for v in rv if v), 1)
-                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7)
-                hindcast[d2.isoformat()] = round(_LOAD_MODEL.predict([feats])[0] / 1000, 2)
-        except Exception:
-            hindcast = {}
-
-    load_forecasts = _LOAD_MODEL.predict_with_uncertainty(
-        forecast_temps_c=pjm_avg_c, forecast_hi_c=pjm_hi_c, forecast_lo_c=pjm_lo_c,
-        gefs_spread_c={}, forecast_dates=forecast_dates_list,
-        recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
-    )
-
-    load_data = [{"date": lf.valid_date.isoformat(),
-                  "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
-                  "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
-                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
-                 for lf in load_forecasts]
-
-    try:
-        comparison = fetch_pjm_official_comparison(session)
-    except Exception:
-        comparison = {"actual": {}, "da_fcst": {}}
-    try:
-        pjm_7day = fetch_pjm_dataminer_7day(session)
-    except Exception:
-        pjm_7day = {}
-    try:
-        backtest = run_load_backtest(_LOAD_MODEL, str(_LOAD_TRAINING_DATA_PATH))
-    except Exception:
-        backtest = {}
-    result = {"load": load_data, "dates": forecast_dates_strs,
-              "comparison": comparison, "pjm_7day": pjm_7day,
-              "backtest": backtest, "hindcast": hindcast}
-    _LOAD_FORECAST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _LOAD_FORECAST_CACHE_FILE.write_text(json.dumps(result))
-    return result
+    return _fetch_iso_forecast("pjm", force=force)
 
 
-# ---------------------------------------------------------------------------
-# CAISO load forecast
-# ---------------------------------------------------------------------------
 def fetch_caiso_load_forecast(force=False):
-    if _CAISO_MODEL is None:
-        return {}
-
-    if not force and _CAISO_FORECAST_CACHE_FILE.exists():
-        age_h = (time.time() - _CAISO_FORECAST_CACHE_FILE.stat().st_mtime) / 3600
-        if age_h < FORECAST_CACHE_TTL_HOURS:
-            try:
-                cached = json.loads(_CAISO_FORECAST_CACHE_FILE.read_text())
-                if isinstance(cached, dict) and cached.get("load"):
-                    if cached["load"][0]["date"] == date.today().isoformat():
-                        return cached
-            except Exception:
-                pass
-
-    session = requests.Session()
-    session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
-
-    caiso_avg_c: dict = {}
-    caiso_hi_c:  dict = {}
-    caiso_lo_c:  dict = {}
-    forecast_dates_strs = None
-
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(_fetch_one, loc["label"], loc["lat"], loc["lon"], session): loc
-                for loc in CAISO_LOAD_LOCATIONS}
-        for fut in as_completed(futs):
-            res = fut.result()
-            if not res:
-                continue
-            label = res["label"]
-            def f_to_c(lst):
-                return [(v - 32) * 5 / 9 if v is not None else None for v in lst]
-            hi_c  = f_to_c(res["hi"])
-            lo_c  = f_to_c(res["lo"])
-            avg_c = [(h + l) / 2 if h and l else None for h, l in zip(hi_c, lo_c)]
-            caiso_avg_c[label] = avg_c
-            caiso_hi_c[label]  = hi_c
-            caiso_lo_c[label]  = lo_c
-            if forecast_dates_strs is None:
-                forecast_dates_strs = res["dates"][:15]
-
-    if not caiso_avg_c or not forecast_dates_strs:
-        return {}
-
-    forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
-
-    from temperature_modeling._era5 import fetch_era5_daily
-    from temperature_modeling.pjm_load import _build_features as _bf
-    from temperature_modeling.models import Coordinates as _C
-
-    era5_session = requests.Session()
-    era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
-    today = date.today()
-    era5_avg_hist: dict = {}
-    recent_avg_f = []
-    try:
-        per_label = {}
-        for loc in CAISO_LOAD_LOCATIONS:
-            per_label[loc["label"]] = fetch_era5_daily(
-                _C(loc["lat"], loc["lon"]), today - timedelta(days=16),
-                today - timedelta(days=1), era5_session,
-            )
-        era5_avg_hist = per_label
-        for lag_d in sorted([today - timedelta(days=k) for k in range(8, 0, -1)]):
-            c_map = {loc["label"]: per_label[loc["label"]][lag_d]
-                     for loc in CAISO_LOAD_LOCATIONS
-                     if lag_d in per_label.get(loc["label"], {})}
-            if c_map:
-                recent_avg_f.append(weighted_avg_temp_f_caiso(c_map))
-    except Exception:
-        recent_avg_f = []
-
-    hindcast: dict = {}
-    if era5_avg_hist:
-        try:
-            avg_f_hist: dict = {}
-            for off in range(16):
-                d2 = today - timedelta(days=off + 1)
-                c_map = {loc["label"]: era5_avg_hist[loc["label"]][d2]
-                         for loc in CAISO_LOAD_LOCATIONS
-                         if d2 in era5_avg_hist.get(loc["label"], {})}
-                if c_map:
-                    avg_f_hist[d2] = weighted_avg_temp_f_caiso(
-                        {k: v for k, v in c_map.items()})
-            for d2, avg_f in avg_f_hist.items():
-                lag1 = avg_f_hist.get(d2 - timedelta(days=1))
-                lag2 = avg_f_hist.get(d2 - timedelta(days=2))
-                lag7 = avg_f_hist.get(d2 - timedelta(days=7))
-                rv = [avg_f_hist.get(d2 - timedelta(days=k)) for k in range(7)]
-                roll7 = sum(v for v in rv if v) / max(sum(1 for v in rv if v), 1)
-                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7)
-                hindcast[d2.isoformat()] = round(_CAISO_MODEL.predict([feats])[0] / 1000, 2)
-        except Exception:
-            hindcast = {}
-
-    load_forecasts = _CAISO_MODEL.predict_with_uncertainty(
-        forecast_temps_c=caiso_avg_c, forecast_hi_c=caiso_hi_c, forecast_lo_c=caiso_lo_c,
-        gefs_spread_c={}, forecast_dates=forecast_dates_list,
-        recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
-    )
-
-    load_data = [{"date": lf.valid_date.isoformat(),
-                  "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
-                  "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
-                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
-                 for lf in load_forecasts]
-
-    try:
-        comparison = fetch_caiso_official_comparison(session)
-    except Exception:
-        comparison = {"actual": {}, "da_fcst": {}}
-    try:
-        oasis_7day = fetch_caiso_oasis_7day(session)
-    except Exception:
-        oasis_7day = {}
-    try:
-        backtest = run_load_backtest(_CAISO_MODEL, str(_CAISO_TRAINING_DATA_PATH))
-    except Exception:
-        backtest = {}
-    result = {"load": load_data, "dates": forecast_dates_strs,
-              "comparison": comparison, "oasis_7day": oasis_7day,
-              "backtest": backtest, "hindcast": hindcast}
-    _CAISO_FORECAST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _CAISO_FORECAST_CACHE_FILE.write_text(json.dumps(result))
-    return result
+    return _fetch_iso_forecast("caiso", force=force)
 
 
-# ---------------------------------------------------------------------------
-# ERCOT load forecast
-# ---------------------------------------------------------------------------
 def fetch_ercot_load_forecast(force=False):
-    if _ERCOT_MODEL is None:
-        return {}
-
-    if not force and _ERCOT_FORECAST_CACHE_FILE.exists():
-        age_h = (time.time() - _ERCOT_FORECAST_CACHE_FILE.stat().st_mtime) / 3600
-        if age_h < FORECAST_CACHE_TTL_HOURS:
-            try:
-                cached = json.loads(_ERCOT_FORECAST_CACHE_FILE.read_text())
-                if isinstance(cached, dict) and cached.get("load"):
-                    if cached["load"][0]["date"] == date.today().isoformat():
-                        return cached
-            except Exception:
-                pass
-
-    session = requests.Session()
-    session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
-
-    ercot_avg_c: dict = {}
-    ercot_hi_c:  dict = {}
-    ercot_lo_c:  dict = {}
-    forecast_dates_strs = None
-
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(_fetch_one, loc["label"], loc["lat"], loc["lon"], session): loc
-                for loc in ERCOT_LOAD_LOCATIONS}
-        for fut in as_completed(futs):
-            res = fut.result()
-            if not res:
-                continue
-            label = res["label"]
-            def f_to_c(lst):
-                return [(v - 32) * 5 / 9 if v is not None else None for v in lst]
-            hi_c  = f_to_c(res["hi"])
-            lo_c  = f_to_c(res["lo"])
-            avg_c = [(h + l) / 2 if h and l else None for h, l in zip(hi_c, lo_c)]
-            ercot_avg_c[label] = avg_c
-            ercot_hi_c[label]  = hi_c
-            ercot_lo_c[label]  = lo_c
-            if forecast_dates_strs is None:
-                forecast_dates_strs = res["dates"][:15]
-
-    if not ercot_avg_c or not forecast_dates_strs:
-        return {}
-
-    forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
-
-    from temperature_modeling._era5 import fetch_era5_daily
-    from temperature_modeling.pjm_load import _build_features as _bf
-    from temperature_modeling.models import Coordinates as _C
-
-    era5_session = requests.Session()
-    era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
-    today = date.today()
-    era5_avg_hist: dict = {}
-    recent_avg_f = []
-    try:
-        per_label = {}
-        for loc in ERCOT_LOAD_LOCATIONS:
-            per_label[loc["label"]] = fetch_era5_daily(
-                _C(loc["lat"], loc["lon"]), today - timedelta(days=16),
-                today - timedelta(days=1), era5_session,
-            )
-        era5_avg_hist = per_label
-        for lag_d in sorted([today - timedelta(days=k) for k in range(8, 0, -1)]):
-            c_map = {loc["label"]: per_label[loc["label"]][lag_d]
-                     for loc in ERCOT_LOAD_LOCATIONS
-                     if lag_d in per_label.get(loc["label"], {})}
-            if c_map:
-                recent_avg_f.append(weighted_avg_temp_f_ercot(c_map))
-    except Exception:
-        recent_avg_f = []
-
-    hindcast: dict = {}
-    if era5_avg_hist:
-        try:
-            avg_f_hist: dict = {}
-            for off in range(16):
-                d2 = today - timedelta(days=off + 1)
-                c_map = {loc["label"]: era5_avg_hist[loc["label"]][d2]
-                         for loc in ERCOT_LOAD_LOCATIONS
-                         if d2 in era5_avg_hist.get(loc["label"], {})}
-                if c_map:
-                    avg_f_hist[d2] = weighted_avg_temp_f_ercot(c_map)
-            for d2, avg_f in avg_f_hist.items():
-                lag1 = avg_f_hist.get(d2 - timedelta(days=1))
-                lag2 = avg_f_hist.get(d2 - timedelta(days=2))
-                lag7 = avg_f_hist.get(d2 - timedelta(days=7))
-                rv = [avg_f_hist.get(d2 - timedelta(days=k)) for k in range(7)]
-                roll7 = sum(v for v in rv if v) / max(sum(1 for v in rv if v), 1)
-                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7)
-                hindcast[d2.isoformat()] = round(_ERCOT_MODEL.predict([feats])[0] / 1000, 2)
-        except Exception:
-            hindcast = {}
-
-    load_forecasts = _ERCOT_MODEL.predict_with_uncertainty(
-        forecast_temps_c=ercot_avg_c, forecast_hi_c=ercot_hi_c, forecast_lo_c=ercot_lo_c,
-        gefs_spread_c={}, forecast_dates=forecast_dates_list,
-        recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
-    )
-
-    load_data = [{"date": lf.valid_date.isoformat(),
-                  "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
-                  "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
-                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
-                 for lf in load_forecasts]
-
-    try:
-        comparison = fetch_ercot_official_comparison(session)
-    except Exception:
-        comparison = {"actual": {}, "da_fcst": {}}
-    try:
-        ercot_7day_data = fetch_ercot_7day(session)
-    except Exception:
-        ercot_7day_data = {}
-    try:
-        backtest = run_load_backtest(_ERCOT_MODEL, str(_ERCOT_TRAINING_DATA_PATH))
-    except Exception:
-        backtest = {}
-
-    result = {"load": load_data, "dates": forecast_dates_strs,
-              "comparison": comparison, "ercot_7day": ercot_7day_data,
-              "backtest": backtest, "hindcast": hindcast}
-    _ERCOT_FORECAST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _ERCOT_FORECAST_CACHE_FILE.write_text(json.dumps(result))
-    return result
+    return _fetch_iso_forecast("ercot", force=force)
 
 
-# ---------------------------------------------------------------------------
-# MISO load forecast
-# ---------------------------------------------------------------------------
 def fetch_miso_load_forecast(force=False):
-    if _MISO_MODEL is None:
-        return {}
-
-    if not force and _MISO_FORECAST_CACHE_FILE.exists():
-        age_h = (time.time() - _MISO_FORECAST_CACHE_FILE.stat().st_mtime) / 3600
-        if age_h < FORECAST_CACHE_TTL_HOURS:
-            try:
-                cached = json.loads(_MISO_FORECAST_CACHE_FILE.read_text())
-                if isinstance(cached, dict) and cached.get("load"):
-                    if cached["load"][0]["date"] == date.today().isoformat():
-                        return cached
-            except Exception:
-                pass
-
-    session = requests.Session()
-    session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
-
-    miso_avg_c: dict = {}
-    miso_hi_c:  dict = {}
-    miso_lo_c:  dict = {}
-    forecast_dates_strs = None
-
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(_fetch_one, loc["label"], loc["lat"], loc["lon"], session): loc
-                for loc in MISO_LOAD_LOCATIONS}
-        for fut in as_completed(futs):
-            res = fut.result()
-            if not res:
-                continue
-            label = res["label"]
-            def f_to_c(lst):
-                return [(v - 32) * 5 / 9 if v is not None else None for v in lst]
-            hi_c  = f_to_c(res["hi"])
-            lo_c  = f_to_c(res["lo"])
-            avg_c = [(h + l) / 2 if h and l else None for h, l in zip(hi_c, lo_c)]
-            miso_avg_c[label] = avg_c
-            miso_hi_c[label]  = hi_c
-            miso_lo_c[label]  = lo_c
-            if forecast_dates_strs is None:
-                forecast_dates_strs = res["dates"][:15]
-
-    if not miso_avg_c or not forecast_dates_strs:
-        return {}
-
-    forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
-
-    from temperature_modeling._era5 import fetch_era5_daily
-    from temperature_modeling.pjm_load import _build_features as _bf
-    from temperature_modeling.models import Coordinates as _C
-
-    era5_session = requests.Session()
-    era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
-    today = date.today()
-    era5_avg_hist: dict = {}
-    recent_avg_f = []
-    try:
-        per_label = {}
-        for loc in MISO_LOAD_LOCATIONS:
-            per_label[loc["label"]] = fetch_era5_daily(
-                _C(loc["lat"], loc["lon"]), today - timedelta(days=16),
-                today - timedelta(days=1), era5_session,
-            )
-        era5_avg_hist = per_label
-        for lag_d in sorted([today - timedelta(days=k) for k in range(8, 0, -1)]):
-            c_map = {loc["label"]: per_label[loc["label"]][lag_d]
-                     for loc in MISO_LOAD_LOCATIONS
-                     if lag_d in per_label.get(loc["label"], {})}
-            if c_map:
-                recent_avg_f.append(weighted_avg_temp_f_miso(c_map))
-    except Exception:
-        recent_avg_f = []
-
-    hindcast: dict = {}
-    if era5_avg_hist:
-        try:
-            avg_f_hist: dict = {}
-            for off in range(16):
-                d2 = today - timedelta(days=off + 1)
-                c_map = {loc["label"]: era5_avg_hist[loc["label"]][d2]
-                         for loc in MISO_LOAD_LOCATIONS
-                         if d2 in era5_avg_hist.get(loc["label"], {})}
-                if c_map:
-                    avg_f_hist[d2] = weighted_avg_temp_f_miso(c_map)
-            for d2, avg_f in avg_f_hist.items():
-                lag1 = avg_f_hist.get(d2 - timedelta(days=1))
-                lag2 = avg_f_hist.get(d2 - timedelta(days=2))
-                lag7 = avg_f_hist.get(d2 - timedelta(days=7))
-                rv = [avg_f_hist.get(d2 - timedelta(days=k)) for k in range(7)]
-                roll7 = sum(v for v in rv if v) / max(sum(1 for v in rv if v), 1)
-                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7)
-                hindcast[d2.isoformat()] = round(_MISO_MODEL.predict([feats])[0] / 1000, 2)
-        except Exception:
-            hindcast = {}
-
-    load_forecasts = _MISO_MODEL.predict_with_uncertainty(
-        forecast_temps_c=miso_avg_c, forecast_hi_c=miso_hi_c, forecast_lo_c=miso_lo_c,
-        gefs_spread_c={}, forecast_dates=forecast_dates_list,
-        recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
-    )
-
-    load_data = [{"date": lf.valid_date.isoformat(),
-                  "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
-                  "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
-                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
-                 for lf in load_forecasts]
-
-    try:
-        comparison = fetch_miso_official_comparison(session)
-    except Exception:
-        comparison = {"actual": {}, "da_fcst": {}}
-    try:
-        miso_7day_data = fetch_miso_7day(session)
-    except Exception:
-        miso_7day_data = {}
-    try:
-        backtest = run_load_backtest(_MISO_MODEL, str(_MISO_TRAINING_DATA_PATH))
-    except Exception:
-        backtest = {}
-
-    result = {"load": load_data, "dates": forecast_dates_strs,
-              "comparison": comparison, "miso_7day": miso_7day_data,
-              "backtest": backtest, "hindcast": hindcast}
-    _MISO_FORECAST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _MISO_FORECAST_CACHE_FILE.write_text(json.dumps(result))
-    return result
+    return _fetch_iso_forecast("miso", force=force)
 
 
 # ---------------------------------------------------------------------------
-# Startup — pre-load PJM forecast
+# Startup — pre-load all ISO comparison data so EIA quota isn't exhausted
+# by the time the user clicks ERCOT or MISO tabs.
 # ---------------------------------------------------------------------------
-print("\nLoading forecasts...")
+_build_iso_configs()
+
+log.info("Loading PJM forecast at startup...")
 _startup_data = fetch_pjm_load_forecast()
-print(f"  Dashboard at http://127.0.0.1:8050\n")
+
+
+def _prefetch_comparisons():
+    """Populate comparison caches for CAISO, ERCOT, MISO at startup."""
+    import time as _t
+    from temperature_modeling.caiso_load import fetch_caiso_official_comparison
+    from temperature_modeling.ercot_load import fetch_ercot_official_comparison
+    from temperature_modeling.miso_load  import fetch_miso_official_comparison
+
+    _s = requests.Session()
+    _s.headers["User-Agent"] = "grid-dashboard/startup"
+    for label, fn in [
+        ("CAISO", lambda: fetch_caiso_official_comparison(_s)),
+        ("ERCOT", lambda: fetch_ercot_official_comparison(_s)),
+        ("MISO",  lambda: fetch_miso_official_comparison(_s)),
+    ]:
+        try:
+            result = fn()
+            n = len(result.get("actual", {}))
+            log.info("%s comparison: %d days cached", label, n)
+        except Exception:
+            log.exception("%s comparison prefetch failed", label)
+        _t.sleep(1)
+
+
+import threading as _threading
+_threading.Thread(target=_prefetch_comparisons, daemon=True).start()
+
+log.info("Dashboard ready at http://127.0.0.1:8050")
 
 
 # ---------------------------------------------------------------------------
@@ -777,14 +486,23 @@ _TAB_SEL   = {"padding": "10px 22px", "fontSize": "13px", "fontWeight": 600,
               "borderTop": "2px solid #2563eb"}
 
 METHODOLOGY_NOTE = """
-**Methodology** — Forecasts are produced by an XGBoost gradient-boosted regression model trained on 2 years of daily EIA \
-load data paired with ERA5 reanalysis temperatures. Temperature inputs are population-weighted across 12 monitoring \
-locations per ISO footprint. Features include heating/cooling degree-days (HDD/CDD) from daily average, high, and low \
-temperatures; day-of-week one-hot encoding; US federal holiday and holiday-week flags; bridge-day indicators; T-1, T-2, \
-and T-7 temperature lags; and a 7-day rolling average temperature (captures heat-wave persistence and population \
-acclimatisation). Forward forecasts use GFS NWP output from Open-Meteo (15-day horizon). Historical hindcast uses \
-ERA5 reanalysis. PJM comparison benchmark: official 7-day forecast from PJM DataMiner API. CAISO comparison benchmark: \
-OASIS 7-day system load forecast. Backtest uses a chronological 80/20 train/test split.
+**Methodology** — Separate machine learning models are trained for each ISO (PJM, CAISO, ERCOT, MISO) on 2 years of \
+hourly EIA demand data aggregated to daily averages, paired with ERA5 reanalysis temperatures. Temperature inputs are \
+population-weighted across 12 representative monitoring locations per ISO footprint. Features include \
+heating/cooling degree-days (HDD/CDD) from daily average, high, and low temperatures; day-of-week encoding; \
+US federal holiday and holiday-week flags; bridge-day indicators; T−1, T−2, and T−7 temperature lags; and a 7-day \
+rolling average temperature to capture heat-wave persistence and population acclimatisation (27 features total). \
+Forward forecasts use GFS NWP output via Open-Meteo (15-day horizon). Historical hindcast uses ERA5 reanalysis. \
+**ISO coverage:** PJM (Eastern US, ~65 GW peak) — 12 locations from Chicago to Washington DC; \
+CAISO (California, ~45 GW peak) — 12 locations from San Diego to Sacramento; \
+ERCOT (Texas, ~80 GW peak) — 12 locations from Houston to Amarillo; \
+MISO (Midcontinent, ~120 GW peak) — 12 locations from New Orleans to Fargo. \
+**Benchmarks:** PJM uses PJM DataMiner official 7-day forecast; CAISO uses CAISO OASIS 7-day system forecast; \
+ERCOT uses ERCOT public reports API when available, otherwise EIA day-ahead; MISO uses EIA day-ahead demand forecast. \
+**Accuracy note:** The hindcast MAPE shown (~0.4–0.5%) is measured under ERA5 observed temperatures on the \
+held-out 20% test set — it reflects model fit given known weather, not live forecast skill. \
+Forward forecast error, driven by GFS temperature uncertainty, is higher and consistent with industry norms of \
+1–3% day-ahead and 3–5% week-ahead for temperature-driven load models.
 """
 
 
@@ -815,7 +533,7 @@ app.layout = html.Div(
                     html.H1("Grid Load Forecast",
                             style={"margin": 0, "fontSize": "18px", "fontWeight": 700,
                                    "color": "#0f172a"}),
-                    html.Span(f"PJM · CAISO  ·  Updated {datetime.now().strftime('%d %b %Y')}",
+                    html.Span(f"PJM · CAISO · ERCOT · MISO  ·  Updated {datetime.now().strftime('%d %b %Y')}",
                               style={"color": "#94a3b8", "fontSize": "12px"}),
                 ]),
                 html.Button(
@@ -859,7 +577,29 @@ app.layout = html.Div(
                 # Summary cards
                 html.Div(id="load-cards",
                          style={"display": "flex", "gap": "12px",
-                                "flexWrap": "wrap", "marginBottom": "20px"}),
+                                "flexWrap": "wrap", "marginBottom": "16px"}),
+
+                # ── AI Forecast Brief ──────────────────────────────────────────
+                html.Div(id="ai-brief-card",
+                         style={"marginBottom": "16px"}),
+
+                # ── Ensemble toggle ────────────────────────────────────────────
+                html.Div(
+                    style={"display": "flex", "alignItems": "center", "gap": "10px",
+                           "marginBottom": "12px"},
+                    children=[
+                        dcc.Checklist(
+                            id="ensemble-toggle",
+                            options=[{"label": " Apply teleconnection ensemble (NAO / AO / PNA / MJO)",
+                                      "value": "on"}],
+                            value=[],
+                            inputStyle={"cursor": "pointer"},
+                            labelStyle={"fontSize": "12px", "color": "#475569",
+                                        "cursor": "pointer"},
+                        ),
+                        html.Span(id="ensemble-badge", style={"fontSize": "11px"}),
+                    ],
+                ),
 
                 # ── Forecast chart ─────────────────────────────────────────────
                 html.Div(
@@ -957,24 +697,32 @@ app.layout = html.Div(
                                         "color": "#475569", "textTransform": "uppercase",
                                         "letterSpacing": "0.06em", "marginBottom": "8px"}),
                         html.P(
-                            "Forecasts are produced by an XGBoost gradient-boosted regression model "
-                            "trained on 2 years of daily EIA load data paired with ERA5 reanalysis "
-                            "temperatures across 12 population-weighted monitoring locations per ISO "
-                            "footprint. Features include heating/cooling degree-days (HDD/CDD) from "
-                            "daily average, high, and low temperatures; day-of-week one-hot encoding; "
-                            "US federal holiday and holiday-week flags; bridge-day indicators; T−1, T−2, "
-                            "and T−7 temperature lags; and a 7-day rolling average temperature (captures "
-                            "heat-wave persistence and population acclimatisation). 27 features total.",
+                            "Separate machine learning models are trained for each ISO (PJM, CAISO, ERCOT, MISO) "
+                            "on 2 years of hourly EIA demand data aggregated to daily averages, paired with ERA5 "
+                            "reanalysis temperatures population-weighted across 12 representative locations per ISO. "
+                            "Features include HDD/CDD from daily average, high, and low temperatures; day-of-week "
+                            "encoding; US federal holiday flags; T−1, T−2, and T−7 temperature lags; and a 7-day "
+                            "rolling average temperature to capture heat-wave persistence (27 features total). "
+                            "Forward forecasts use GFS NWP output via Open-Meteo (15-day horizon); historical "
+                            "hindcast uses ERA5 reanalysis.",
                             style={"fontSize": "12px", "color": "#64748b",
                                    "lineHeight": "1.7", "margin": "0 0 8px 0"},
                         ),
                         html.P(
-                            "Forward forecasts use GFS NWP output via Open-Meteo (15-day horizon). "
-                            "Historical hindcast uses ERA5 reanalysis. "
-                            "PJM benchmark: official 7-day forecast from PJM DataMiner API. "
-                            "CAISO benchmark: OASIS 7-day system load forecast. "
-                            "Backtest uses a chronological 80/20 train/test split — "
-                            "PJM test MAPE: 0.4% · CAISO test MAPE: 0.3%.",
+                            "ISO coverage — "
+                            "PJM (Eastern US, ~65 GW peak): 12 locations from Chicago to Washington DC. "
+                            "CAISO (California, ~45 GW peak): 12 locations from San Diego to Sacramento. "
+                            "ERCOT (Texas, ~80 GW peak): 12 locations weighted by population from Houston to Amarillo. "
+                            "MISO (Midcontinent, ~120 GW peak): 12 locations from New Orleans to Fargo. "
+                            "Benchmarks — PJM: PJM DataMiner official 7-day forecast. "
+                            "CAISO: CAISO OASIS 7-day system forecast. "
+                            "ERCOT: ERCOT public reports API (ERCOT_API_KEY) or EIA day-ahead. "
+                            "MISO: EIA day-ahead demand forecast. "
+                            "Accuracy note: the hindcast MAPE shown (~0.4–0.5%) is measured under ERA5 "
+                            "observed temperatures on the held-out 20% test set — it reflects model fit "
+                            "given known weather, not live forecast skill. Forward forecast error (GFS "
+                            "temperature uncertainty) is higher, consistent with industry norms of "
+                            "1–3% day-ahead and 3–5% week-ahead for temperature-driven load models.",
                             style={"fontSize": "12px", "color": "#64748b",
                                    "lineHeight": "1.7", "margin": 0},
                         ),
@@ -984,8 +732,76 @@ app.layout = html.Div(
             ],
         ),
 
+        # ── AI Chat panel ─────────────────────────────────────────────────────
+        html.Div(
+            style={"maxWidth": "1400px", "margin": "0 auto",
+                   "padding": "0 24px 40px 24px"},
+            children=[
+                html.Div(
+                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                           "border": "1px solid #e2e8f0", "padding": "20px",
+                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "alignItems": "center",
+                                   "gap": "8px", "marginBottom": "12px"},
+                            children=[
+                                html.Div("Ask the Forecast AI",
+                                         style={"fontSize": "13px", "fontWeight": 600,
+                                                "color": "#0f172a"}),
+                                html.Span("Powered by Claude",
+                                          style={"fontSize": "10px", "color": "#94a3b8",
+                                                 "background": "#f1f5f9",
+                                                 "borderRadius": "4px",
+                                                 "padding": "2px 7px"}),
+                            ],
+                        ),
+                        # Chat history display
+                        html.Div(id="chat-history",
+                                 style={"minHeight": "60px", "maxHeight": "320px",
+                                        "overflowY": "auto", "marginBottom": "12px",
+                                        "padding": "8px 0",
+                                        "borderBottom": "1px solid #f1f5f9"}),
+                        # Input row
+                        html.Div(
+                            style={"display": "flex", "gap": "8px", "alignItems": "flex-end"},
+                            children=[
+                                dcc.Textarea(
+                                    id="chat-input",
+                                    placeholder="Ask about the forecast… e.g. 'Why is load spiking Thursday?' or 'What does the ERCOT reserve margin mean?'",
+                                    style={"flex": 1, "height": "60px", "resize": "vertical",
+                                           "fontSize": "13px", "padding": "8px 12px",
+                                           "border": "1px solid #e2e8f0",
+                                           "borderRadius": "6px", "color": "#1e293b",
+                                           "fontFamily": "Inter, system-ui, sans-serif"},
+                                ),
+                                html.Button(
+                                    "Send", id="chat-submit",
+                                    style={"background": "#2563eb", "color": "#ffffff",
+                                           "border": "none", "borderRadius": "6px",
+                                           "padding": "10px 20px", "fontSize": "13px",
+                                           "fontWeight": 600, "cursor": "pointer",
+                                           "height": "60px", "minWidth": "70px"},
+                                ),
+                                html.Button(
+                                    "Clear", id="chat-clear",
+                                    style={"background": "#f1f5f9", "color": "#475569",
+                                           "border": "1px solid #e2e8f0",
+                                           "borderRadius": "6px", "padding": "10px 16px",
+                                           "fontSize": "13px", "cursor": "pointer",
+                                           "height": "60px"},
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        ),
+
         # Store
         dcc.Store(id="load-forecast-store"),
+        dcc.Store(id="ensemble-store"),
+        dcc.Store(id="chat-history-store", data=[]),
         dcc.Store(id="dc-selected-mw", data=0),
         dcc.Interval(id="daily-refresh", interval=24 * 60 * 60 * 1000, n_intervals=0),
     ],
@@ -1073,20 +889,19 @@ def render(data, iso):
         if r < 0.94: return "#3b82f6"
         return "#22c55e"
 
-    # 14-day hindcast MAPE vs EIA actual
     actual_dict = comparison.get("actual", {})
     da_dict     = comparison.get("da_fcst", {})
-    h_errs = [abs(combined_hindcast[d] - actual_dict[d]) / actual_dict[d] * 100
-              for d in combined_hindcast if d in actual_dict and actual_dict[d]]
-    recent_mape = sum(h_errs[-14:]) / len(h_errs[-14:]) if h_errs else None
-    mape_str = f"{recent_mape:.1f}%" if recent_mape is not None else "—"
-    mape_col = "#22c55e" if recent_mape is not None and recent_mape < 3 else "#f97316"
+
+    # Use held-out test-set MAPE from the 2-year backtest (last 20% ~ 150 days)
+    test_mape = backtest.get("mape_test")
+    mape_str  = f"{test_mape:.1f}%" if test_mape is not None else "—"
+    mape_col  = "#22c55e" if test_mape is not None and test_mape < 3 else "#f97316"
 
     summary_cards = [
         card("Today (GW)", f"{today_gw:.1f}", "GFS-based", load_color(today_gw)),
         card("15-Day Peak", f"{peak_gw:.1f}", f"on {peak_lbl}", load_color(peak_gw)),
         card("15-Day Avg", f"{avg_gw:.1f}", "GW baseline", "#475569"),
-        card("Model vs Actual", mape_str, "14-day MAPE", mape_col),
+        card("Hindcast MAPE", mape_str, "ERA5 obs. temps", mape_col),
     ]
 
     subtitle = f"{iso_label}  ·  GFS temperature input  ·  {len(dates)}-day horizon"
@@ -1142,17 +957,20 @@ def render(data, iso):
                   "CAISO OASIS"),
         "pjm":   ("pjm_7day",   "PJM Official 7-Day (DataMiner)",       "#2563eb",
                   "PJM official"),
-        "ercot": ("ercot_7day",  "ERCOT Official 7-Day",                 "#7c3aed",
-                  "ERCOT official"),
-        "miso":  ("miso_7day",   "MISO Official 7-Day",                  "#0891b2",
-                  "MISO official"),
+        "ercot": ("ercot_7day",  "ERCOT 7-Day Forecast",                 "#7c3aed",
+                  "ERCOT forecast"),
+        "miso":  ("miso_7day",   "MISO EIA Day-Ahead Forecast",          "#0891b2",
+                  "MISO EIA DA"),
     }
     bench_key, bench_name, bench_color, bench_hover = _bench_cfg.get(
         iso, ("pjm_7day", "Official 7-Day", "#2563eb", "Official")
     )
     bench_data  = data.get(bench_key, {})
     bench_dates = sorted(d for d in bench_data if d in dates)
-    if bench_dates:
+    # Only show the benchmark trace when it's a real multi-day forecast (3+ days).
+    # With only 1-2 days it's EIA day-ahead data, which is already shown below
+    # as the "EIA Day-Ahead" markers — no point duplicating it.
+    if len(bench_dates) >= 3:
         fig.add_trace(go.Scatter(
             x=bench_dates, y=[bench_data[d] for d in bench_dates],
             mode="lines+markers", name=bench_name,
@@ -1191,6 +1009,165 @@ def render(data, iso):
     )
 
     return summary_cards, subtitle, fig
+
+
+# ---------------------------------------------------------------------------
+# AI Brief callback
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("ai-brief-card", "children"),
+    Input("load-forecast-store", "data"),
+    Input("iso-selector", "value"),
+)
+def render_ai_brief(data, iso):
+    if not data or not data.get("load"):
+        return []
+    brief = generate_forecast_brief(iso, data)
+    if not brief:
+        return []
+    return html.Div(
+        style={"backgroundColor": "#fffbeb", "border": "1px solid #fde68a",
+               "borderRadius": "8px", "padding": "14px 18px",
+               "display": "flex", "gap": "12px", "alignItems": "flex-start"},
+        children=[
+            html.Span("AI", style={"background": "#f59e0b", "color": "#ffffff",
+                                   "borderRadius": "4px", "padding": "2px 6px",
+                                   "fontSize": "10px", "fontWeight": 700,
+                                   "flexShrink": 0, "marginTop": "1px"}),
+            html.P(brief, style={"margin": 0, "fontSize": "13px",
+                                  "color": "#78350f", "lineHeight": "1.65"}),
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ensemble callback — runs teleconnection adjustment when toggle is on
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("ensemble-store", "data"),
+    Output("ensemble-badge", "children"),
+    Input("ensemble-toggle", "value"),
+    Input("load-forecast-store", "data"),
+    Input("iso-selector", "value"),
+)
+def run_ensemble(toggle_value, data, iso):
+    if not toggle_value or not data or not data.get("load"):
+        return {}, ""
+
+    from temperature_modeling.models import LoadForecast as _LF
+    from datetime import date as _date
+
+    # Reconstruct LoadForecast objects from the store
+    load_list = data.get("load", [])
+    xgb_forecasts = [
+        _LF(
+            valid_date=_date.fromisoformat(d["date"]),
+            lead_days=i,
+            mean_load_mw=d["mean_load_gw"] * 1000,
+            low_load_mw=d["low_load_gw"]   * 1000,
+            high_load_mw=d["high_load_gw"] * 1000,
+            hdd=0.0, cdd=0.0, avg_temp_f=0.0,
+        )
+        for i, d in enumerate(load_list)
+    ]
+
+    try:
+        session = requests.Session()
+        session.headers["User-Agent"] = "grid-dashboard-ensemble/1.0"
+        adjusted, meta = get_ensemble_forecast(iso, xgb_forecasts, session)
+    except Exception:
+        log.exception("Ensemble callback failed")
+        return {}, html.Span("Ensemble error", style={"color": "#ef4444", "fontSize": "11px"})
+
+    if not meta.get("ensemble_available"):
+        return {}, html.Span("Teleconnection data unavailable",
+                              style={"color": "#94a3b8", "fontSize": "11px"})
+
+    # Overwrite load data with adjusted values
+    adj_data = [
+        {"date": lf.valid_date.isoformat(),
+         "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
+         "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
+         "high_load_gw": round(lf.high_load_mw / 1000, 2)}
+        for lf in adjusted
+    ]
+
+    conf = meta.get("confidence", "low")
+    conf_color = {"high": "#22c55e", "medium": "#f97316", "low": "#94a3b8"}.get(conf, "#94a3b8")
+    badge = html.Span(
+        [html.Span(f"Ensemble active — {conf} confidence: ", style={"color": "#475569"}),
+         html.Span(meta.get("headline", ""), style={"color": "#0f172a"})],
+        style={"fontSize": "11px"},
+    )
+    return {"load": adj_data, "reasoning": meta.get("reasoning", ""),
+            "confidence": conf, "confidence_color": conf_color}, badge
+
+
+# ---------------------------------------------------------------------------
+# Chat callbacks
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("chat-history-store", "data"),
+    Output("chat-input", "value"),
+    Input("chat-submit", "n_clicks"),
+    Input("chat-clear", "n_clicks"),
+    dash.dependencies.State("chat-input", "value"),
+    dash.dependencies.State("chat-history-store", "data"),
+    dash.dependencies.State("load-forecast-store", "data"),
+    dash.dependencies.State("iso-selector", "value"),
+    prevent_initial_call=True,
+)
+def handle_chat(submit_clicks, clear_clicks, user_input, history, forecast_data, iso):
+    del submit_clicks, clear_clicks  # trigger-only; ctx.triggered_id used instead
+    from dash import ctx
+    if ctx.triggered_id == "chat-clear":
+        return [], ""
+    if not user_input or not user_input.strip():
+        return history or [], ""
+
+    history = history or []
+    response = generate_chat_response(iso, forecast_data or {}, user_input.strip(), history)
+    updated = history + [
+        {"role": "user",      "content": user_input.strip()},
+        {"role": "assistant", "content": response},
+    ]
+    return updated, ""
+
+
+@app.callback(
+    Output("chat-history", "children"),
+    Input("chat-history-store", "data"),
+)
+def render_chat(history):
+    if not history:
+        return html.Div("Ask anything about the current forecast, methodology, or market context.",
+                        style={"color": "#94a3b8", "fontSize": "12px", "padding": "4px 0"})
+
+    bubbles = []
+    for msg in history:
+        is_user = msg["role"] == "user"
+        bubbles.append(html.Div(
+            style={
+                "display": "flex",
+                "justifyContent": "flex-end" if is_user else "flex-start",
+                "marginBottom": "10px",
+            },
+            children=[
+                html.Div(
+                    msg["content"],
+                    style={
+                        "maxWidth": "80%",
+                        "background":   "#2563eb" if is_user else "#f1f5f9",
+                        "color":        "#ffffff"  if is_user else "#1e293b",
+                        "borderRadius": "12px 12px 2px 12px" if is_user else "12px 12px 12px 2px",
+                        "padding":      "10px 14px",
+                        "fontSize":     "13px",
+                        "lineHeight":   "1.55",
+                    },
+                ),
+            ],
+        ))
+    return bubbles
 
 
 # ---------------------------------------------------------------------------

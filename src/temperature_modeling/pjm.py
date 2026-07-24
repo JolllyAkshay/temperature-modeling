@@ -1,4 +1,8 @@
+import logging as _logging
+
 from .exceptions import LocationNotInPJMError
+
+_log = _logging.getLogger(__name__)
 
 PJM_STATES: frozenset = frozenset({
     "DE",  # Delaware
@@ -58,6 +62,15 @@ PJM_LOAD_LOCATIONS: list[dict] = [
     {"label": "Charlotte NC",    "lat": 35.0, "lon": -80.5, "weight": 0.09},
     {"label": "Pittsburgh PA",   "lat": 40.5, "lon": -80.0, "weight": 0.09},
 ]
+
+
+_pjm_weight_sum = sum(loc["weight"] for loc in PJM_LOAD_LOCATIONS)
+if abs(_pjm_weight_sum - 1.0) > 0.01:
+    _log.warning(
+        "PJM_LOAD_LOCATIONS weights sum to %.4f (expected 1.0); "
+        "weighted_avg_temp_f normalises, so results are correct, but consider updating weights.",
+        _pjm_weight_sum,
+    )
 
 
 def validate_pjm_state(state: str) -> None:

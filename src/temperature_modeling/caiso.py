@@ -4,6 +4,10 @@ Covers the CISO EIA respondent footprint (~30M people in California).
 Weights sum to 1.0 and are proportional to metro population within CISO territory.
 """
 
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
 CAISO_LOAD_LOCATIONS: list[dict] = [
     {"label": "Los Angeles CA",   "lat": 34.05, "lon": -118.25, "weight": 0.35},
     {"label": "Riverside CA",     "lat": 33.95, "lon": -117.40, "weight": 0.12},
@@ -18,3 +22,11 @@ CAISO_LOAD_LOCATIONS: list[dict] = [
     {"label": "Palm Springs CA",  "lat": 33.83, "lon": -116.54, "weight": 0.03},
     {"label": "Santa Barbara CA", "lat": 34.42, "lon": -119.70, "weight": 0.03},
 ]
+
+_caiso_weight_sum = sum(loc["weight"] for loc in CAISO_LOAD_LOCATIONS)
+if abs(_caiso_weight_sum - 1.0) > 0.01:
+    _log.warning(
+        "CAISO_LOAD_LOCATIONS weights sum to %.4f (expected 1.0); "
+        "weighted average normalises, so results are correct, but consider updating weights.",
+        _caiso_weight_sum,
+    )

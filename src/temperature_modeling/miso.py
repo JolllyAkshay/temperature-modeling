@@ -5,6 +5,10 @@ South (AR, LA, MS, TX panhandle) footprint (~45M people).
 Weights sum to 1.0 and are proportional to metro population within MISO territory.
 """
 
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
 MISO_LOAD_LOCATIONS: list[dict] = [
     {"label": "Chicago IL",      "lat": 41.85, "lon": -87.65, "weight": 0.18},
     {"label": "Detroit MI",      "lat": 42.33, "lon": -83.05, "weight": 0.11},
@@ -19,3 +23,11 @@ MISO_LOAD_LOCATIONS: list[dict] = [
     {"label": "Little Rock AR",  "lat": 34.75, "lon": -92.29, "weight": 0.06},
     {"label": "Fargo ND",        "lat": 46.88, "lon": -96.79, "weight": 0.06},
 ]
+
+_miso_weight_sum = sum(loc["weight"] for loc in MISO_LOAD_LOCATIONS)
+if abs(_miso_weight_sum - 1.0) > 0.01:
+    _log.warning(
+        "MISO_LOAD_LOCATIONS weights sum to %.4f (expected 1.0); "
+        "weighted average normalises, so results are correct, but consider updating weights.",
+        _miso_weight_sum,
+    )

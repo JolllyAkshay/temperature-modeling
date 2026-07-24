@@ -29,6 +29,18 @@ htmlcov/
 *.swp
 *.swo
 
+# Environment / secrets — never commit API keys
+.env
+.env.local
+.env.*.local
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime / generated
+api_cache/
+logs/
+*.log
+backtest_results.jsonl
+eccodes_libs/

@@ -401,10 +401,80 @@ def fetch_miso_official_comparison(
 
 
 # ---------------------------------------------------------------------------
-# MISO 7-day official load forecast
-# MISO Market Information System (MIS) requires login for detailed forecasts.
-# We return {} here; future work can integrate the MISO public API.
+# MISO 7-day load forecast proxy
+# MISO's detailed forecast requires a full Data Exchange account.
+# We use EIA day-ahead forecast (type=DF, respondent=MISO) as a proxy.
 # ---------------------------------------------------------------------------
 
 def fetch_miso_7day(session: requests.Session) -> Dict[str, float]:
-    return {}
+    import json as _json, time as _time
+    from collections import defaultdict
+
+    cache_path = _MISO_7DAY_CACHE
+    if os.path.exists(cache_path):
+        try:
+            age_h = (_time.time() - os.path.getmtime(cache_path)) / 3600
+            if age_h < 2:
+                cached = _json.loads(open(cache_path).read())
+                if cached:
+                    return cached
+        except Exception:
+            pass
+
+    today   = date.today()
+    fwd_end = today + timedelta(days=7)
+
+    all_rows: list = []
+    offset = 0
+    while True:
+        params = {
+            "api_key":              _EIA_KEY,
+            "frequency":            "hourly",
+            "data[0]":              "value",
+            "facets[respondent][]": "MISO",
+            "facets[type][]":       "DF",
+            "start":                today.strftime("%Y-%m-%dT00"),
+            "end":                  fwd_end.strftime("%Y-%m-%dT23"),
+            "length":               5000,
+            "offset":               offset,
+            "sort[0][column]":      "period",
+            "sort[0][direction]":   "asc",
+        }
+        try:
+            r = session.get(_EIA_BASE, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            break
+        rows  = data.get("response", {}).get("data", [])
+        total = int(data.get("response", {}).get("total", 0))
+        all_rows.extend(rows)
+        offset += 5000
+        if offset >= total:
+            break
+
+    daily_lists: dict = defaultdict(list)
+    for row in all_rows:
+        period = row.get("period", "")
+        val    = row.get("value")
+        if val is None:
+            continue
+        try:
+            daily_lists[period[:10]].append(float(val))
+        except (ValueError, TypeError):
+            continue
+
+    result = {
+        d: round(sum(v) / len(v) / 1000, 2)
+        for d, v in daily_lists.items()
+        if v
+    }
+
+    if result:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            open(cache_path, "w").write(_json.dumps(result))
+        except Exception:
+            pass
+
+    return result

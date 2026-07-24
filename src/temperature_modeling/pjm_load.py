@@ -8,6 +8,8 @@ Improvements over v1:
   - Separate daily high / low in addition to avg (better HDD/CDD split)
 """
 
+import calendar
+import logging
 import math
 import os
 import pickle
@@ -16,6 +18,15 @@ from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import requests
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Named constants — avoids magic numbers scattered through the codebase
+# ---------------------------------------------------------------------------
+HDD_CDD_BASE_F: float = 65.0   # standard base temperature for HDD/CDD calculation
+UNCERTAINTY_Z:  float = 1.645  # z-score for 90% confidence interval (5th/95th pct)
+N_FEATURES:     int   = 27     # total feature vector length expected by the model
 
 try:
     import holidays as _holidays_lib
@@ -150,7 +161,7 @@ def fetch_era5_daily_hi_lo(
 # HDD / CDD helpers
 # ---------------------------------------------------------------------------
 
-def compute_hdd_cdd(avg_temp_f: float, base_f: float = 65.0) -> Tuple[float, float]:
+def compute_hdd_cdd(avg_temp_f: float, base_f: float = HDD_CDD_BASE_F) -> Tuple[float, float]:
     return max(0.0, base_f - avg_temp_f), max(0.0, avg_temp_f - base_f)
 
 
@@ -310,7 +321,8 @@ def _build_features(
     hdd_hi, cdd_hi = compute_hdd_cdd(hi_f)
     hdd_lo, cdd_lo = compute_hdd_cdd(lo_f)
 
-    doy_rad = 2 * math.pi * d.timetuple().tm_yday / 365.0
+    days_in_year = 366.0 if calendar.isleap(d.year) else 365.0
+    doy_rad = 2 * math.pi * d.timetuple().tm_yday / days_in_year
     dow = [1.0 if d.weekday() == i else 0.0 for i in range(7)]
 
     lag1 = lag1_f if lag1_f is not None else avg_f
@@ -469,7 +481,7 @@ class LoadCorrectionModel:
                     total_w  += w
             spread_f = (total_ws / total_w) if total_w > 0 else 3.0  # fallback 3°F
 
-            z = 1.645
+            z = UNCERTAINTY_Z
             low_feats,  _, _ = _build_features(avg_f - z * spread_f, hi_f - z * spread_f,
                                                 lo_f - z * spread_f, d, lag1, lag2, lag7, roll7)
             high_feats, _, _ = _build_features(avg_f + z * spread_f, hi_f + z * spread_f,

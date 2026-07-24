@@ -41,6 +41,9 @@ _ERCOT_7DAY_CACHE = os.path.join(
     os.path.dirname(__file__), "..", "..", "api_cache", "ercot_7day_cache.json"
 )
 
+_ERCOT_API_KEY = os.environ.get("ERCOT_API_KEY", "")
+_ERCOT_7DAY_URL = "https://api.ercot.com/api/public-reports/np3-565-cd/lf_by_model_weather_zone"
+
 _ERCOT_COMPARISON_CACHE = os.path.join(
     os.path.dirname(__file__), "..", "..", "api_cache", "ercot_comparison_cache.json"
 )
@@ -400,13 +403,16 @@ def fetch_ercot_official_comparison(
 
 
 # ---------------------------------------------------------------------------
-# ERCOT public reports — 7-day load forecast
-# ERCOT publishes load forecasts at mis.ercot.com; no subscription key needed
-# for the "Seven Day Load Forecast" report.  Returns {} on failure.
+# ERCOT 7-day load forecast
+# Primary:  ERCOT public reports API (NP3-565-CD) — requires ERCOT_API_KEY
+#           from developer.ercot.com (free registration).
+# Fallback: EIA day-ahead demand forecast (type=DF, respondent=ERCO) —
+#           requires EIA_API_KEY (free at eia.gov/opendata/register.php).
 # ---------------------------------------------------------------------------
 
 def fetch_ercot_7day(session: requests.Session) -> Dict[str, float]:
     import json as _json, time as _time
+    from collections import defaultdict
 
     cache_path = _ERCOT_7DAY_CACHE
     if os.path.exists(cache_path):
@@ -422,38 +428,86 @@ def fetch_ercot_7day(session: requests.Session) -> Dict[str, float]:
     today = date.today()
     end   = today + timedelta(days=8)
 
-    # ERCOT public report: Seven Day Load Forecast (NP3-562-CD)
-    try:
+    # ── Primary: ERCOT NP3-565-CD ─────────────────────────────────────────────
+    api_key = os.environ.get("ERCOT_API_KEY", _ERCOT_API_KEY)
+    if api_key:
+        try:
+            r = session.get(
+                _ERCOT_7DAY_URL,
+                params={
+                    "startTime": today.strftime("%Y-%m-%dT00:00:00"),
+                    "endTime":   end.strftime("%Y-%m-%dT23:59:59"),
+                    "size": 336, "page": 1,
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Ocp-Apim-Subscription-Key": api_key,
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            items = r.json().get("data", {}).get("data", [])
+            daily: dict = defaultdict(list)
+            for row in items:
+                if row.get("inUseFlag") is False:
+                    continue
+                day = str(row.get("deliveryDate", ""))[:10]
+                mw  = row.get("systemTotal")
+                if day and mw is not None:
+                    daily[day].append(float(mw))
+            result = {d: round(sum(v) / len(v) / 1000, 2) for d, v in daily.items() if v}
+            if result:
+                try:
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    open(cache_path, "w").write(_json.dumps(result))
+                except Exception:
+                    pass
+                return result
+        except Exception:
+            pass
+
+    # ── Fallback: EIA day-ahead forecast (type=DF) ────────────────────────────
+    all_rows: list = []
+    offset = 0
+    while True:
         params = {
-            "startTime":    today.strftime("%Y-%m-%dT00:00:00"),
-            "endTime":      end.strftime("%Y-%m-%dT23:59:59"),
-            "size":         288,
-            "page":         1,
+            "api_key":              _EIA_KEY,
+            "frequency":            "hourly",
+            "data[0]":              "value",
+            "facets[respondent][]": "ERCO",
+            "facets[type][]":       "DF",
+            "start":                today.strftime("%Y-%m-%dT00"),
+            "end":                  end.strftime("%Y-%m-%dT23"),
+            "length":               5000,
+            "offset":               offset,
+            "sort[0][column]":      "period",
+            "sort[0][direction]":   "asc",
         }
-        r = session.get(
-            "https://api.ercot.com/api/public-reports/np3-562-cd/act_sys_load_by_wzn",
-            params=params,
-            headers={"Accept": "application/json"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        items = r.json().get("data", {}).get("data", [])
-    except Exception:
-        return {}
+        try:
+            r = session.get(_EIA_BASE, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            break
+        rows  = data.get("response", {}).get("data", [])
+        total = int(data.get("response", {}).get("total", 0))
+        all_rows.extend(rows)
+        offset += 5000
+        if offset >= total:
+            break
 
-    from collections import defaultdict
-    daily: dict = defaultdict(list)
-    for row in items:
-        day = str(row.get("operatingDay", ""))[:10]
-        mw  = row.get("systemTotal")
-        if day and mw is not None:
-            daily[day].append(float(mw))
+    daily2: dict = defaultdict(list)
+    for row in all_rows:
+        period = row.get("period", "")
+        val    = row.get("value")
+        if val is None:
+            continue
+        try:
+            daily2[period[:10]].append(float(val))
+        except (ValueError, TypeError):
+            continue
 
-    result = {
-        day: round(sum(vals) / len(vals) / 1000, 2)
-        for day, vals in daily.items()
-        if vals
-    }
+    result = {d: round(sum(v) / len(v) / 1000, 2) for d, v in daily2.items() if v}
 
     if result:
         try:

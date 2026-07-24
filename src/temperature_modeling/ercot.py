@@ -5,6 +5,10 @@ Weights sum to 1.0 and are proportional to metro population within ERCOT territo
 Note: El Paso is in WECC, not ERCOT.
 """
 
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
 ERCOT_LOAD_LOCATIONS: list[dict] = [
     {"label": "Houston TX",        "lat": 29.76, "lon": -95.37,  "weight": 0.28},
     {"label": "Dallas TX",         "lat": 32.78, "lon": -96.80,  "weight": 0.22},
@@ -19,3 +23,11 @@ ERCOT_LOAD_LOCATIONS: list[dict] = [
     {"label": "Amarillo TX",       "lat": 35.22, "lon": -101.83, "weight": 0.03},
     {"label": "Laredo TX",         "lat": 27.51, "lon": -99.51,  "weight": 0.02},
 ]
+
+_ercot_weight_sum = sum(loc["weight"] for loc in ERCOT_LOAD_LOCATIONS)
+if abs(_ercot_weight_sum - 1.0) > 0.01:
+    _log.warning(
+        "ERCOT_LOAD_LOCATIONS weights sum to %.4f (expected 1.0); "
+        "weighted average normalises, so results are correct, but consider updating weights.",
+        _ercot_weight_sum,
+    )
