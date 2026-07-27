@@ -444,6 +444,7 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         forecast_temps_c=avg_c, forecast_hi_c=hi_c, forecast_lo_c=lo_c,
         gefs_spread_c={}, forecast_dates=forecast_dates_list,
         recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
+        locations=locations, weighted_avg_fn=weighted_avg_fn,
     )
     load_data = [{"date": lf.valid_date.isoformat(),
                   "mean_load_gw": round(lf.mean_load_mw / 1000, 2),

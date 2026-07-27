@@ -407,22 +407,27 @@ class LoadCorrectionModel:
         gefs_spread_c:      Dict[str, List[float]],  # GEFS spread °C (optional)
         forecast_dates:     List[date],
         recent_avg_temps_f: List[float] = None,      # [T-2, T-1] actual °F for lag init
+        locations=None,                               # ISO location list; defaults to PJM
+        weighted_avg_fn=None,                         # ISO weighted-avg fn; defaults to PJM's
     ) -> List[LoadForecast]:
         """
         Produce a LoadForecast for each date, propagating temperature
         uncertainty from GEFS spread into load uncertainty.
         """
+        _locs   = locations    if locations    is not None else PJM_LOAD_LOCATIONS
+        _wt_avg = weighted_avg_fn if weighted_avg_fn is not None else weighted_avg_temp_f
+
         today = date.today()
         # Build a running list of avg temp forecasts (index 0 = today) for lags
         forecast_avg_f: List[Optional[float]] = []
         for i, d in enumerate(forecast_dates):
             temps_c = {
                 loc["label"]: (forecast_temps_c.get(loc["label"]) or [None]*20)[i]
-                for loc in PJM_LOAD_LOCATIONS
+                for loc in _locs
                 if (forecast_temps_c.get(loc["label"]) or [None]*20)[i] is not None
             }
             if temps_c:
-                forecast_avg_f.append(weighted_avg_temp_f(temps_c))
+                forecast_avg_f.append(_wt_avg(temps_c))
             else:
                 forecast_avg_f.append(None)
 
@@ -452,16 +457,16 @@ class LoadCorrectionModel:
             # Daily hi/lo
             hi_c_vals = {
                 loc["label"]: (forecast_hi_c.get(loc["label"]) or [None]*20)[i]
-                for loc in PJM_LOAD_LOCATIONS
+                for loc in _locs
                 if (forecast_hi_c.get(loc["label"]) or [None]*20)[i] is not None
             }
             lo_c_vals = {
                 loc["label"]: (forecast_lo_c.get(loc["label"]) or [None]*20)[i]
-                for loc in PJM_LOAD_LOCATIONS
+                for loc in _locs
                 if (forecast_lo_c.get(loc["label"]) or [None]*20)[i] is not None
             }
-            hi_f = weighted_avg_temp_f(hi_c_vals) if hi_c_vals else avg_f + 5
-            lo_f = weighted_avg_temp_f(lo_c_vals) if lo_c_vals else avg_f - 5
+            hi_f = _wt_avg(hi_c_vals) if hi_c_vals else avg_f + 5
+            lo_f = _wt_avg(lo_c_vals) if lo_c_vals else avg_f - 5
 
             lag1  = _lag(i, 1)
             lag2  = _lag(i, 2)
@@ -473,7 +478,7 @@ class LoadCorrectionModel:
 
             # Uncertainty from GEFS spread
             total_w = total_ws = 0.0
-            for loc in PJM_LOAD_LOCATIONS:
+            for loc in _locs:
                 spreads = gefs_spread_c.get(loc["label"])
                 if spreads and i < len(spreads) and spreads[i] is not None:
                     w = loc["weight"]
