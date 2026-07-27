@@ -10,6 +10,9 @@ import logging.config
 import os
 import sys
 import time
+
+from dotenv import load_dotenv
+load_dotenv()
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -73,8 +76,25 @@ from temperature_modeling.miso_load import (
     fetch_miso_official_comparison, fetch_miso_7day,
     weighted_avg_temp_f_miso,
 )
+from temperature_modeling.nyiso import NYISO_LOAD_LOCATIONS
+from temperature_modeling.nyiso_load import (
+    weighted_avg_temp_f_nyiso, _NYISO_MODEL_PATH,
+)
+from temperature_modeling.isone import ISONE_LOAD_LOCATIONS
+from temperature_modeling.isone_load import (
+    weighted_avg_temp_f_isone, _ISONE_MODEL_PATH,
+)
+from temperature_modeling.spp import SPP_LOAD_LOCATIONS
+from temperature_modeling.spp_load import (
+    weighted_avg_temp_f_spp, _SPP_MODEL_PATH,
+)
+from temperature_modeling import _llm
 from temperature_modeling.ai_brief import generate_forecast_brief, generate_chat_response
 from temperature_modeling.datacenter_agent import load_datacenter_projects
+from temperature_modeling.verification import record_forecast, load_verification_stats
+from temperature_modeling.net_load import fetch_net_load_forecast
+from temperature_modeling.price_forecast import forecast_prices
+from temperature_modeling.capacity_market import get_capacity_market_data, get_reserve_margin_color
 from temperature_modeling.ensemble import get_ensemble_forecast
 
 FORECAST_CACHE_TTL_HOURS = 3
@@ -87,6 +107,12 @@ _ERCOT_FORECAST_CACHE_FILE  = _HERE / "api_cache" / "ercot_forecast_cache.json"
 _ERCOT_TRAINING_DATA_PATH   = _HERE / "api_cache" / "ercot_load_training.json"
 _MISO_FORECAST_CACHE_FILE   = _HERE / "api_cache" / "miso_forecast_cache.json"
 _MISO_TRAINING_DATA_PATH    = _HERE / "api_cache" / "miso_load_training.json"
+_NYISO_FORECAST_CACHE_FILE  = _HERE / "api_cache" / "nyiso_forecast_cache.json"
+_NYISO_TRAINING_DATA_PATH   = _HERE / "api_cache" / "nyiso_load_training.json"
+_ISONE_FORECAST_CACHE_FILE  = _HERE / "api_cache" / "isone_forecast_cache.json"
+_ISONE_TRAINING_DATA_PATH   = _HERE / "api_cache" / "isone_load_training.json"
+_SPP_FORECAST_CACHE_FILE    = _HERE / "api_cache" / "spp_forecast_cache.json"
+_SPP_TRAINING_DATA_PATH     = _HERE / "api_cache" / "spp_load_training.json"
 
 # ---------------------------------------------------------------------------
 # Load models at startup
@@ -126,6 +152,43 @@ except FileNotFoundError:
     log.error("MISO load model not found — run training script first")
 except Exception:
     log.exception("Failed to load MISO load model")
+
+
+_NYISO_MODEL: LoadCorrectionModel | None = None
+try:
+    _NYISO_MODEL = LoadCorrectionModel()
+    _NYISO_MODEL = _NYISO_MODEL.__class__()
+    from temperature_modeling.pjm_load import load_load_model as _ll
+    _NYISO_MODEL = _ll(_NYISO_MODEL_PATH)
+    log.info("NYISO load model loaded OK")
+except FileNotFoundError:
+    log.warning("NYISO model not found — run collect_nyiso_load.py first")
+    _NYISO_MODEL = None
+except Exception:
+    log.exception("Failed to load NYISO model")
+    _NYISO_MODEL = None
+
+_ISONE_MODEL: LoadCorrectionModel | None = None
+try:
+    _ISONE_MODEL = _ll(_ISONE_MODEL_PATH)
+    log.info("ISO-NE load model loaded OK")
+except FileNotFoundError:
+    log.warning("ISO-NE model not found — run collect_isone_load.py first")
+    _ISONE_MODEL = None
+except Exception:
+    log.exception("Failed to load ISO-NE model")
+    _ISONE_MODEL = None
+
+_SPP_MODEL: LoadCorrectionModel | None = None
+try:
+    _SPP_MODEL = _ll(_SPP_MODEL_PATH)
+    log.info("SPP load model loaded OK")
+except FileNotFoundError:
+    log.warning("SPP model not found — run collect_spp_load.py first")
+    _SPP_MODEL = None
+except Exception:
+    log.exception("Failed to load SPP model")
+    _SPP_MODEL = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +283,36 @@ def _build_iso_configs():
             comparison_fn=fetch_miso_official_comparison,
             bench_fn=fetch_miso_7day,
             bench_key="miso_7day",
+        ),
+        "nyiso": dict(
+            locations=NYISO_LOAD_LOCATIONS,
+            weighted_avg_fn=weighted_avg_temp_f_nyiso,
+            model_ref=lambda: _NYISO_MODEL,
+            cache_file=_NYISO_FORECAST_CACHE_FILE,
+            training_path=_NYISO_TRAINING_DATA_PATH,
+            comparison_fn=lambda s: {},
+            bench_fn=lambda s: [],
+            bench_key="nyiso_7day",
+        ),
+        "isone": dict(
+            locations=ISONE_LOAD_LOCATIONS,
+            weighted_avg_fn=weighted_avg_temp_f_isone,
+            model_ref=lambda: _ISONE_MODEL,
+            cache_file=_ISONE_FORECAST_CACHE_FILE,
+            training_path=_ISONE_TRAINING_DATA_PATH,
+            comparison_fn=lambda s: {},
+            bench_fn=lambda s: [],
+            bench_key="isone_7day",
+        ),
+        "spp": dict(
+            locations=SPP_LOAD_LOCATIONS,
+            weighted_avg_fn=weighted_avg_temp_f_spp,
+            model_ref=lambda: _SPP_MODEL,
+            cache_file=_SPP_FORECAST_CACHE_FILE,
+            training_path=_SPP_TRAINING_DATA_PATH,
+            comparison_fn=lambda s: {},
+            bench_fn=lambda s: [],
+            bench_key="spp_7day",
         ),
     })
 
@@ -400,6 +493,14 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
     except OSError:
         log.warning("%s: could not write forecast cache to %s", iso.upper(), cache_file)
 
+    record_forecast(iso, load_data)
+
+    net_load = fetch_net_load_forecast(iso, forecast_dates_list, session)
+    result["net_load"] = net_load
+
+    prices = forecast_prices(iso, load_data)
+    result["price_forecast"] = prices
+
     log.info("%s: forecast complete — %d days, hindcast %d days, backtest MAPE test=%.1f%%",
              iso.upper(), len(load_data), len(hindcast),
              backtest.get("mape_test") or 0)
@@ -533,7 +634,7 @@ app.layout = html.Div(
                     html.H1("Grid Load Forecast",
                             style={"margin": 0, "fontSize": "18px", "fontWeight": 700,
                                    "color": "#0f172a"}),
-                    html.Span(f"PJM · CAISO · ERCOT · MISO  ·  Updated {datetime.now().strftime('%d %b %Y')}",
+                    html.Span(f"PJM · CAISO · ERCOT · MISO · NYISO · ISO-NE · SPP  ·  Updated {datetime.now().strftime('%d %b %Y')}",
                               style={"color": "#94a3b8", "fontSize": "12px"}),
                 ]),
                 html.Button(
@@ -565,6 +666,9 @@ app.layout = html.Div(
                                 {"label": "CAISO (California)", "value": "caiso"},
                                 {"label": "ERCOT (Texas)",      "value": "ercot"},
                                 {"label": "MISO (Midwest)",     "value": "miso"},
+                                {"label": "NYISO (New York)",   "value": "nyiso"},
+                                {"label": "ISO-NE (New England)", "value": "isone"},
+                                {"label": "SPP (Southwest)",    "value": "spp"},
                             ],
                             value="pjm", inline=True,
                             inputStyle={"marginRight": "5px"},
@@ -621,6 +725,48 @@ app.layout = html.Div(
                         ),
                         dcc.Graph(id="load-forecast-chart", style={"height": "320px"},
                                   config={"displayModeBar": False}),
+                    ],
+                ),
+
+                # ── Day-ahead price forecast ───────────────────────────────────
+                html.Div(
+                    id="price-forecast-panel",
+                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                           "border": "1px solid #e2e8f0", "padding": "20px",
+                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+                           "marginBottom": "20px"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between",
+                                   "alignItems": "center", "marginBottom": "12px"},
+                            children=[
+                                html.Div("Day-Ahead Price Forecast ($/MWh)",
+                                         style={"fontSize": "13px", "fontWeight": 600,
+                                                "color": "#0f172a"}),
+                                html.Span("EIA regression model",
+                                          style={"fontSize": "10px", "color": "#94a3b8",
+                                                 "background": "#f1f5f9",
+                                                 "borderRadius": "4px",
+                                                 "padding": "2px 7px"}),
+                            ],
+                        ),
+                        dcc.Graph(id="price-forecast-chart", style={"height": "220px"},
+                                  config={"displayModeBar": False}),
+                    ],
+                ),
+
+                # ── Capacity market panel ─────────────────────────────────────
+                html.Div(
+                    id="capacity-market-panel",
+                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                           "border": "1px solid #e2e8f0", "padding": "20px",
+                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+                           "marginBottom": "20px"},
+                    children=[
+                        html.Div("Capacity Market Snapshot",
+                                 style={"fontSize": "13px", "fontWeight": 600,
+                                        "color": "#0f172a", "marginBottom": "14px"}),
+                        html.Div(id="capacity-market-content"),
                     ],
                 ),
 
@@ -749,7 +895,7 @@ app.layout = html.Div(
                                 html.Div("Ask the Forecast AI",
                                          style={"fontSize": "13px", "fontWeight": 600,
                                                 "color": "#0f172a"}),
-                                html.Span("Powered by Claude",
+                                html.Span(f"Powered by {_llm.provider_label()}",
                                           style={"fontSize": "10px", "color": "#94a3b8",
                                                  "background": "#f1f5f9",
                                                  "borderRadius": "4px",
@@ -804,6 +950,7 @@ app.layout = html.Div(
         dcc.Store(id="chat-history-store", data=[]),
         dcc.Store(id="dc-selected-mw", data=0),
         dcc.Interval(id="daily-refresh", interval=24 * 60 * 60 * 1000, n_intervals=0),
+        dcc.Interval(id="forecast-refresh", interval=15 * 60 * 1000, n_intervals=0),
     ],
 )
 
@@ -816,8 +963,9 @@ app.layout = html.Div(
     Input("iso-selector", "value"),
     Input("refresh-btn", "n_clicks"),
     Input("daily-refresh", "n_intervals"),
+    Input("forecast-refresh", "n_intervals"),
 )
-def load_forecast_data(iso, n_clicks, _n_intervals):
+def load_forecast_data(iso, n_clicks, _daily, _interval):
     force = n_clicks is not None and n_clicks > 0
     if iso == "caiso":
         return fetch_caiso_load_forecast(force=force)
@@ -863,6 +1011,7 @@ def render(data, iso):
     comparison = data.get("comparison", {})
     backtest   = data.get("backtest", {})
     hindcast   = data.get("hindcast", {})
+    net_load_list = data.get("net_load", [])
     backtest_pre = data.get("backtest", {})
     bt_pred_by_date = dict(zip(backtest_pre.get("dates", []),
                                backtest_pre.get("predicted_gw", [])))
@@ -897,11 +1046,19 @@ def render(data, iso):
     mape_str  = f"{test_mape:.1f}%" if test_mape is not None else "—"
     mape_col  = "#22c55e" if test_mape is not None and test_mape < 3 else "#f97316"
 
+    vstats = load_verification_stats(iso)
+    v7  = f"{vstats['mape_7d']:.1f}%"  if vstats["mape_7d"]  is not None else "—"
+    v30 = f"{vstats['mape_30d']:.1f}%" if vstats["mape_30d"] is not None else "—"
+    vbias = (f"{vstats['bias_mw']:+,.0f} MW" if vstats["bias_mw"] is not None else "—")
+    v_col = ("#22c55e" if vstats["mape_7d"] is not None and vstats["mape_7d"] < 3
+             else "#f97316")
+
     summary_cards = [
         card("Today (GW)", f"{today_gw:.1f}", "GFS-based", load_color(today_gw)),
         card("15-Day Peak", f"{peak_gw:.1f}", f"on {peak_lbl}", load_color(peak_gw)),
         card("15-Day Avg", f"{avg_gw:.1f}", "GW baseline", "#475569"),
         card("Hindcast MAPE", mape_str, "ERA5 obs. temps", mape_col),
+        card("Verified MAPE 7d", v7, f"30d: {v30}  bias: {vbias}", v_col),
     ]
 
     subtitle = f"{iso_label}  ·  GFS temperature input  ·  {len(dates)}-day horizon"
@@ -989,6 +1146,36 @@ def render(data, iso):
             hovertemplate="<b>%{x|%d %b}</b><br>EIA day-ahead: %{y:.1f} GW<extra></extra>",
         ))
 
+    # Net load trace (CAISO / ERCOT only — meaningful with high renewable penetration)
+    if net_load_list and iso in ("caiso", "ercot"):
+        nl_by_date = {r["date"]: r for r in net_load_list}
+        nl_dates   = [d for d in dates if d in nl_by_date]
+        net_vals   = [means[dates.index(d)] - nl_by_date[d]["renewable_gw"] for d in nl_dates]
+        sol_vals   = [nl_by_date[d]["solar_gw"] for d in nl_dates]
+        wnd_vals   = [nl_by_date[d]["wind_gw"]  for d in nl_dates]
+        fig.add_trace(go.Scatter(
+            x=nl_dates, y=net_vals, mode="lines",
+            name="Net Load (ex-renewables)",
+            line=dict(color="#8b5cf6", width=2, dash="dash"),
+            hovertemplate=(
+                "<b>%{x|%d %b}</b><br>Net load: %{y:.1f} GW<br>"
+                "Solar: " + "<br>".join(f"{s:.1f}" for s in sol_vals[:1]) +
+                "<extra></extra>"
+            ),
+        ))
+        # Stacked renewable area
+        fig.add_trace(go.Scatter(
+            x=nl_dates, y=sol_vals, mode="none", name="Solar (est.)",
+            fill="tozeroy", fillcolor="rgba(251,191,36,0.20)",
+            hovertemplate="<b>%{x|%d %b}</b><br>Solar: %{y:.1f} GW<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=nl_dates, y=[s + w for s, w in zip(sol_vals, wnd_vals)],
+            mode="none", name="Solar+Wind (est.)",
+            fill="tonexty", fillcolor="rgba(52,211,153,0.20)",
+            hovertemplate="<b>%{x|%d %b}</b><br>Solar+Wind: %{y:.1f} GW<extra></extra>",
+        ))
+
     fig.add_hline(y=avg_gw, line_dash="dot", line_color="#cbd5e1", line_width=1.5,
                   annotation_text=f"15-day avg: {avg_gw:.1f} GW",
                   annotation_font_size=10, annotation_font_color="#94a3b8",
@@ -1009,6 +1196,123 @@ def render(data, iso):
     )
 
     return summary_cards, subtitle, fig
+
+
+# ---------------------------------------------------------------------------
+# Price forecast callback
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("price-forecast-chart", "figure"),
+    Input("load-forecast-store", "data"),
+    Input("iso-selector", "value"),
+)
+def render_price_chart(data, iso):
+    if not data or not data.get("price_forecast"):
+        fig = go.Figure()
+        fig.add_annotation(text="Price data unavailable (EIA_API_KEY required)",
+                           xref="paper", yref="paper", x=0.5, y=0.5,
+                           showarrow=False, font=dict(color="#94a3b8", size=12))
+        fig.update_layout(paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+                          height=220, margin=dict(l=60, r=20, t=10, b=40))
+        return fig
+
+    prices = data["price_forecast"]
+    dates  = [p["date"] for p in prices]
+    means  = [p["forecast_price"] for p in prices]
+    lows   = [p["low_price"]  for p in prices]
+    highs  = [p["high_price"] for p in prices]
+    rmse   = prices[0].get("model_rmse", 0) if prices else 0
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates + dates[::-1], y=highs + lows[::-1],
+        fill="toself", fillcolor="rgba(99,102,241,0.10)",
+        line=dict(color="rgba(0,0,0,0)"),
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=dates, y=means, mode="lines+markers",
+        name="DA Price Forecast",
+        line=dict(color="#6366f1", width=2),
+        marker=dict(size=5, color="#6366f1"),
+        hovertemplate="<b>%{x|%d %b}</b><br>Price: $%{y:.2f}/MWh<extra></extra>",
+    ))
+    fig.update_layout(
+        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+        font=dict(color="#334155", size=11),
+        annotations=[dict(
+            text=f"Model RMSE: ${rmse:.1f}/MWh · EIA log-linear regression",
+            xref="paper", yref="paper", x=0, y=1.08, showarrow=False,
+            font=dict(size=9, color="#94a3b8"), xanchor="left",
+        )],
+        legend=dict(orientation="h", y=-0.30, font=dict(size=10),
+                    bgcolor="rgba(0,0,0,0)", x=0),
+        margin=dict(l=60, r=20, t=20, b=60),
+        xaxis=dict(type="date", tickformat="%d %b", gridcolor="#f8fafc",
+                   tickangle=-30, tickfont=dict(size=10), linecolor="#e2e8f0",
+                   dtick="D1"),
+        yaxis=dict(gridcolor="#f1f5f9", tickformat=".0f", tickprefix="$",
+                   ticksuffix="/MWh", linecolor="#e2e8f0"),
+        height=220,
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Capacity market callback
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("capacity-market-content", "children"),
+    Input("iso-selector", "value"),
+)
+def render_capacity_market(iso):
+    cm = get_capacity_market_data(iso)
+    if "error" in cm:
+        return html.Div(cm["error"], style={"color": "#94a3b8", "fontSize": "13px"})
+
+    rm_pct  = cm.get("reserve_margin_pct")
+    rm_col  = get_reserve_margin_color(rm_pct)
+    rm_str  = f"{rm_pct:.1f}%" if rm_pct else "—"
+    price   = cm.get("clearing_price_mw_year")
+    price_s = f"${price:,.0f}/MW-year" if price else "Energy-only market"
+    procured = cm.get("procured_mw")
+    req      = cm.get("requirement_mw")
+
+    def stat(label, value, color="#334155"):
+        return html.Div(
+            style={"background": "#f8fafc", "borderRadius": "8px", "padding": "12px 16px",
+                   "minWidth": "140px", "flex": "1"},
+            children=[
+                html.Div(label, style={"fontSize": "10px", "color": "#94a3b8",
+                                       "textTransform": "uppercase", "letterSpacing": "0.05em",
+                                       "marginBottom": "4px"}),
+                html.Div(value, style={"fontSize": "18px", "fontWeight": 700, "color": color}),
+            ],
+        )
+
+    return html.Div([
+        html.Div(
+            style={"display": "flex", "gap": "10px", "flexWrap": "wrap", "marginBottom": "14px"},
+            children=[
+                stat("Mechanism", cm["mechanism"][:30], "#334155"),
+                stat("Reserve Margin", rm_str, rm_col),
+                stat("Capacity Price", price_s, "#6366f1"),
+                stat("Procured", f"{procured/1000:.1f} GW" if procured else "—", "#0ea5e9"),
+                stat("Requirement", f"{req/1000:.1f} GW" if req else "—", "#334155"),
+                stat("2024 Peak", f"{cm['peak_mw_2024']/1000:.1f} GW", "#f97316"),
+            ],
+        ),
+        html.Div(
+            cm.get("notes", ""),
+            style={"fontSize": "12px", "color": "#64748b", "lineHeight": "1.6",
+                   "background": "#f8fafc", "borderRadius": "6px", "padding": "10px 14px",
+                   "marginBottom": "6px"},
+        ),
+        html.Div(
+            f"Source: {cm.get('source', '')}",
+            style={"fontSize": "10px", "color": "#cbd5e1"},
+        ),
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -1557,6 +1861,81 @@ def render_datacenter(data, iso, check_values):
 # Run
 # ---------------------------------------------------------------------------
 server = app.server  # expose Flask server for gunicorn
+
+
+# ---------------------------------------------------------------------------
+# REST API routes (served by the same Flask server as the dashboard)
+# ---------------------------------------------------------------------------
+from flask import jsonify, request as flask_request
+
+_VALID_ISOS = {"pjm", "caiso", "ercot", "miso", "nyiso", "isone", "spp"}
+
+
+@server.route("/api/v1/forecast/<iso>")
+def api_forecast(iso):
+    """
+    GET /api/v1/forecast/<iso>?force=0
+    Returns the 15-day load forecast for the given ISO as JSON.
+
+    Response schema:
+    {
+      "iso": "pjm",
+      "generated": "2025-07-27T10:00:00",
+      "load": [{date, mean_load_gw, low_load_gw, high_load_gw, hdd, cdd, avg_temp_f}],
+      "price_forecast": [{date, forecast_price, low_price, high_price}],
+      "net_load": [{date, solar_gw, wind_gw, renewable_gw}],
+      "backtest": {mape_test, ...}
+    }
+    """
+    iso = iso.lower()
+    if iso not in _VALID_ISOS:
+        return jsonify({"error": f"Unknown ISO. Valid: {sorted(_VALID_ISOS)}"}), 400
+
+    force = flask_request.args.get("force", "0") == "1"
+    data  = _fetch_iso_forecast(iso, force=force)
+    if not data:
+        return jsonify({"error": f"Forecast unavailable for {iso.upper()} — model may not be trained yet"}), 503
+
+    return jsonify({
+        "iso":            iso.upper(),
+        "generated":      datetime.now().isoformat(timespec="seconds"),
+        "load":           data.get("load", []),
+        "price_forecast": data.get("price_forecast", []),
+        "net_load":       data.get("net_load", []),
+        "backtest":       data.get("backtest", {}),
+    })
+
+
+@server.route("/api/v1/isos")
+def api_isos():
+    """GET /api/v1/isos — list available ISOs and their model status."""
+    status = []
+    for iso in sorted(_VALID_ISOS):
+        cfg   = _ISO_CONFIGS.get(iso, {})
+        model = cfg.get("model_ref", lambda: None)() if cfg else None
+        status.append({
+            "iso":         iso.upper(),
+            "model_ready": model is not None,
+            "cache_file":  str(cfg.get("cache_file", "")) if cfg else "",
+        })
+    return jsonify({"isos": status})
+
+
+@server.route("/api/v1/verification/<iso>")
+def api_verification(iso):
+    """GET /api/v1/verification/<iso> — forecast vs actuals statistics."""
+    iso = iso.lower()
+    if iso not in _VALID_ISOS:
+        return jsonify({"error": f"Unknown ISO. Valid: {sorted(_VALID_ISOS)}"}), 400
+    stats = load_verification_stats(iso)
+    return jsonify({"iso": iso.upper(), **stats})
+
+
+@server.route("/api/v1/health")
+def api_health():
+    """GET /api/v1/health — liveness check."""
+    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8050))

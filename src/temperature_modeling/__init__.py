@@ -22,7 +22,7 @@ from .models import (
     TemperatureObservation,
     WeatherResult,
 )
-from .verification import collect_verification_records, score_by_lead
+from .verification import record_forecast, load_verification_stats
 from .features import (
     ClimateNormals,
     FEATURE_FIELDS,
@@ -53,8 +53,8 @@ __all__ = [
     "SatelliteObservation",
     "ForecastSample",
     "LeadTimeSkill",
-    "collect_verification_records",
-    "score_by_lead",
+    "record_forecast",
+    "load_verification_stats",
     "ClimateNormals",
     "FEATURE_FIELDS",
     "FEATURE_FIELDS_ERA5",
