@@ -101,6 +101,7 @@ def main():
                     "temp_lag2_f":    o.temp_lag2_f,
                     "temp_lag7_f":    o.temp_lag7_f,
                     "rolling7_avg_f": o.rolling7_avg_f,
+                    "apparent_hi_f":  o.apparent_hi_f,
                 }
                 for o in observations
             ],

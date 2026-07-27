@@ -117,6 +117,7 @@ class LoadObservation:
     temp_lag2_f: Optional[float] = None    # 2 days ago avg temp (°F)
     temp_lag7_f: Optional[float] = None    # same weekday last week avg temp (°F)
     rolling7_avg_f: Optional[float] = None # 7-day trailing avg temp (°F)
+    apparent_hi_f: Optional[float] = None  # daily max apparent temperature / heat index (°F)
 
 
 @dataclass

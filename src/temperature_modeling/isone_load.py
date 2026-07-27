@@ -114,9 +114,10 @@ def build_isone_training_data(
     era5_avg_by_label: Dict[str, Dict[date, float]],
     era5_hi_by_label:  Dict[str, Dict[date, Tuple[float, float]]],
 ) -> List[LoadObservation]:
-    avg_f_by_date: Dict[date, float] = {}
-    hi_f_by_date:  Dict[date, float] = {}
-    lo_f_by_date:  Dict[date, float] = {}
+    avg_f_by_date:      Dict[date, float] = {}
+    hi_f_by_date:       Dict[date, float] = {}
+    lo_f_by_date:       Dict[date, float] = {}
+    apparent_hi_by_date: Dict[date, float] = {}
 
     for d in sorted(load_daily):
         avg_c = {
@@ -128,16 +129,20 @@ def build_isone_training_data(
             continue
         avg_f_by_date[d] = weighted_avg_temp_f_isone(avg_c)
 
-        hi_c, lo_c = {}, {}
+        hi_c, lo_c, ap_c = {}, {}, {}
         for loc in ISONE_LOAD_LOCATIONS:
             pair = era5_hi_by_label.get(loc["label"], {}).get(d)
             if pair is not None:
                 hi_c[loc["label"]] = pair[0]
                 lo_c[loc["label"]] = pair[1]
+                if len(pair) > 2 and pair[2] is not None:
+                    ap_c[loc["label"]] = pair[2]
         if hi_c:
             hi_f_by_date[d] = weighted_avg_temp_f_isone(hi_c)
         if lo_c:
             lo_f_by_date[d] = weighted_avg_temp_f_isone(lo_c)
+        if ap_c:
+            apparent_hi_by_date[d] = weighted_avg_temp_f_isone(ap_c)
 
     obs: List[LoadObservation] = []
     for d in sorted(avg_f_by_date):
@@ -165,5 +170,6 @@ def build_isone_training_data(
                 len([v for v in roll_vals if v is not None])
                 if any(v is not None for v in roll_vals) else None
             ),
+            apparent_hi_f=_c_to_f(apparent_hi_by_date[d]) if d in apparent_hi_by_date else None,
         ))
     return obs

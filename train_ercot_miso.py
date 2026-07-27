@@ -102,21 +102,22 @@ def _fetch_era5_for_locations(locations, start, end, session):
 def _obs_to_json(obs_list):
     return [
         {
-            "date":          o.date.isoformat(),
-            "hdd":           o.hdd,
-            "cdd":           o.cdd,
-            "avg_temp_f":    o.avg_temp_f,
-            "hi_temp_f":     o.hi_temp_f,
-            "lo_temp_f":     o.lo_temp_f,
+            "date":           o.date.isoformat(),
+            "hdd":            o.hdd,
+            "cdd":            o.cdd,
+            "avg_temp_f":     o.avg_temp_f,
+            "hi_temp_f":      o.hi_temp_f,
+            "lo_temp_f":      o.lo_temp_f,
             "actual_load_mw": o.actual_load_mw,
-            "is_weekend":    o.is_weekend,
-            "day_of_week":   o.day_of_week,
-            "is_holiday":    o.is_holiday,
-            "day_of_year":   o.day_of_year,
-            "temp_lag1_f":   o.temp_lag1_f,
-            "temp_lag2_f":   o.temp_lag2_f,
-            "temp_lag7_f":   o.temp_lag7_f,
+            "is_weekend":     o.is_weekend,
+            "day_of_week":    o.day_of_week,
+            "is_holiday":     o.is_holiday,
+            "day_of_year":    o.day_of_year,
+            "temp_lag1_f":    o.temp_lag1_f,
+            "temp_lag2_f":    o.temp_lag2_f,
+            "temp_lag7_f":    o.temp_lag7_f,
             "rolling7_avg_f": o.rolling7_avg_f,
+            "apparent_hi_f":  o.apparent_hi_f,
         }
         for o in obs_list
     ]
@@ -153,6 +154,7 @@ def _train_iso(
                     temp_lag2_f=r.get("temp_lag2_f"),
                     temp_lag7_f=r.get("temp_lag7_f"),
                     rolling7_avg_f=r.get("rolling7_avg_f"),
+                    apparent_hi_f=r.get("apparent_hi_f"),
                 ))
             except (KeyError, ValueError):
                 continue

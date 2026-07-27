@@ -115,9 +115,10 @@ def build_nyiso_training_data(
     era5_hi_by_label:  Dict[str, Dict[date, Tuple[float, float]]],
 ) -> List[LoadObservation]:
     sorted_dates = sorted(load_daily.keys())
-    avg_f_by_date: Dict[date, float] = {}
-    hi_f_by_date:  Dict[date, float] = {}
-    lo_f_by_date:  Dict[date, float] = {}
+    avg_f_by_date:      Dict[date, float] = {}
+    hi_f_by_date:       Dict[date, float] = {}
+    lo_f_by_date:       Dict[date, float] = {}
+    apparent_hi_by_date: Dict[date, float] = {}
 
     for d in sorted_dates:
         avg_c = {
@@ -129,16 +130,20 @@ def build_nyiso_training_data(
             continue
         avg_f_by_date[d] = weighted_avg_temp_f_nyiso(avg_c)
 
-        hi_c, lo_c = {}, {}
+        hi_c, lo_c, ap_c = {}, {}, {}
         for loc in NYISO_LOAD_LOCATIONS:
             pair = era5_hi_by_label.get(loc["label"], {}).get(d)
             if pair is not None:
                 hi_c[loc["label"]] = pair[0]
                 lo_c[loc["label"]] = pair[1]
+                if len(pair) > 2 and pair[2] is not None:
+                    ap_c[loc["label"]] = pair[2]
         if hi_c:
             hi_f_by_date[d] = weighted_avg_temp_f_nyiso(hi_c)
         if lo_c:
             lo_f_by_date[d] = weighted_avg_temp_f_nyiso(lo_c)
+        if ap_c:
+            apparent_hi_by_date[d] = weighted_avg_temp_f_nyiso(ap_c)
 
     obs: List[LoadObservation] = []
     for d in sorted(avg_f_by_date):
@@ -163,5 +168,6 @@ def build_nyiso_training_data(
             rolling7_avg_f=(
                 lambda vals: sum(vals) / len(vals) if vals else None
             )([v for v in [avg_f_by_date.get(d - timedelta(days=k)) for k in range(7)] if v is not None]),
+            apparent_hi_f=_c_to_f(apparent_hi_by_date[d]) if d in apparent_hi_by_date else None,
         ))
     return obs

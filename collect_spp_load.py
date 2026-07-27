@@ -44,7 +44,7 @@ def main():
     end   = date.today() - timedelta(days=1)
     start = end - timedelta(days=730)
 
-    print(f"\n[1/4] Fetching SPP (SWPP) daily load  {start} → {end} ...")
+    print(f"\n[1/4] Fetching SPP (SWPP) daily load  {start} to {end} ...")
     load_daily = fetch_spp_load_daily(start, end, session)
     print(f"      {len(load_daily)} days fetched")
 
@@ -72,6 +72,7 @@ def main():
             "is_holiday": o.is_holiday, "day_of_year": o.day_of_year,
             "temp_lag1_f": o.temp_lag1_f, "temp_lag2_f": o.temp_lag2_f,
             "temp_lag7_f": o.temp_lag7_f, "rolling7_avg_f": o.rolling7_avg_f,
+            "apparent_hi_f": o.apparent_hi_f,
         } for o in observations], f, indent=2)
 
     if Path(_SPP_MODEL_PATH).exists() and not retrain:

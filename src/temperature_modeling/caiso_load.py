@@ -132,9 +132,10 @@ def build_caiso_training_data(
     era5_hi_by_label:   Dict[str, Dict[date, Tuple[float, float]]],
 ) -> List[LoadObservation]:
     sorted_dates = sorted(load_daily.keys())
-    avg_f_by_date: Dict[date, float] = {}
-    hi_f_by_date:  Dict[date, float] = {}
-    lo_f_by_date:  Dict[date, float] = {}
+    avg_f_by_date:      Dict[date, float] = {}
+    hi_f_by_date:       Dict[date, float] = {}
+    lo_f_by_date:       Dict[date, float] = {}
+    apparent_hi_by_date: Dict[date, float] = {}
 
     for d in sorted_dates:
         avg_c = {
@@ -148,16 +149,21 @@ def build_caiso_training_data(
 
         hi_c = {}
         lo_c = {}
+        ap_c = {}
         for loc in CAISO_LOAD_LOCATIONS:
             label = loc["label"]
             pair  = era5_hi_by_label.get(label, {}).get(d)
             if pair is not None:
                 hi_c[label] = pair[0]
                 lo_c[label] = pair[1]
+                if len(pair) > 2 and pair[2] is not None:
+                    ap_c[label] = pair[2]
         if hi_c:
             hi_f_by_date[d] = weighted_avg_temp_f_caiso(hi_c)
         if lo_c:
             lo_f_by_date[d] = weighted_avg_temp_f_caiso(lo_c)
+        if ap_c:
+            apparent_hi_by_date[d] = weighted_avg_temp_f_caiso(ap_c)
 
     obs: List[LoadObservation] = []
     sorted_with_temp = sorted(avg_f_by_date.keys())
@@ -194,6 +200,7 @@ def build_caiso_training_data(
             temp_lag2_f=lag2_f,
             temp_lag7_f=lag7_f,
             rolling7_avg_f=rolling7_f,
+            apparent_hi_f=_c_to_f(apparent_hi_by_date[d]) if d in apparent_hi_by_date else None,
         ))
     return obs
 
@@ -207,22 +214,28 @@ class CAISOLoadModel(LoadCorrectionModel):
 
     def predict_with_uncertainty(
         self,
-        forecast_temps_c:   Dict[str, List[float]],
-        forecast_hi_c:      Dict[str, List[float]],
-        forecast_lo_c:      Dict[str, List[float]],
-        gefs_spread_c:      Dict[str, List[float]],
-        forecast_dates:     List[date],
-        recent_avg_temps_f: List[float] = None,
+        forecast_temps_c:       Dict[str, List[float]],
+        forecast_hi_c:          Dict[str, List[float]],
+        forecast_lo_c:          Dict[str, List[float]],
+        gefs_spread_c:          Dict[str, List[float]],
+        forecast_dates:         List[date],
+        recent_avg_temps_f:     List[float] = None,
+        locations=None,
+        weighted_avg_fn=None,
+        forecast_apparent_hi_c: Dict[str, List[float]] = None,
     ) -> List[LoadForecast]:
+        _locs   = locations    if locations    is not None else CAISO_LOAD_LOCATIONS
+        _wt_avg = weighted_avg_fn if weighted_avg_fn is not None else weighted_avg_temp_f_caiso
+
         forecast_avg_f: List[Optional[float]] = []
         for i, d in enumerate(forecast_dates):
             temps_c = {
                 loc["label"]: (forecast_temps_c.get(loc["label"]) or [None] * 20)[i]
-                for loc in CAISO_LOAD_LOCATIONS
+                for loc in _locs
                 if (forecast_temps_c.get(loc["label"]) or [None] * 20)[i] is not None
             }
             if temps_c:
-                forecast_avg_f.append(weighted_avg_temp_f_caiso(temps_c))
+                forecast_avg_f.append(_wt_avg(temps_c))
             else:
                 forecast_avg_f.append(None)
 
@@ -245,32 +258,41 @@ class CAISOLoadModel(LoadCorrectionModel):
         for i, d in enumerate(forecast_dates):
             hi_c_map = {
                 loc["label"]: (forecast_hi_c.get(loc["label"]) or [None] * 20)[i]
-                for loc in CAISO_LOAD_LOCATIONS
+                for loc in _locs
                 if (forecast_hi_c.get(loc["label"]) or [None] * 20)[i] is not None
             }
             lo_c_map = {
                 loc["label"]: (forecast_lo_c.get(loc["label"]) or [None] * 20)[i]
-                for loc in CAISO_LOAD_LOCATIONS
+                for loc in _locs
                 if (forecast_lo_c.get(loc["label"]) or [None] * 20)[i] is not None
             }
             avg_f = forecast_avg_f[i]
             if avg_f is None:
                 continue
-            hi_f = weighted_avg_temp_f_caiso(hi_c_map) if hi_c_map else avg_f
-            lo_f = weighted_avg_temp_f_caiso(lo_c_map) if lo_c_map else avg_f
+            hi_f = _wt_avg(hi_c_map) if hi_c_map else avg_f
+            lo_f = _wt_avg(lo_c_map) if lo_c_map else avg_f
+
+            app_hi_c_map = {}
+            if forecast_apparent_hi_c:
+                app_hi_c_map = {
+                    loc["label"]: (forecast_apparent_hi_c.get(loc["label"]) or [None]*20)[i]
+                    for loc in _locs
+                    if (forecast_apparent_hi_c.get(loc["label"]) or [None]*20)[i] is not None
+                }
+            app_hi_f = _wt_avg(app_hi_c_map) if app_hi_c_map else None
 
             lag1_f = _lag(i, 1)
             lag2_f = _lag(i, 2)
             lag7_f = _lag(i, 7)
             roll7_f = _rolling7(i)
 
-            feats, hdd, cdd = _build_features(avg_f, hi_f, lo_f, d, lag1_f, lag2_f, lag7_f, roll7_f)
+            feats, hdd, cdd = _build_features(avg_f, hi_f, lo_f, d, lag1_f, lag2_f, lag7_f, roll7_f,
+                                               apparent_hi_f=app_hi_f)
             mean_mw = self.predict([feats])[0]
 
-            # Temperature uncertainty -> load uncertainty via slope approximation
             spread_c_vals = [
                 (gefs_spread_c.get(loc["label"]) or [1.0] * 20)[i]
-                for loc in CAISO_LOAD_LOCATIONS
+                for loc in _locs
                 if gefs_spread_c.get(loc["label"])
             ]
             spread_f = (sum(spread_c_vals) / len(spread_c_vals) * 9 / 5) if spread_c_vals else 1.8

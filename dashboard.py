@@ -203,7 +203,7 @@ def _fetch_one(label, lat, lon, session, forecast_days=15):
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": lat, "longitude": lon,
-                "daily": "temperature_2m_max,temperature_2m_min",
+                "daily": "temperature_2m_max,temperature_2m_min,apparent_temperature_max",
                 "forecast_days": forecast_days,
                 "temperature_unit": "fahrenheit",
                 "timezone": "auto",
@@ -213,7 +213,8 @@ def _fetch_one(label, lat, lon, session, forecast_days=15):
         r.raise_for_status()
         d = r.json()["daily"]
         return {"label": label, "dates": d["time"],
-                "hi": d["temperature_2m_max"], "lo": d["temperature_2m_min"]}
+                "hi": d["temperature_2m_max"], "lo": d["temperature_2m_min"],
+                "apparent_hi": d.get("apparent_temperature_max")}
     except requests.HTTPError as exc:
         log.warning("Open-Meteo HTTP error for %s: %s", label, exc)
     except requests.RequestException as exc:
@@ -359,9 +360,10 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
     session = requests.Session()
     session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
 
-    avg_c: dict = {}
-    hi_c:  dict = {}
-    lo_c:  dict = {}
+    avg_c:         dict = {}
+    hi_c:          dict = {}
+    lo_c:          dict = {}
+    apparent_hi_c: dict = {}
     forecast_dates_strs = None
 
     def _f_to_c(lst):
@@ -381,6 +383,8 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
             avg_c[label] = loc_avg
             hi_c[label]  = loc_hi
             lo_c[label]  = loc_lo
+            if res.get("apparent_hi"):
+                apparent_hi_c[label] = _f_to_c(res["apparent_hi"])
             if forecast_dates_strs is None:
                 forecast_dates_strs = res["dates"][:15]
 
@@ -445,6 +449,7 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         gefs_spread_c={}, forecast_dates=forecast_dates_list,
         recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
         locations=locations, weighted_avg_fn=weighted_avg_fn,
+        forecast_apparent_hi_c=apparent_hi_c if apparent_hi_c else None,
     )
     load_data = [{"date": lf.valid_date.isoformat(),
                   "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
