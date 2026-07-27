@@ -156,39 +156,30 @@ except Exception:
 
 _NYISO_MODEL: LoadCorrectionModel | None = None
 try:
-    _NYISO_MODEL = LoadCorrectionModel()
-    _NYISO_MODEL = _NYISO_MODEL.__class__()
-    from temperature_modeling.pjm_load import load_load_model as _ll
-    _NYISO_MODEL = _ll(_NYISO_MODEL_PATH)
+    _NYISO_MODEL = load_load_model(_NYISO_MODEL_PATH)
     log.info("NYISO load model loaded OK")
 except FileNotFoundError:
     log.warning("NYISO model not found — run collect_nyiso_load.py first")
-    _NYISO_MODEL = None
 except Exception:
     log.exception("Failed to load NYISO model")
-    _NYISO_MODEL = None
 
 _ISONE_MODEL: LoadCorrectionModel | None = None
 try:
-    _ISONE_MODEL = _ll(_ISONE_MODEL_PATH)
+    _ISONE_MODEL = load_load_model(_ISONE_MODEL_PATH)
     log.info("ISO-NE load model loaded OK")
 except FileNotFoundError:
     log.warning("ISO-NE model not found — run collect_isone_load.py first")
-    _ISONE_MODEL = None
 except Exception:
     log.exception("Failed to load ISO-NE model")
-    _ISONE_MODEL = None
 
 _SPP_MODEL: LoadCorrectionModel | None = None
 try:
-    _SPP_MODEL = _ll(_SPP_MODEL_PATH)
+    _SPP_MODEL = load_load_model(_SPP_MODEL_PATH)
     log.info("SPP load model loaded OK")
 except FileNotFoundError:
     log.warning("SPP model not found — run collect_spp_load.py first")
-    _SPP_MODEL = None
 except Exception:
     log.exception("Failed to load SPP model")
-    _SPP_MODEL = None
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +478,13 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         "backtest":        backtest,
         "hindcast":        hindcast,
     }
+    # Enrich result with net load and price forecast before caching
+    net_load = fetch_net_load_forecast(iso, forecast_dates_list, session)
+    result["net_load"] = net_load
+
+    prices = forecast_prices(iso, load_data)
+    result["price_forecast"] = prices
+
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(result))
@@ -494,12 +492,6 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         log.warning("%s: could not write forecast cache to %s", iso.upper(), cache_file)
 
     record_forecast(iso, load_data)
-
-    net_load = fetch_net_load_forecast(iso, forecast_dates_list, session)
-    result["net_load"] = net_load
-
-    prices = forecast_prices(iso, load_data)
-    result["price_forecast"] = prices
 
     log.info("%s: forecast complete — %d days, hindcast %d days, backtest MAPE test=%.1f%%",
              iso.upper(), len(load_data), len(hindcast),
@@ -967,13 +959,7 @@ app.layout = html.Div(
 )
 def load_forecast_data(iso, n_clicks, _daily, _interval):
     force = n_clicks is not None and n_clicks > 0
-    if iso == "caiso":
-        return fetch_caiso_load_forecast(force=force)
-    if iso == "ercot":
-        return fetch_ercot_load_forecast(force=force)
-    if iso == "miso":
-        return fetch_miso_load_forecast(force=force)
-    return fetch_pjm_load_forecast(force=force)
+    return _fetch_iso_forecast(iso, force=force)
 
 
 def _empty_fig(msg="Loading…"):
@@ -1005,6 +991,9 @@ def render(data, iso):
         "caiso": "CAISO (California ISO)",
         "ercot": "ERCOT (Texas)",
         "miso":  "MISO (Midcontinent ISO)",
+        "nyiso": "NYISO (New York)",
+        "isone": "ISO-NE (New England)",
+        "spp":   "SPP (Southwest Power Pool)",
     }
     iso_label = _iso_labels.get(iso, iso.upper())
     load_list  = data["load"]
@@ -1157,9 +1146,12 @@ def render(data, iso):
             x=nl_dates, y=net_vals, mode="lines",
             name="Net Load (ex-renewables)",
             line=dict(color="#8b5cf6", width=2, dash="dash"),
+            customdata=list(zip(sol_vals, wnd_vals)),
             hovertemplate=(
-                "<b>%{x|%d %b}</b><br>Net load: %{y:.1f} GW<br>"
-                "Solar: " + "<br>".join(f"{s:.1f}" for s in sol_vals[:1]) +
+                "<b>%{x|%d %b}</b><br>"
+                "Net load: %{y:.1f} GW<br>"
+                "Solar: %{customdata[0]:.1f} GW<br>"
+                "Wind: %{customdata[1]:.1f} GW"
                 "<extra></extra>"
             ),
         ))
@@ -1756,7 +1748,8 @@ def render_datacenter(data, iso, check_values):
     # ── Emissions text block ───────────────────────────────────────────────────
     carbon_price_usd = 50   # $/tonne CO2 (EU ETS reference)
     social_cost_m = ann_co2_ktons * carbon_price_usd / 1e3  # $M/yr social cost
-    _dc_iso_labels = {"pjm": "PJM", "caiso": "CAISO", "ercot": "ERCOT", "miso": "MISO"}
+    _dc_iso_labels = {"pjm": "PJM", "caiso": "CAISO", "ercot": "ERCOT", "miso": "MISO",
+                      "nyiso": "NYISO", "isone": "ISO-NE", "spp": "SPP"}
     iso_label = _dc_iso_labels.get(iso, iso.upper())
     emissions_text = [
         html.Span(f"Annual marginal CO₂ emissions: "),
