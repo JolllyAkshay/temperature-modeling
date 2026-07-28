@@ -1,0 +1,79 @@
+name: Refresh Forecast Cache
+
+on:
+  schedule:
+    # Every 6 hours — GFS updates 4x/day so this keeps forecasts fresh
+    - cron: "0 */6 * * *"
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download model PKL files from HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          mkdir -p api_cache
+          python - <<'EOF'
+          import os
+          from huggingface_hub import hf_hub_download
+
+          repo = "JollyAkshay/grid-dashboard"
+          token = os.environ["HF_TOKEN"]
+          models = [
+              "api_cache/nyiso_load_model.pkl",
+              "api_cache/isone_load_model.pkl",
+              "api_cache/spp_load_model.pkl",
+          ]
+          for filename in models:
+              print(f"Downloading {filename} ...", flush=True)
+              hf_hub_download(
+                  repo_id=repo, repo_type="space",
+                  filename=filename, local_dir=".",
+                  token=token,
+              )
+              print(f"  done", flush=True)
+          EOF
+
+      - name: Generate forecast caches
+        run: python precache_forecasts.py
+
+      - name: Upload fresh caches to HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          from huggingface_hub import upload_file
+
+          repo = "JollyAkshay/grid-dashboard"
+          token = os.environ["HF_TOKEN"]
+          caches = [
+              "api_cache/nyiso_forecast_cache.json",
+              "api_cache/isone_forecast_cache.json",
+              "api_cache/spp_forecast_cache.json",
+          ]
+          for path in caches:
+              print(f"Uploading {path} ...", flush=True)
+              upload_file(
+                  path_or_fileobj=path, path_in_repo=path,
+                  repo_id=repo, repo_type="space",
+                  token=token,
+              )
+              print(f"  done", flush=True)
+          EOF
