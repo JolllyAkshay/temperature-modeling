@@ -14,6 +14,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE / "src"))

@@ -27,6 +27,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
