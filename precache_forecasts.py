@@ -36,13 +36,17 @@ from temperature_modeling.net_load import fetch_net_load_forecast
 from temperature_modeling.price_forecast import forecast_prices
 
 from temperature_modeling.nyiso import NYISO_LOAD_LOCATIONS
-from temperature_modeling.nyiso_load import weighted_avg_temp_f_nyiso, _NYISO_MODEL_PATH
-
+from temperature_modeling.nyiso_load import (
+    weighted_avg_temp_f_nyiso, _NYISO_MODEL_PATH, fetch_nyiso_official_comparison,
+)
 from temperature_modeling.isone import ISONE_LOAD_LOCATIONS
-from temperature_modeling.isone_load import weighted_avg_temp_f_isone, _ISONE_MODEL_PATH
-
+from temperature_modeling.isone_load import (
+    weighted_avg_temp_f_isone, _ISONE_MODEL_PATH, fetch_isone_official_comparison,
+)
 from temperature_modeling.spp import SPP_LOAD_LOCATIONS
-from temperature_modeling.spp_load import weighted_avg_temp_f_spp, _SPP_MODEL_PATH
+from temperature_modeling.spp_load import (
+    weighted_avg_temp_f_spp, _SPP_MODEL_PATH, fetch_spp_official_comparison,
+)
 
 _ISOS = {
     "nyiso": dict(
@@ -50,18 +54,21 @@ _ISOS = {
         weighted_avg_fn=weighted_avg_temp_f_nyiso,
         model_path=_NYISO_MODEL_PATH,
         cache_file=_HERE / "api_cache" / "nyiso_forecast_cache.json",
+        comparison_fn=fetch_nyiso_official_comparison,
     ),
     "isone": dict(
         locations=ISONE_LOAD_LOCATIONS,
         weighted_avg_fn=weighted_avg_temp_f_isone,
         model_path=_ISONE_MODEL_PATH,
         cache_file=_HERE / "api_cache" / "isone_forecast_cache.json",
+        comparison_fn=fetch_isone_official_comparison,
     ),
     "spp": dict(
         locations=SPP_LOAD_LOCATIONS,
         weighted_avg_fn=weighted_avg_temp_f_spp,
         model_path=_SPP_MODEL_PATH,
         cache_file=_HERE / "api_cache" / "spp_forecast_cache.json",
+        comparison_fn=fetch_spp_official_comparison,
     ),
 }
 
@@ -218,10 +225,19 @@ def generate_cache(iso, cfg):
     net_load = fetch_net_load_forecast(iso, forecast_dates_list, session)
     prices   = forecast_prices(iso, load_data)
 
+    # Official ISO comparison (actual + day-ahead forecast)
+    comparison: dict = {"actual": {}, "da_fcst": {}}
+    try:
+        comparison = cfg["comparison_fn"](session)
+        log.info("%s: comparison fetched — %d actual, %d da_fcst days",
+                 iso.upper(), len(comparison.get("actual", {})), len(comparison.get("da_fcst", {})))
+    except Exception:
+        log.exception("%s: comparison fetch failed", iso.upper())
+
     result = {
         "load":       load_data,
         "dates":      forecast_dates_strs,
-        "comparison": {"actual": {}, "da_fcst": {}},
+        "comparison": comparison,
         f"{iso}_7day": [],
         "backtest":   {},
         "hindcast":   hindcast,

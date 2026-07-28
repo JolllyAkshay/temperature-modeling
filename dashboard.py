@@ -80,14 +80,17 @@ from temperature_modeling.miso_load import (
 from temperature_modeling.nyiso import NYISO_LOAD_LOCATIONS
 from temperature_modeling.nyiso_load import (
     weighted_avg_temp_f_nyiso, _NYISO_MODEL_PATH,
+    fetch_nyiso_official_comparison,
 )
 from temperature_modeling.isone import ISONE_LOAD_LOCATIONS
 from temperature_modeling.isone_load import (
     weighted_avg_temp_f_isone, _ISONE_MODEL_PATH,
+    fetch_isone_official_comparison,
 )
 from temperature_modeling.spp import SPP_LOAD_LOCATIONS
 from temperature_modeling.spp_load import (
     weighted_avg_temp_f_spp, _SPP_MODEL_PATH,
+    fetch_spp_official_comparison,
 )
 from temperature_modeling import _llm
 from temperature_modeling.ai_brief import generate_forecast_brief, generate_chat_response
@@ -283,7 +286,7 @@ def _build_iso_configs():
             model_ref=lambda: _NYISO_MODEL,
             cache_file=_NYISO_FORECAST_CACHE_FILE,
             training_path=_NYISO_TRAINING_DATA_PATH,
-            comparison_fn=lambda s: {},
+            comparison_fn=fetch_nyiso_official_comparison,
             bench_fn=lambda s: [],
             bench_key="nyiso_7day",
         ),
@@ -293,7 +296,7 @@ def _build_iso_configs():
             model_ref=lambda: _ISONE_MODEL,
             cache_file=_ISONE_FORECAST_CACHE_FILE,
             training_path=_ISONE_TRAINING_DATA_PATH,
-            comparison_fn=lambda s: {},
+            comparison_fn=fetch_isone_official_comparison,
             bench_fn=lambda s: [],
             bench_key="isone_7day",
         ),
@@ -303,7 +306,7 @@ def _build_iso_configs():
             model_ref=lambda: _SPP_MODEL,
             cache_file=_SPP_FORECAST_CACHE_FILE,
             training_path=_SPP_TRAINING_DATA_PATH,
-            comparison_fn=lambda s: {},
+            comparison_fn=fetch_spp_official_comparison,
             bench_fn=lambda s: [],
             bench_key="spp_7day",
         ),

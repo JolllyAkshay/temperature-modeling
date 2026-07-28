@@ -173,3 +173,91 @@ def build_isone_training_data(
             apparent_hi_f=_c_to_f(apparent_hi_by_date[d]) if d in apparent_hi_by_date else None,
         ))
     return obs
+
+
+# ---------------------------------------------------------------------------
+# Official comparison (actual demand + day-ahead forecast from EIA)
+# ---------------------------------------------------------------------------
+
+_ISONE_COMPARISON_CACHE = os.path.join(
+    os.path.dirname(__file__), "..", "..", "api_cache", "isone_comparison_cache.json"
+)
+
+
+def fetch_isone_official_comparison(
+    session: requests.Session,
+    lookback_days: int = 14,
+) -> Dict[str, Dict]:
+    """
+    Fetch EIA actual demand (D) and day-ahead forecast (DF) for ISO-NE (ISNE).
+    Returns {"actual": {date_str: gw}, "da_fcst": {date_str: gw}}.
+    """
+    import json as _json
+
+    today = date.today()
+    if os.path.exists(_ISONE_COMPARISON_CACHE):
+        try:
+            cached = _json.loads(open(_ISONE_COMPARISON_CACHE).read())
+            age_h = (time.time() - os.path.getmtime(_ISONE_COMPARISON_CACHE)) / 3600
+            if age_h < 6 and cached.get("actual") and today.isoformat() in str(cached):
+                return cached
+        except Exception:
+            pass
+
+    hist_start = today - timedelta(days=lookback_days)
+    fwd_end    = today + timedelta(days=2)
+
+    def _fetch_type(type_code: str, start: date, end: date) -> Dict[date, float]:
+        all_rows: list = []
+        offset = 0
+        while True:
+            params = {
+                "api_key":              _EIA_KEY,
+                "frequency":            "hourly",
+                "data[0]":              "value",
+                "facets[respondent][]": _EIA_RESPONDENT,
+                "facets[type][]":       type_code,
+                "start":                start.strftime("%Y-%m-%dT00"),
+                "end":                  end.strftime("%Y-%m-%dT23"),
+                "length":               5000,
+                "offset":               offset,
+                "sort[0][column]":      "period",
+                "sort[0][direction]":   "asc",
+            }
+            try:
+                r = session.get(_EIA_BASE, params=params, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+            except Exception:
+                break
+            rows  = data.get("response", {}).get("data", [])
+            total = int(data.get("response", {}).get("total", 0))
+            all_rows.extend(rows)
+            offset += 5000
+            if offset >= total:
+                break
+        daily: Dict[date, list] = {}
+        for row in all_rows:
+            val = row.get("value")
+            if val is None:
+                continue
+            try:
+                d = date.fromisoformat(row["period"][:10])
+                daily.setdefault(d, []).append(float(val))
+            except (ValueError, TypeError, KeyError):
+                continue
+        return {d: sum(v) / len(v) for d, v in daily.items() if v}
+
+    actual  = _fetch_type("D",  hist_start, today)
+    da_fcst = _fetch_type("DF", today,      fwd_end)
+
+    result = {
+        "actual":  {d.isoformat(): round(mw / 1000, 2) for d, mw in actual.items()},
+        "da_fcst": {d.isoformat(): round(mw / 1000, 2) for d, mw in da_fcst.items()},
+    }
+    try:
+        os.makedirs(os.path.dirname(_ISONE_COMPARISON_CACHE), exist_ok=True)
+        open(_ISONE_COMPARISON_CACHE, "w").write(_json.dumps(result))
+    except Exception:
+        pass
+    return result
