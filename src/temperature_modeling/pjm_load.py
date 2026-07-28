@@ -536,6 +536,23 @@ class LoadCorrectionModel:
             raise RuntimeError("Model not fitted.")
         return [float(p) for p in self._model.predict(feature_rows)]
 
+    def explain_prediction(self, feature_vector: list) -> Optional[list]:
+        """
+        Return Tree SHAP contributions (MW) for a single prediction using
+        XGBoost's built-in pred_contribs (no shap library needed).
+        Returns list of len(features)+1 values: per-feature MW contributions
+        followed by the bias/base value. Returns None if unavailable.
+        """
+        if self._model is None:
+            return None
+        try:
+            import xgboost as xgb
+            dm = xgb.DMatrix([feature_vector])
+            contribs = self._model.get_booster().predict(dm, pred_contribs=True)
+            return [float(v) for v in contribs[0]]
+        except Exception:
+            return None
+
     def predict_with_uncertainty(
         self,
         forecast_temps_c:      Dict[str, List[float]],  # avg °C per location

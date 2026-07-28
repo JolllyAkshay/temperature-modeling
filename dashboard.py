@@ -522,6 +522,48 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
     prices = forecast_prices(iso, load_data)
     result["price_forecast"] = prices
 
+    # ── SHAP explanation for day-0 forecast ──────────────────────────────────
+    _SHAP_GROUPS = {
+        "Temperature today": [0, 1, 2, 3, 4, 5, 6],
+        "Seasonal pattern":  [7, 8],
+        "Day / Calendar":    [9, 10, 11, 12, 13, 14, 15, 16, 21, 22],
+        "Recent temps":      [17, 18, 19, 20, 23, 24, 25, 26],
+        "Humidity & Wind":   [27, 28, 29, 30],
+    }
+    try:
+        d0 = forecast_dates_list[0]
+        def _c_map_d0(src):
+            return {loc["label"]: (src.get(loc["label"]) or [None]*15)[0]
+                    for loc in locations
+                    if (src.get(loc["label"]) or [None]*15)[0] is not None}
+        avg_f0 = weighted_avg_fn(_c_map_d0(avg_c)) if _c_map_d0(avg_c) else 65.0
+        hi_f0  = weighted_avg_fn(_c_map_d0(hi_c))  if _c_map_d0(hi_c)  else avg_f0
+        lo_f0  = weighted_avg_fn(_c_map_d0(lo_c))  if _c_map_d0(lo_c)  else avg_f0
+        app_f0 = weighted_avg_fn(_c_map_d0(apparent_hi_c)) if _c_map_d0(apparent_hi_c) else None
+        dew_f0 = weighted_avg_fn(_c_map_d0(dewpoint_c))    if _c_map_d0(dewpoint_c)    else None
+        wmap   = _c_map_d0(wind_kph)
+        wind_mph0 = None
+        if wmap:
+            tw = sum(loc["weight"] for loc in locations if loc["label"] in wmap)
+            wind_mph0 = sum(loc["weight"] * wmap[loc["label"]]
+                            for loc in locations if loc["label"] in wmap) / tw * 0.621371
+        lag1_f  = recent_avg_f[-1] if len(recent_avg_f) >= 1 else avg_f0
+        lag2_f  = recent_avg_f[-2] if len(recent_avg_f) >= 2 else avg_f0
+        lag7_f  = recent_avg_f[-7] if len(recent_avg_f) >= 7 else avg_f0
+        rv      = [recent_avg_f[-k] for k in range(1, 8) if k <= len(recent_avg_f)]
+        roll7_f = sum(rv) / len(rv) if rv else avg_f0
+        feats_d0, _, _ = _bf(avg_f0, hi_f0, lo_f0, d0, lag1_f, lag2_f, lag7_f, roll7_f,
+                              apparent_hi_f=app_f0, dewpoint_hi_f=dew_f0, wind_speed_mph=wind_mph0)
+        contribs = model.explain_prediction(feats_d0)
+        if contribs:
+            result["shap"] = {
+                "groups": {g: round(sum(contribs[i] for i in idx), 1)
+                           for g, idx in _SHAP_GROUPS.items()},
+                "base_mw": round(contribs[-1], 1),
+            }
+    except Exception:
+        log.exception("%s: SHAP computation failed — skipping explainability panel", iso.upper())
+
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(result))
@@ -753,6 +795,37 @@ app.layout = html.Div(
                             ],
                         ),
                         dcc.Graph(id="load-forecast-chart", style={"height": "320px"},
+                                  config={"displayModeBar": False}),
+                    ],
+                ),
+
+                # ── SHAP Explainability ────────────────────────────────────────
+                html.Div(
+                    id="shap-panel",
+                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                           "border": "1px solid #e2e8f0", "padding": "20px",
+                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+                           "marginBottom": "20px"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between",
+                                   "alignItems": "center", "marginBottom": "4px"},
+                            children=[
+                                html.Div("What's driving today's forecast?",
+                                         style={"fontSize": "13px", "fontWeight": 600,
+                                                "color": "#0f172a"}),
+                                html.Span("Tree SHAP — XGBoost attribution",
+                                          style={"fontSize": "10px", "color": "#94a3b8",
+                                                 "background": "#f1f5f9",
+                                                 "borderRadius": "4px",
+                                                 "padding": "2px 7px"}),
+                            ],
+                        ),
+                        html.Div("Each bar shows how much that factor adds or subtracts from "
+                                 "the expected baseline load. Positive = pushes load higher.",
+                                 style={"fontSize": "11px", "color": "#94a3b8",
+                                        "marginBottom": "8px"}),
+                        dcc.Graph(id="shap-chart", style={"height": "200px"},
                                   config={"displayModeBar": False}),
                     ],
                 ),
@@ -1284,6 +1357,60 @@ def render(data, iso):
     )
 
     return summary_cards, subtitle, fig
+
+
+# ---------------------------------------------------------------------------
+# SHAP explainability callback
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("shap-chart", "figure"),
+    Input("load-forecast-store", "data"),
+)
+def render_shap(data):
+    if not data or "shap" not in data:
+        return _empty_fig("Forecast not loaded yet")
+
+    shap = data["shap"]
+    groups = shap.get("groups", {})
+    base_mw = shap.get("base_mw", 0)
+
+    if not groups:
+        return _empty_fig("No SHAP data available")
+
+    labels = list(groups.keys())
+    values = [groups[g] for g in labels]
+    colors = ["#ef4444" if v > 0 else "#3b82f6" for v in values]
+    base_gw = round(base_mw / 1000, 2)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=values,
+        y=labels,
+        orientation="h",
+        marker_color=colors,
+        text=[f"{v:+,.0f} MW" for v in values],
+        textposition="outside",
+        cliponaxis=False,
+    ))
+    fig.add_vline(x=0, line_width=1, line_color="#94a3b8")
+    fig.update_layout(
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        margin=dict(l=10, r=80, t=10, b=10),
+        xaxis=dict(
+            title=dict(text="Contribution vs. baseline (MW)", font=dict(size=10)),
+            gridcolor="#f1f5f9", zeroline=False, tickfont=dict(size=10),
+        ),
+        yaxis=dict(tickfont=dict(size=11), autorange="reversed"),
+        showlegend=False,
+        annotations=[dict(
+            text=f"Baseline: {base_gw:.1f} GW",
+            x=1, y=1.08, xref="paper", yref="paper",
+            showarrow=False, font=dict(size=10, color="#94a3b8"),
+            xanchor="right",
+        )],
+    )
+    return fig
 
 
 # ---------------------------------------------------------------------------
