@@ -1,7 +1,7 @@
 """
 Train XGBoost load models for ERCOT and MISO.
 
-Fetches 2 years of EIA hourly load data and ERA5 daily temperatures,
+Fetches 5 years of EIA hourly load data and ERA5 daily temperatures,
 builds training observations, trains an XGBoost model for each ISO,
 evaluates on a chronological 80/20 split, and saves the models to pkl.
 
@@ -16,7 +16,7 @@ Prerequisites
 
 Runtime
 -------
-    ~10-20 minutes (ERA5 fetches for 12 locations × 2 years each ISO,
+    ~25-50 minutes (ERA5 fetches for 12 locations × 5 years each ISO,
     most will be served from api_cache/ on subsequent runs).
 """
 
@@ -55,9 +55,9 @@ from temperature_modeling.models import Coordinates
 # Configuration
 # ---------------------------------------------------------------------------
 
-# 2-year training window; ERA5 has a ~5-day lag so end at least 7 days ago
+# 5-year training window; ERA5 has a ~5-day lag so end at least 7 days ago
 TRAIN_END   = date.today() - timedelta(days=7)
-TRAIN_START = TRAIN_END - timedelta(days=730)
+TRAIN_START = TRAIN_END - timedelta(days=1825)
 
 TRAINING_DATA_DIR = os.path.join(os.path.dirname(__file__), "api_cache")
 
@@ -82,15 +82,18 @@ def _fetch_era5_for_locations(locations, start, end, session):
         coords = Coordinates(loc["lat"], loc["lon"])
         return loc["label"], fetch_era5_daily_hi_lo(coords, start, end, session)
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    # Use 2 workers to avoid overwhelming Open-Meteo's free tier;
+    # avg and hilo are submitted sequentially so max concurrent = 2.
+    with ThreadPoolExecutor(max_workers=2) as pool:
         avg_futs  = {pool.submit(_avg,  loc): loc for loc in locations}
-        hilo_futs = {pool.submit(_hilo, loc): loc for loc in locations}
         for fut in as_completed(avg_futs):
             try:
                 label, data = fut.result()
                 avg_by_label[label] = data
             except Exception as exc:
                 print(f"  ERA5 avg fetch error: {exc}")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        hilo_futs = {pool.submit(_hilo, loc): loc for loc in locations}
         for fut in as_completed(hilo_futs):
             try:
                 label, data = fut.result()
@@ -120,6 +123,8 @@ def _obs_to_json(obs_list):
             "temp_lag7_f":    o.temp_lag7_f,
             "rolling7_avg_f": o.rolling7_avg_f,
             "apparent_hi_f":  o.apparent_hi_f,
+            "dewpoint_hi_f":  o.dewpoint_hi_f,
+            "wind_speed_mph": o.wind_speed_mph,
         }
         for o in obs_list
     ]
@@ -157,6 +162,8 @@ def _train_iso(
                     temp_lag7_f=r.get("temp_lag7_f"),
                     rolling7_avg_f=r.get("rolling7_avg_f"),
                     apparent_hi_f=r.get("apparent_hi_f"),
+                    dewpoint_hi_f=r.get("dewpoint_hi_f"),
+                    wind_speed_mph=r.get("wind_speed_mph"),
                 ))
             except (KeyError, ValueError):
                 continue

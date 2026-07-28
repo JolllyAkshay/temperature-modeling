@@ -25,7 +25,7 @@ BRIEF_CACHE_TTL_HOURS: int = 3
 _CACHE_DIR = Path(__file__).parent.parent.parent / "api_cache"
 _BRIEF_CACHES = {
     iso: _CACHE_DIR / f"{iso}_brief_cache.json"
-    for iso in ("pjm", "caiso", "ercot", "miso")
+    for iso in ("pjm", "caiso", "ercot", "miso", "nyiso", "isone", "spp")
 }
 
 _ISO_CONTEXT = {
@@ -33,13 +33,18 @@ _ISO_CONTEXT = {
     "caiso": "CAISO — California ISO, ~45 GW peak. Covers most of California; high solar penetration creates a pronounced duck-curve.",
     "ercot": "ERCOT — Texas ISO, ~80 GW peak. Energy-only market (no capacity payments); ORDC scarcity pricing kicks in above ~68 GW.",
     "miso":  "MISO — Midcontinent ISO, ~120 GW peak. Covers MN, WI, MI, IA, IL, MO, AR, LA, MS; historically coal-heavy, rapid wind build-out.",
+    "nyiso": "NYISO — New York ISO, ~35 GW peak. Dense urban load; significant hydro imports from Quebec; NYC congestion drives zonal price spreads.",
+    "isone": "ISO-NE — New England ISO, ~28 GW peak. Winter gas-electric fuel competition is the primary reliability concern; limited pipeline capacity.",
+    "spp":   "SPP — Southwest Power Pool, ~90 GW peak. Wind-heavy (>50% penetration on strong days); covers Great Plains from Texas Panhandle to North Dakota.",
 }
 
 _BRIEF_SYSTEM = (
     "You are an expert energy market analyst specialising in US electricity grid operations. "
     "Write concise, factual, analyst-style forecast briefs for grid operators and energy traders. "
-    "Be precise with numbers. Lead with the most actionable insight. "
-    "Write in flowing prose — no bullet points, no headers — 3 to 5 sentences maximum."
+    "Be precise with numbers. "
+    "If any day in the forecast shows avg_temp_f above 90°F or below 20°F, open with that weather "
+    "alert and its projected load impact before anything else. Otherwise lead with the peak load date "
+    "and magnitude. Write in flowing prose — no bullet points, no headers — 3 to 5 sentences maximum."
 )
 
 _CHAT_SYSTEM_TEMPLATE = (
@@ -84,6 +89,22 @@ def _build_context_block(iso: str, forecast_data: dict) -> str:
     avg_gw    = sum(means) / len(means) if means else 0
 
     recent_actual = dict(list(comparison.get("actual", {}).items())[-7:])
+    da_fcst       = comparison.get("da_fcst", {})
+
+    daily = []
+    for d in load_list:
+        row: dict = {
+            "date":        d["date"],
+            "mean_gw":     d["mean_load_gw"],
+            "low_gw":      d["low_load_gw"],
+            "high_gw":     d["high_load_gw"],
+            "ci_width_gw": round(d["high_load_gw"] - d["low_load_gw"], 2),
+        }
+        if d.get("avg_temp_f") is not None:
+            row["avg_temp_f"] = round(d["avg_temp_f"], 1)
+        if d["date"] in da_fcst:
+            row["vs_iso_da_gw"] = round(d["mean_load_gw"] - da_fcst[d["date"]], 2)
+        daily.append(row)
 
     return json.dumps({
         "iso":              iso.upper(),
@@ -95,9 +116,7 @@ def _build_context_block(iso: str, forecast_data: dict) -> str:
         "peak_date":        peak_date,
         "avg_gw_15day":     round(avg_gw, 2),
         "model_mape_test":  backtest.get("mape_test"),
-        "daily_forecast":   [{"date": d["date"], "mean_gw": d["mean_load_gw"],
-                               "low_gw": d["low_load_gw"], "high_gw": d["high_load_gw"]}
-                              for d in load_list],
+        "daily_forecast":   daily,
         "recent_actual_gw": recent_actual,
         "monthly_mape":     backtest.get("monthly_mape", {}),
     }, indent=2)
@@ -174,6 +193,9 @@ def generate_chat_response(
         "caiso": "CAISO (California ISO)",
         "ercot": "ERCOT (Texas)",
         "miso":  "MISO (Midcontinent ISO)",
+        "nyiso": "NYISO (New York ISO)",
+        "isone": "ISO-NE (New England ISO)",
+        "spp":   "SPP (Southwest Power Pool)",
     }
     iso_label     = _ISO_LABELS.get(iso, iso.upper())
     context_block = _build_context_block(iso, forecast_data)

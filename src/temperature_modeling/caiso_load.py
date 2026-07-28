@@ -101,7 +101,16 @@ def fetch_caiso_load_daily(
         except (ValueError, TypeError):
             continue
 
-    return {d: sum(vals) / len(vals) for d, vals in daily.items() if vals}
+    result: Dict[date, float] = {}
+    for d, vals in daily.items():
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        median = vals_sorted[n // 2] if n % 2 else (vals_sorted[n//2-1] + vals_sorted[n//2]) / 2
+        clean = [v for v in vals if v <= median * 10]
+        result[d] = sum(clean) / len(clean) if clean else median
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +141,12 @@ def build_caiso_training_data(
     era5_hi_by_label:   Dict[str, Dict[date, Tuple[float, float]]],
 ) -> List[LoadObservation]:
     sorted_dates = sorted(load_daily.keys())
-    avg_f_by_date:      Dict[date, float] = {}
-    hi_f_by_date:       Dict[date, float] = {}
-    lo_f_by_date:       Dict[date, float] = {}
+    avg_f_by_date:       Dict[date, float] = {}
+    hi_f_by_date:        Dict[date, float] = {}
+    lo_f_by_date:        Dict[date, float] = {}
     apparent_hi_by_date: Dict[date, float] = {}
+    dewpoint_hi_by_date: Dict[date, float] = {}
+    wind_speed_by_date:  Dict[date, float] = {}
 
     for d in sorted_dates:
         avg_c = {
@@ -150,6 +161,8 @@ def build_caiso_training_data(
         hi_c = {}
         lo_c = {}
         ap_c = {}
+        dew_c: Dict[str, float] = {}
+        wind_kph: Dict[str, float] = {}
         for loc in CAISO_LOAD_LOCATIONS:
             label = loc["label"]
             pair  = era5_hi_by_label.get(label, {}).get(d)
@@ -158,12 +171,23 @@ def build_caiso_training_data(
                 lo_c[label] = pair[1]
                 if len(pair) > 2 and pair[2] is not None:
                     ap_c[label] = pair[2]
+                if len(pair) > 3 and pair[3] is not None:
+                    dew_c[label] = pair[3]
+                if len(pair) > 4 and pair[4] is not None:
+                    wind_kph[label] = pair[4]
         if hi_c:
             hi_f_by_date[d] = weighted_avg_temp_f_caiso(hi_c)
         if lo_c:
             lo_f_by_date[d] = weighted_avg_temp_f_caiso(lo_c)
         if ap_c:
             apparent_hi_by_date[d] = weighted_avg_temp_f_caiso(ap_c)
+        if dew_c:
+            dewpoint_hi_by_date[d] = weighted_avg_temp_f_caiso(dew_c)
+        if wind_kph:
+            total_w = sum(loc["weight"] for loc in CAISO_LOAD_LOCATIONS if loc["label"] in wind_kph)
+            avg_kph = sum(loc["weight"] * wind_kph[loc["label"]]
+                          for loc in CAISO_LOAD_LOCATIONS if loc["label"] in wind_kph) / total_w
+            wind_speed_by_date[d] = avg_kph * 0.621371
 
     obs: List[LoadObservation] = []
     sorted_with_temp = sorted(avg_f_by_date.keys())
@@ -200,7 +224,9 @@ def build_caiso_training_data(
             temp_lag2_f=lag2_f,
             temp_lag7_f=lag7_f,
             rolling7_avg_f=rolling7_f,
-            apparent_hi_f=_c_to_f(apparent_hi_by_date[d]) if d in apparent_hi_by_date else None,
+            apparent_hi_f=apparent_hi_by_date.get(d),           # already °F (via weighted_avg_temp_f)
+            dewpoint_hi_f=dewpoint_hi_by_date.get(d),
+            wind_speed_mph=wind_speed_by_date.get(d),
         ))
     return obs
 
@@ -223,6 +249,8 @@ class CAISOLoadModel(LoadCorrectionModel):
         locations=None,
         weighted_avg_fn=None,
         forecast_apparent_hi_c: Dict[str, List[float]] = None,
+        forecast_dewpoint_c:    Dict[str, List[float]] = None,
+        forecast_wind_kph:      Dict[str, List[float]] = None,
     ) -> List[LoadForecast]:
         _locs   = locations    if locations    is not None else CAISO_LOAD_LOCATIONS
         _wt_avg = weighted_avg_fn if weighted_avg_fn is not None else weighted_avg_temp_f_caiso
@@ -281,13 +309,35 @@ class CAISOLoadModel(LoadCorrectionModel):
                 }
             app_hi_f = _wt_avg(app_hi_c_map) if app_hi_c_map else None
 
+            dew_c_map = {}
+            if forecast_dewpoint_c:
+                dew_c_map = {
+                    loc["label"]: (forecast_dewpoint_c.get(loc["label"]) or [None]*20)[i]
+                    for loc in _locs
+                    if (forecast_dewpoint_c.get(loc["label"]) or [None]*20)[i] is not None
+                }
+            dew_hi_f = _wt_avg(dew_c_map) if dew_c_map else None
+
+            wind_f: Optional[float] = None
+            if forecast_wind_kph:
+                wkph_map = {
+                    loc["label"]: (forecast_wind_kph.get(loc["label"]) or [None]*20)[i]
+                    for loc in _locs
+                    if (forecast_wind_kph.get(loc["label"]) or [None]*20)[i] is not None
+                }
+                if wkph_map:
+                    tw = sum(loc["weight"] for loc in _locs if loc["label"] in wkph_map)
+                    wind_f = (sum(loc["weight"] * wkph_map[loc["label"]]
+                                  for loc in _locs if loc["label"] in wkph_map) / tw) * 0.621371
+
             lag1_f = _lag(i, 1)
             lag2_f = _lag(i, 2)
             lag7_f = _lag(i, 7)
             roll7_f = _rolling7(i)
 
             feats, hdd, cdd = _build_features(avg_f, hi_f, lo_f, d, lag1_f, lag2_f, lag7_f, roll7_f,
-                                               apparent_hi_f=app_hi_f)
+                                               apparent_hi_f=app_hi_f,
+                                               dewpoint_hi_f=dew_hi_f, wind_speed_mph=wind_f)
             mean_mw = self.predict([feats])[0]
 
             spread_c_vals = [

@@ -92,7 +92,16 @@ def fetch_isone_load_daily(start: date, end: date, session: requests.Session) ->
         except (ValueError, TypeError):
             continue
 
-    return {d: sum(v) / len(v) for d, v in daily.items() if v}
+    result: Dict[date, float] = {}
+    for d, vals in daily.items():
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        median = vals_sorted[n // 2] if n % 2 else (vals_sorted[n//2-1] + vals_sorted[n//2]) / 2
+        clean = [v for v in vals if v <= median * 10]
+        result[d] = sum(clean) / len(clean) if clean else median
+    return result
 
 
 def weighted_avg_temp_f_isone(temps_c_by_label: Dict[str, float]) -> float:
@@ -114,10 +123,12 @@ def build_isone_training_data(
     era5_avg_by_label: Dict[str, Dict[date, float]],
     era5_hi_by_label:  Dict[str, Dict[date, Tuple[float, float]]],
 ) -> List[LoadObservation]:
-    avg_f_by_date:      Dict[date, float] = {}
-    hi_f_by_date:       Dict[date, float] = {}
-    lo_f_by_date:       Dict[date, float] = {}
+    avg_f_by_date:       Dict[date, float] = {}
+    hi_f_by_date:        Dict[date, float] = {}
+    lo_f_by_date:        Dict[date, float] = {}
     apparent_hi_by_date: Dict[date, float] = {}
+    dewpoint_hi_by_date: Dict[date, float] = {}
+    wind_speed_by_date:  Dict[date, float] = {}
 
     for d in sorted(load_daily):
         avg_c = {
@@ -129,7 +140,11 @@ def build_isone_training_data(
             continue
         avg_f_by_date[d] = weighted_avg_temp_f_isone(avg_c)
 
-        hi_c, lo_c, ap_c = {}, {}, {}
+        hi_c: Dict[str, float] = {}
+        lo_c: Dict[str, float] = {}
+        ap_c: Dict[str, float] = {}
+        dew_c: Dict[str, float] = {}
+        wind_kph: Dict[str, float] = {}
         for loc in ISONE_LOAD_LOCATIONS:
             pair = era5_hi_by_label.get(loc["label"], {}).get(d)
             if pair is not None:
@@ -137,12 +152,23 @@ def build_isone_training_data(
                 lo_c[loc["label"]] = pair[1]
                 if len(pair) > 2 and pair[2] is not None:
                     ap_c[loc["label"]] = pair[2]
+                if len(pair) > 3 and pair[3] is not None:
+                    dew_c[loc["label"]] = pair[3]
+                if len(pair) > 4 and pair[4] is not None:
+                    wind_kph[loc["label"]] = pair[4]
         if hi_c:
             hi_f_by_date[d] = weighted_avg_temp_f_isone(hi_c)
         if lo_c:
             lo_f_by_date[d] = weighted_avg_temp_f_isone(lo_c)
         if ap_c:
             apparent_hi_by_date[d] = weighted_avg_temp_f_isone(ap_c)
+        if dew_c:
+            dewpoint_hi_by_date[d] = weighted_avg_temp_f_isone(dew_c)
+        if wind_kph:
+            total_w = sum(loc["weight"] for loc in ISONE_LOAD_LOCATIONS if loc["label"] in wind_kph)
+            avg_kph = sum(loc["weight"] * wind_kph[loc["label"]]
+                          for loc in ISONE_LOAD_LOCATIONS if loc["label"] in wind_kph) / total_w
+            wind_speed_by_date[d] = avg_kph * 0.621371
 
     obs: List[LoadObservation] = []
     for d in sorted(avg_f_by_date):
@@ -170,7 +196,9 @@ def build_isone_training_data(
                 len([v for v in roll_vals if v is not None])
                 if any(v is not None for v in roll_vals) else None
             ),
-            apparent_hi_f=_c_to_f(apparent_hi_by_date[d]) if d in apparent_hi_by_date else None,
+            apparent_hi_f=apparent_hi_by_date.get(d),           # already °F (via weighted_avg_temp_f)
+            dewpoint_hi_f=dewpoint_hi_by_date.get(d),
+            wind_speed_mph=wind_speed_by_date.get(d),
         ))
     return obs
 

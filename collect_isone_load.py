@@ -42,7 +42,7 @@ def main():
     session.headers["User-Agent"] = "temperature-modeling/1.0"
 
     end   = date.today() - timedelta(days=1)
-    start = end - timedelta(days=730)
+    start = end - timedelta(days=1825)
 
     print(f"\n[1/4] Fetching ISO-NE (ISNE) daily load  {start} to {end} ...")
     load_daily = fetch_isone_load_daily(start, end, session)
@@ -73,6 +73,8 @@ def main():
             "temp_lag1_f": o.temp_lag1_f, "temp_lag2_f": o.temp_lag2_f,
             "temp_lag7_f": o.temp_lag7_f, "rolling7_avg_f": o.rolling7_avg_f,
             "apparent_hi_f": o.apparent_hi_f,
+            "dewpoint_hi_f": o.dewpoint_hi_f,
+            "wind_speed_mph": o.wind_speed_mph,
         } for o in observations], f, indent=2)
 
     if Path(_ISONE_MODEL_PATH).exists() and not retrain:

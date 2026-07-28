@@ -36,6 +36,10 @@ jobs:
           repo = "JollyAkshay/grid-dashboard"
           token = os.environ["HF_TOKEN"]
           models = [
+              "api_cache/pjm_load_model.pkl",
+              "api_cache/caiso_load_model.pkl",
+              "api_cache/ercot_load_model.pkl",
+              "api_cache/miso_load_model.pkl",
               "api_cache/nyiso_load_model.pkl",
               "api_cache/isone_load_model.pkl",
               "api_cache/spp_load_model.pkl",
@@ -66,6 +70,10 @@ jobs:
           repo = "JollyAkshay/grid-dashboard"
           token = os.environ["HF_TOKEN"]
           caches = [
+              "api_cache/pjm_forecast_cache.json",
+              "api_cache/caiso_forecast_cache.json",
+              "api_cache/ercot_forecast_cache.json",
+              "api_cache/miso_forecast_cache.json",
               "api_cache/nyiso_forecast_cache.json",
               "api_cache/isone_forecast_cache.json",
               "api_cache/spp_forecast_cache.json",

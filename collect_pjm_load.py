@@ -14,6 +14,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE / "src"))
@@ -41,7 +43,7 @@ def main():
     session.headers.update({"User-Agent": "temperature-modeling/1.0"})
 
     end   = date.today() - timedelta(days=1)
-    start = end - timedelta(days=730)
+    start = end - timedelta(days=1825)
 
     # ------------------------------------------------------------------
     # 1. PJM RTO load
@@ -103,6 +105,8 @@ def main():
                     "temp_lag7_f":    o.temp_lag7_f,
                     "rolling7_avg_f": o.rolling7_avg_f,
                     "apparent_hi_f":  o.apparent_hi_f,
+                    "dewpoint_hi_f":  o.dewpoint_hi_f,
+                    "wind_speed_mph": o.wind_speed_mph,
                 }
                 for o in observations
             ],

@@ -61,6 +61,7 @@ PJM_LOAD_LOCATIONS: list[dict] = [
     {"label": "Indianapolis IN", "lat": 39.5, "lon": -86.5, "weight": 0.10},
     {"label": "Charlotte NC",    "lat": 35.0, "lon": -80.5, "weight": 0.09},
     {"label": "Pittsburgh PA",   "lat": 40.5, "lon": -80.0, "weight": 0.09},
+    {"label": "Chicago IL",      "lat": 41.9, "lon": -87.6, "weight": 0.10},
 ]
 
 

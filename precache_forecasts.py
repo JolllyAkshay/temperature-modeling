@@ -25,16 +25,37 @@ sys.path.insert(0, str(_HERE / "src"))
 
 from temperature_modeling._era5 import fetch_era5_daily
 from temperature_modeling.models import Coordinates
+from temperature_modeling.pjm import PJM_LOAD_LOCATIONS
 from temperature_modeling.pjm_load import (
     LoadCorrectionModel,
     _build_features,
     load_load_model,
     fetch_era5_daily_hi_lo,
     fetch_gefs_spread,
+    run_load_backtest,
+    fetch_pjm_official_comparison,
+    fetch_pjm_dataminer_7day,
+    weighted_avg_temp_f as weighted_avg_temp_f_pjm,
+    _MODEL_PATH as _PJM_MODEL_PATH,
 )
 from temperature_modeling.net_load import fetch_net_load_forecast
 from temperature_modeling.price_forecast import forecast_prices
 
+from temperature_modeling.caiso import CAISO_LOAD_LOCATIONS
+from temperature_modeling.caiso_load import (
+    weighted_avg_temp_f_caiso, _CAISO_MODEL_PATH,
+    fetch_caiso_official_comparison, fetch_caiso_oasis_7day,
+)
+from temperature_modeling.ercot import ERCOT_LOAD_LOCATIONS
+from temperature_modeling.ercot_load import (
+    weighted_avg_temp_f_ercot, _ERCOT_MODEL_PATH,
+    fetch_ercot_official_comparison, fetch_ercot_7day,
+)
+from temperature_modeling.miso import MISO_LOAD_LOCATIONS
+from temperature_modeling.miso_load import (
+    weighted_avg_temp_f_miso, _MISO_MODEL_PATH,
+    fetch_miso_official_comparison, fetch_miso_7day,
+)
 from temperature_modeling.nyiso import NYISO_LOAD_LOCATIONS
 from temperature_modeling.nyiso_load import (
     weighted_avg_temp_f_nyiso, _NYISO_MODEL_PATH, fetch_nyiso_official_comparison,
@@ -48,27 +69,78 @@ from temperature_modeling.spp_load import (
     weighted_avg_temp_f_spp, _SPP_MODEL_PATH, fetch_spp_official_comparison,
 )
 
+_API_CACHE = _HERE / "api_cache"
+
 _ISOS = {
+    "pjm": dict(
+        locations=PJM_LOAD_LOCATIONS,
+        weighted_avg_fn=weighted_avg_temp_f_pjm,
+        model_path=_PJM_MODEL_PATH,
+        cache_file=_API_CACHE / "pjm_forecast_cache.json",
+        comparison_fn=fetch_pjm_official_comparison,
+        bench_fn=fetch_pjm_dataminer_7day,
+        bench_key="pjm_7day",
+        training_path=_API_CACHE / "pjm_load_training.json",
+    ),
+    "caiso": dict(
+        locations=CAISO_LOAD_LOCATIONS,
+        weighted_avg_fn=weighted_avg_temp_f_caiso,
+        model_path=_CAISO_MODEL_PATH,
+        cache_file=_API_CACHE / "caiso_forecast_cache.json",
+        comparison_fn=fetch_caiso_official_comparison,
+        bench_fn=fetch_caiso_oasis_7day,
+        bench_key="oasis_7day",
+        training_path=_API_CACHE / "caiso_load_training.json",
+    ),
+    "ercot": dict(
+        locations=ERCOT_LOAD_LOCATIONS,
+        weighted_avg_fn=weighted_avg_temp_f_ercot,
+        model_path=_ERCOT_MODEL_PATH,
+        cache_file=_API_CACHE / "ercot_forecast_cache.json",
+        comparison_fn=fetch_ercot_official_comparison,
+        bench_fn=fetch_ercot_7day,
+        bench_key="ercot_7day",
+        training_path=_API_CACHE / "ercot_load_training.json",
+    ),
+    "miso": dict(
+        locations=MISO_LOAD_LOCATIONS,
+        weighted_avg_fn=weighted_avg_temp_f_miso,
+        model_path=_MISO_MODEL_PATH,
+        cache_file=_API_CACHE / "miso_forecast_cache.json",
+        comparison_fn=fetch_miso_official_comparison,
+        bench_fn=fetch_miso_7day,
+        bench_key="miso_7day",
+        training_path=_API_CACHE / "miso_load_training.json",
+    ),
     "nyiso": dict(
         locations=NYISO_LOAD_LOCATIONS,
         weighted_avg_fn=weighted_avg_temp_f_nyiso,
         model_path=_NYISO_MODEL_PATH,
-        cache_file=_HERE / "api_cache" / "nyiso_forecast_cache.json",
+        cache_file=_API_CACHE / "nyiso_forecast_cache.json",
         comparison_fn=fetch_nyiso_official_comparison,
+        bench_fn=lambda s: {},
+        bench_key="nyiso_7day",
+        training_path=_API_CACHE / "nyiso_load_training.json",
     ),
     "isone": dict(
         locations=ISONE_LOAD_LOCATIONS,
         weighted_avg_fn=weighted_avg_temp_f_isone,
         model_path=_ISONE_MODEL_PATH,
-        cache_file=_HERE / "api_cache" / "isone_forecast_cache.json",
+        cache_file=_API_CACHE / "isone_forecast_cache.json",
         comparison_fn=fetch_isone_official_comparison,
+        bench_fn=lambda s: {},
+        bench_key="isone_7day",
+        training_path=_API_CACHE / "isone_load_training.json",
     ),
     "spp": dict(
         locations=SPP_LOAD_LOCATIONS,
         weighted_avg_fn=weighted_avg_temp_f_spp,
         model_path=_SPP_MODEL_PATH,
-        cache_file=_HERE / "api_cache" / "spp_forecast_cache.json",
+        cache_file=_API_CACHE / "spp_forecast_cache.json",
         comparison_fn=fetch_spp_official_comparison,
+        bench_fn=lambda s: {},
+        bench_key="spp_7day",
+        training_path=_API_CACHE / "spp_load_training.json",
     ),
 }
 
@@ -79,7 +151,10 @@ def _fetch_one(label, lat, lon, session, forecast_days=15):
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": lat, "longitude": lon,
-                "daily": "temperature_2m_max,temperature_2m_min,apparent_temperature_max",
+                "daily": ("temperature_2m_max,temperature_2m_min,"
+                          "apparent_temperature_max,"
+                          "dew_point_2m_max,"
+                          "wind_speed_10m_max"),
                 "forecast_days": forecast_days,
                 "temperature_unit": "fahrenheit",
                 "timezone": "auto",
@@ -88,9 +163,13 @@ def _fetch_one(label, lat, lon, session, forecast_days=15):
         )
         r.raise_for_status()
         d = r.json()["daily"]
-        return {"label": label, "dates": d["time"],
-                "hi": d["temperature_2m_max"], "lo": d["temperature_2m_min"],
-                "apparent_hi": d.get("apparent_temperature_max")}
+        return {
+            "label": label, "dates": d["time"],
+            "hi": d["temperature_2m_max"], "lo": d["temperature_2m_min"],
+            "apparent_hi":  d.get("apparent_temperature_max"),
+            "dewpoint_hi":  d.get("dew_point_2m_max"),   # °F (temperature_unit=fahrenheit)
+            "wind_kph":     d.get("wind_speed_10m_max"),  # km/h (independent of temp unit)
+        }
     except Exception as exc:
         log.warning("Open-Meteo error for %s: %s", label, exc)
         return None
@@ -114,7 +193,7 @@ def generate_cache(iso, cfg):
         return [(v - 32) * 5 / 9 if v is not None else None for v in lst]
 
     # GFS temperature fetch
-    avg_c, hi_c, lo_c, apparent_hi_c = {}, {}, {}, {}
+    avg_c, hi_c, lo_c, apparent_hi_c, dewpoint_c, wind_kph = {}, {}, {}, {}, {}, {}
     forecast_dates_strs = None
 
     log.info("%s: fetching GFS for %d locations ...", iso.upper(), len(locations))
@@ -134,6 +213,10 @@ def generate_cache(iso, cfg):
             lo_c[label]  = loc_lo
             if res.get("apparent_hi"):
                 apparent_hi_c[label] = _f_to_c(res["apparent_hi"])
+            if res.get("dewpoint_hi"):
+                dewpoint_c[label] = _f_to_c(res["dewpoint_hi"])  # °F → °C
+            if res.get("wind_kph"):
+                wind_kph[label] = res["wind_kph"]  # already km/h
             if forecast_dates_strs is None:
                 forecast_dates_strs = res["dates"][:15]
 
@@ -213,11 +296,16 @@ def generate_cache(iso, cfg):
         recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
         locations=locations, weighted_avg_fn=weighted_avg_fn,
         forecast_apparent_hi_c=apparent_hi_c if apparent_hi_c else None,
+        forecast_dewpoint_c=dewpoint_c if dewpoint_c else None,
+        forecast_wind_kph=wind_kph if wind_kph else None,
     )
     load_data = [{"date": lf.valid_date.isoformat(),
                   "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
                   "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
-                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
+                  "high_load_gw": round(lf.high_load_mw / 1000, 2),
+                  "avg_temp_f":   round(lf.avg_temp_f, 1) if lf.avg_temp_f else None,
+                  "hdd":          round(lf.hdd, 1),
+                  "cdd":          round(lf.cdd, 1)}
                  for lf in load_forecasts]
     log.info("%s: forecast done — %d days", iso.upper(), len(load_data))
 
@@ -234,15 +322,33 @@ def generate_cache(iso, cfg):
     except Exception:
         log.exception("%s: comparison fetch failed", iso.upper())
 
+    # 7-day benchmark from ISO
+    bench_data: dict = {}
+    try:
+        bench_data = cfg["bench_fn"](session)
+    except Exception:
+        log.exception("%s: bench fetch failed", iso.upper())
+
+    # Model accuracy backtest (reads training JSON; returns {} if not present)
+    backtest: dict = {}
+    try:
+        tp = cfg.get("training_path")
+        if tp and Path(tp).exists():
+            backtest = run_load_backtest(model, str(tp))
+            log.info("%s: backtest done — test MAPE %.1f%%",
+                     iso.upper(), backtest.get("mape_test") or 0)
+    except Exception:
+        log.exception("%s: backtest failed", iso.upper())
+
     result = {
-        "load":       load_data,
-        "dates":      forecast_dates_strs,
-        "comparison": comparison,
-        f"{iso}_7day": [],
-        "backtest":   {},
-        "hindcast":   hindcast,
-        "net_load":   net_load,
-        "price_forecast": prices,
+        "load":              load_data,
+        "dates":             forecast_dates_strs,
+        "comparison":        comparison,
+        cfg["bench_key"]:    bench_data,
+        "backtest":          backtest,
+        "hindcast":          hindcast,
+        "net_load":          net_load,
+        "price_forecast":    prices,
     }
 
     cfg["cache_file"].parent.mkdir(parents=True, exist_ok=True)

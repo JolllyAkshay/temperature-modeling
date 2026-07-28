@@ -103,7 +103,7 @@ from temperature_modeling.ensemble import get_ensemble_forecast
 
 FORECAST_CACHE_TTL_HOURS = 3
 
-_LOAD_FORECAST_CACHE_FILE   = _HERE / "api_cache" / "load_forecast_cache.json"
+_LOAD_FORECAST_CACHE_FILE   = _HERE / "api_cache" / "pjm_forecast_cache.json"
 _LOAD_TRAINING_DATA_PATH    = _HERE / "api_cache" / "pjm_load_training.json"
 _CAISO_FORECAST_CACHE_FILE  = _HERE / "api_cache" / "caiso_forecast_cache.json"
 _CAISO_TRAINING_DATA_PATH   = _HERE / "api_cache" / "caiso_load_training.json"
@@ -207,7 +207,10 @@ def _fetch_one(label, lat, lon, session, forecast_days=15):
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": lat, "longitude": lon,
-                "daily": "temperature_2m_max,temperature_2m_min,apparent_temperature_max",
+                "daily": ("temperature_2m_max,temperature_2m_min,"
+                          "apparent_temperature_max,"
+                          "dew_point_2m_max,"
+                          "wind_speed_10m_max"),
                 "forecast_days": forecast_days,
                 "temperature_unit": "fahrenheit",
                 "timezone": "auto",
@@ -216,9 +219,13 @@ def _fetch_one(label, lat, lon, session, forecast_days=15):
         )
         r.raise_for_status()
         d = r.json()["daily"]
-        return {"label": label, "dates": d["time"],
-                "hi": d["temperature_2m_max"], "lo": d["temperature_2m_min"],
-                "apparent_hi": d.get("apparent_temperature_max")}
+        return {
+            "label": label, "dates": d["time"],
+            "hi": d["temperature_2m_max"], "lo": d["temperature_2m_min"],
+            "apparent_hi":  d.get("apparent_temperature_max"),
+            "dewpoint_hi":  d.get("dew_point_2m_max"),   # °F (temperature_unit=fahrenheit)
+            "wind_kph":     d.get("wind_speed_10m_max"),  # km/h
+        }
     except requests.HTTPError as exc:
         log.warning("Open-Meteo HTTP error for %s: %s", label, exc)
     except requests.RequestException as exc:
@@ -368,6 +375,8 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
     hi_c:          dict = {}
     lo_c:          dict = {}
     apparent_hi_c: dict = {}
+    dewpoint_c:    dict = {}
+    wind_kph:      dict = {}
     forecast_dates_strs = None
 
     def _f_to_c(lst):
@@ -389,6 +398,10 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
             lo_c[label]  = loc_lo
             if res.get("apparent_hi"):
                 apparent_hi_c[label] = _f_to_c(res["apparent_hi"])
+            if res.get("dewpoint_hi"):
+                dewpoint_c[label] = _f_to_c(res["dewpoint_hi"])  # °F → °C
+            if res.get("wind_kph"):
+                wind_kph[label] = res["wind_kph"]
             if forecast_dates_strs is None:
                 forecast_dates_strs = res["dates"][:15]
 
@@ -463,11 +476,16 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
         locations=locations, weighted_avg_fn=weighted_avg_fn,
         forecast_apparent_hi_c=apparent_hi_c if apparent_hi_c else None,
+        forecast_dewpoint_c=dewpoint_c if dewpoint_c else None,
+        forecast_wind_kph=wind_kph if wind_kph else None,
     )
     load_data = [{"date": lf.valid_date.isoformat(),
                   "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
                   "low_load_gw":  round(lf.low_load_mw  / 1000, 2),
-                  "high_load_gw": round(lf.high_load_mw / 1000, 2)}
+                  "high_load_gw": round(lf.high_load_mw / 1000, 2),
+                  "avg_temp_f":   round(lf.avg_temp_f, 1) if lf.avg_temp_f else None,
+                  "hdd":          round(lf.hdd, 1),
+                  "cdd":          round(lf.cdd, 1)}
                  for lf in load_forecasts]
 
     # Official benchmark data
@@ -766,6 +784,34 @@ app.layout = html.Div(
                     ],
                 ),
 
+                # ── Model accuracy backtest ───────────────────────────────────
+                html.Div(
+                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                           "border": "1px solid #e2e8f0", "padding": "20px",
+                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+                           "marginBottom": "20px"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "alignItems": "center",
+                                   "gap": "10px", "marginBottom": "12px"},
+                            children=[
+                                html.Div("Model Accuracy — Backtest",
+                                         style={"fontSize": "13px", "fontWeight": 600,
+                                                "color": "#0f172a"}),
+                                html.Div(id="backtest-mape-badges",
+                                         style={"display": "flex", "gap": "6px"}),
+                            ],
+                        ),
+                        html.Div(
+                            "Actual vs model-predicted load on the held-out test set (last 20% of "
+                            "training data, shown in blue). Dotted line = model prediction.",
+                            style={"fontSize": "11px", "color": "#94a3b8", "marginBottom": "8px"},
+                        ),
+                        dcc.Graph(id="backtest-chart", style={"height": "260px"},
+                                  config={"displayModeBar": False}),
+                    ],
+                ),
+
                 # ── Capacity market panel ─────────────────────────────────────
                 html.Div(
                     id="capacity-market-panel",
@@ -919,6 +965,37 @@ app.layout = html.Div(
                                         "overflowY": "auto", "marginBottom": "12px",
                                         "padding": "8px 0",
                                         "borderBottom": "1px solid #f1f5f9"}),
+                        # Suggested question chips
+                        html.Div(
+                            style={"display": "flex", "gap": "6px", "flexWrap": "wrap",
+                                   "marginBottom": "10px"},
+                            children=[
+                                html.Button(
+                                    "What's driving the forecast peak?",
+                                    id="chip-q1", n_clicks=0,
+                                    style={"fontSize": "11px", "padding": "5px 10px",
+                                           "borderRadius": "14px", "border": "1px solid #cbd5e1",
+                                           "background": "#f8fafc", "color": "#475569",
+                                           "cursor": "pointer", "whiteSpace": "nowrap"},
+                                ),
+                                html.Button(
+                                    "How confident is this 15-day forecast?",
+                                    id="chip-q2", n_clicks=0,
+                                    style={"fontSize": "11px", "padding": "5px 10px",
+                                           "borderRadius": "14px", "border": "1px solid #cbd5e1",
+                                           "background": "#f8fafc", "color": "#475569",
+                                           "cursor": "pointer", "whiteSpace": "nowrap"},
+                                ),
+                                html.Button(
+                                    "How does our forecast compare to the ISO's day-ahead?",
+                                    id="chip-q3", n_clicks=0,
+                                    style={"fontSize": "11px", "padding": "5px 10px",
+                                           "borderRadius": "14px", "border": "1px solid #cbd5e1",
+                                           "background": "#f8fafc", "color": "#475569",
+                                           "cursor": "pointer", "whiteSpace": "nowrap"},
+                                ),
+                            ],
+                        ),
                         # Input row
                         html.Div(
                             style={"display": "flex", "gap": "8px", "alignItems": "flex-end"},
@@ -1252,7 +1329,7 @@ def render_price_chart(data, iso):
         paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
         font=dict(color="#334155", size=11),
         annotations=[dict(
-            text=f"Model RMSE: ${rmse:.1f}/MWh · EIA log-linear regression",
+            text=f"Model RMSE: ${rmse:.1f}/MWh · OLS regression (load + weekday + seasonal)",
             xref="paper", yref="paper", x=0, y=1.08, showarrow=False,
             font=dict(size=9, color="#94a3b8"), xanchor="left",
         )],
@@ -1267,6 +1344,99 @@ def render_price_chart(data, iso):
         height=220,
     )
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Backtest chart callback
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("backtest-chart", "figure"),
+    Output("backtest-mape-badges", "children"),
+    Input("load-forecast-store", "data"),
+)
+def render_backtest(data):
+    empty = _empty_fig("Backtest data unavailable for this ISO")
+    if not data:
+        return empty, []
+
+    bt = data.get("backtest", {})
+    if not bt or not bt.get("dates"):
+        return empty, []
+
+    all_dates     = bt["dates"]
+    all_actual    = bt["actual_gw"]
+    all_predicted = bt["predicted_gw"]
+    all_is_test   = bt["is_test"]
+    split_date    = bt.get("split_date", "")
+    mape_train    = bt.get("mape_train", 0)
+    mape_test     = bt.get("mape_test", 0)
+
+    # Show last 200 days for readability (enough to capture most of test period)
+    SHOW = 200
+    dates     = all_dates[-SHOW:]
+    actual    = all_actual[-SHOW:]
+    predicted = all_predicted[-SHOW:]
+    is_test   = all_is_test[-SHOW:]
+
+    train_dates   = [d for d, t in zip(dates, is_test) if not t]
+    train_actual  = [a for a, t in zip(actual,    is_test) if not t]
+    test_dates    = [d for d, t in zip(dates, is_test) if t]
+    test_actual   = [a for a, t in zip(actual,    is_test) if t]
+    test_pred     = [p for p, t in zip(predicted, is_test) if t]
+
+    fig = go.Figure()
+    if train_dates:
+        fig.add_trace(go.Scatter(
+            x=train_dates, y=train_actual,
+            name="Actual (train)", mode="lines",
+            line=dict(color="#cbd5e1", width=1),
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Actual: %{y:.2f} GW<extra>Train</extra>",
+        ))
+    if test_dates:
+        fig.add_trace(go.Scatter(
+            x=test_dates, y=test_actual,
+            name="Actual (test)", mode="lines",
+            line=dict(color="#1e293b", width=1.5),
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Actual: %{y:.2f} GW<extra>Test</extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=test_dates, y=test_pred,
+            name="Model prediction", mode="lines",
+            line=dict(color="#2563eb", width=1.5, dash="dot"),
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Predicted: %{y:.2f} GW<extra>Model</extra>",
+        ))
+
+    if split_date and split_date >= dates[0]:
+        fig.add_vline(x=split_date, line_dash="dash", line_color="#94a3b8", line_width=1,
+                      annotation_text="Train → Test", annotation_position="top right",
+                      annotation_font_size=9, annotation_font_color="#94a3b8")
+
+    fig.update_layout(
+        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+        font=dict(color="#334155", size=11),
+        legend=dict(orientation="h", y=1.1, x=0, font=dict(size=10),
+                    bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=60, r=20, t=30, b=50),
+        xaxis=dict(type="date", tickformat="%d %b '%y", gridcolor="#f8fafc",
+                   tickangle=-30, tickfont=dict(size=10), linecolor="#e2e8f0"),
+        yaxis=dict(gridcolor="#f1f5f9", tickformat=".1f", ticksuffix=" GW",
+                   linecolor="#e2e8f0"),
+        hovermode="x unified",
+        height=260,
+    )
+
+    def _badge(label, val, color):
+        return html.Span(
+            f"{label}: {val:.1f}%",
+            style={"fontSize": "11px", "background": color + "18", "color": color,
+                   "borderRadius": "4px", "padding": "2px 8px"},
+        )
+
+    badges = [
+        _badge("Train MAPE", mape_train, "#64748b"),
+        _badge("Test MAPE",  mape_test,  "#2563eb"),
+    ]
+    return fig, badges
 
 
 # ---------------------------------------------------------------------------
@@ -1421,22 +1591,34 @@ def run_ensemble(toggle_value, data, iso):
 # ---------------------------------------------------------------------------
 # Chat callbacks
 # ---------------------------------------------------------------------------
+_CHIP_QUESTIONS = {
+    "chip-q1": "What's driving the forecast peak?",
+    "chip-q2": "How confident is this 15-day forecast?",
+    "chip-q3": "How does our forecast compare to the ISO's day-ahead forecast?",
+}
+
 @app.callback(
     Output("chat-history-store", "data"),
     Output("chat-input", "value"),
     Input("chat-submit", "n_clicks"),
     Input("chat-clear", "n_clicks"),
+    Input("chip-q1", "n_clicks"),
+    Input("chip-q2", "n_clicks"),
+    Input("chip-q3", "n_clicks"),
     dash.dependencies.State("chat-input", "value"),
     dash.dependencies.State("chat-history-store", "data"),
     dash.dependencies.State("load-forecast-store", "data"),
     dash.dependencies.State("iso-selector", "value"),
     prevent_initial_call=True,
 )
-def handle_chat(submit_clicks, clear_clicks, user_input, history, forecast_data, iso):
-    del submit_clicks, clear_clicks  # trigger-only; ctx.triggered_id used instead
+def handle_chat(submit_clicks, clear_clicks, _c1, _c2, _c3,
+                user_input, history, forecast_data, iso):
     from dash import ctx
-    if ctx.triggered_id == "chat-clear":
+    triggered = ctx.triggered_id
+    if triggered == "chat-clear":
         return [], ""
+    if triggered in _CHIP_QUESTIONS:
+        user_input = _CHIP_QUESTIONS[triggered]
     if not user_input or not user_input.strip():
         return history or [], ""
 

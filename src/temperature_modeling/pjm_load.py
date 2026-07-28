@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 HDD_CDD_BASE_F: float = 65.0   # standard base temperature for HDD/CDD calculation
 UNCERTAINTY_Z:  float = 1.645  # z-score for 90% confidence interval (5th/95th pct)
-N_FEATURES:     int   = 29     # total feature vector length expected by the model
+N_FEATURES:     int   = 31     # total feature vector length expected by the model
 
 try:
     import holidays as _holidays_lib
@@ -121,7 +121,18 @@ def fetch_pjm_load_daily(
         except (ValueError, TypeError):
             continue
 
-    return {d: sum(vals) / len(vals) for d, vals in daily.items() if vals}
+    result: Dict[date, float] = {}
+    for d, vals in daily.items():
+        if not vals:
+            continue
+        # Robust aggregation: filter EIA data glitches (e.g., 171M MW on 2021-10-19)
+        # before averaging. Use median as a reference; discard any hour > 10× median.
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        median = vals_sorted[n // 2] if n % 2 else (vals_sorted[n//2-1] + vals_sorted[n//2]) / 2
+        clean = [v for v in vals if v <= median * 10]
+        result[d] = sum(clean) / len(clean) if clean else median
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -133,31 +144,41 @@ def fetch_era5_daily_hi_lo(
     start: date,
     end: date,
     session: requests.Session,
-) -> Dict[date, Tuple[float, float, Optional[float]]]:
+) -> Dict[date, Tuple]:
     """
-    Fetch daily max/min 2m temperature and max apparent temperature from ERA5.
-    Returns {date: (max_c, min_c, apparent_max_c)}.
-    apparent_max_c may be None if the archive does not return it for that date.
+    Fetch daily max/min 2m temperature, apparent temperature, dewpoint, and wind from ERA5.
+    Returns {date: (max_c, min_c, apparent_max_c, dewpoint_max_c, wind_speed_ms)}.
+    Values at index ≥ 2 may be None if the archive does not return them.
     """
     params = {
         "latitude":   coords.lat,
         "longitude":  coords.lon,
-        "daily":      "temperature_2m_max,temperature_2m_min,apparent_temperature_max",
+        "daily":      ("temperature_2m_max,temperature_2m_min,"
+                       "apparent_temperature_max,"
+                       "dew_point_2m_max,"
+                       "wind_speed_10m_max"),
         "start_date": start.isoformat(),
         "end_date":   end.isoformat(),
         "timezone":   "UTC",
     }
     data = get_json(ERA5_ARCHIVE_URL, params, session, label="ERA5 daily hi/lo")
     daily = data.get("daily", {})
-    dates    = daily.get("time", [])
-    maxes    = daily.get("temperature_2m_max", [])
-    mins     = daily.get("temperature_2m_min", [])
-    app_maxs = daily.get("apparent_temperature_max", [None] * len(dates))
+    dates   = daily.get("time", [])
+    maxes   = daily.get("temperature_2m_max", [])
+    mins    = daily.get("temperature_2m_min", [])
+    app_mx  = daily.get("apparent_temperature_max", [None] * len(dates))
+    dew_mx  = daily.get("dew_point_2m_max",         [None] * len(dates))
+    wind_mx = daily.get("wind_speed_10m_max",        [None] * len(dates))
     result = {}
-    for d_str, mx, mn, ap in zip(dates, maxes, mins, app_maxs):
+    for d_str, mx, mn, ap, dw, ws in zip(dates, maxes, mins, app_mx, dew_mx, wind_mx):
         if mx is not None and mn is not None:
-            result[date.fromisoformat(d_str)] = (float(mx), float(mn),
-                                                  float(ap) if ap is not None else None)
+            result[date.fromisoformat(d_str)] = (
+                float(mx),
+                float(mn),
+                float(ap) if ap is not None else None,
+                float(dw) if dw is not None else None,   # dewpoint max (°C)
+                float(ws) if ws is not None else None,   # wind speed max (km/h)
+            )
     return result
 
 
@@ -308,10 +329,12 @@ def build_load_training_data(
     Includes hi/lo split, holidays, day-of-week, and T-1/T-2 lag features.
     """
     sorted_dates = sorted(load_daily.keys())
-    avg_f_by_date:      Dict[date, float] = {}
-    hi_f_by_date:       Dict[date, float] = {}
-    lo_f_by_date:       Dict[date, float] = {}
+    avg_f_by_date:       Dict[date, float] = {}
+    hi_f_by_date:        Dict[date, float] = {}
+    lo_f_by_date:        Dict[date, float] = {}
     apparent_hi_by_date: Dict[date, float] = {}
+    dewpoint_hi_by_date: Dict[date, float] = {}
+    wind_speed_by_date:  Dict[date, float] = {}
 
     for d in sorted_dates:
         # Weighted avg
@@ -324,10 +347,12 @@ def build_load_training_data(
             continue
         avg_f_by_date[d] = weighted_avg_temp_f(avg_c)
 
-        # Weighted hi / lo / apparent_hi
+        # Weighted hi / lo / apparent_hi / dewpoint / wind
         hi_c = {}
         lo_c = {}
         ap_c = {}
+        dew_c: Dict[str, float] = {}
+        wind_kph: Dict[str, float] = {}
         for loc in PJM_LOAD_LOCATIONS:
             label = loc["label"]
             pair  = era5_hi_by_label.get(label, {}).get(d)
@@ -336,12 +361,23 @@ def build_load_training_data(
                 lo_c[label] = pair[1]
                 if len(pair) > 2 and pair[2] is not None:
                     ap_c[label] = pair[2]
+                if len(pair) > 3 and pair[3] is not None:
+                    dew_c[label] = pair[3]
+                if len(pair) > 4 and pair[4] is not None:
+                    wind_kph[label] = pair[4]
         if hi_c:
             hi_f_by_date[d] = weighted_avg_temp_f(hi_c)
         if lo_c:
             lo_f_by_date[d] = weighted_avg_temp_f(lo_c)
         if ap_c:
             apparent_hi_by_date[d] = weighted_avg_temp_f(ap_c)
+        if dew_c:
+            dewpoint_hi_by_date[d] = weighted_avg_temp_f(dew_c)  # °C → °F via weighted_avg_temp_f
+        if wind_kph:
+            total_w = sum(loc["weight"] for loc in PJM_LOAD_LOCATIONS if loc["label"] in wind_kph)
+            avg_kph = sum(loc["weight"] * wind_kph[loc["label"]]
+                          for loc in PJM_LOAD_LOCATIONS if loc["label"] in wind_kph) / total_w
+            wind_speed_by_date[d] = avg_kph * 0.621371  # km/h → mph
 
     obs = []
     dates_with_avg = sorted(avg_f_by_date.keys())
@@ -377,7 +413,9 @@ def build_load_training_data(
             temp_lag2_f=lag2_f,
             temp_lag7_f=lag7_f,
             rolling7_avg_f=rolling7_f,
-            apparent_hi_f=_c_to_f(apparent_hi_by_date[d]) if d in apparent_hi_by_date else None,
+            apparent_hi_f=apparent_hi_by_date.get(d),           # already °F (via weighted_avg_temp_f)
+            dewpoint_hi_f=dewpoint_hi_by_date.get(d),        # already °F (via weighted_avg_temp_f)
+            wind_speed_mph=wind_speed_by_date.get(d),
         ))
     return obs
 
@@ -387,15 +425,17 @@ def build_load_training_data(
 # ---------------------------------------------------------------------------
 
 def _build_features(
-    avg_f:        float,
-    hi_f:         float,
-    lo_f:         float,
-    d:            date,
-    lag1_f:       Optional[float],
-    lag2_f:       Optional[float],
-    lag7_f:       Optional[float] = None,
-    rolling7_f:   Optional[float] = None,
-    apparent_hi_f: Optional[float] = None,  # daily max apparent temp (heat index) °F
+    avg_f:         float,
+    hi_f:          float,
+    lo_f:          float,
+    d:             date,
+    lag1_f:        Optional[float],
+    lag2_f:        Optional[float],
+    lag7_f:        Optional[float] = None,
+    rolling7_f:    Optional[float] = None,
+    apparent_hi_f: Optional[float] = None,   # daily max apparent temp (heat index) °F
+    dewpoint_hi_f: Optional[float] = None,   # daily max dewpoint temperature (°F)
+    wind_speed_mph: Optional[float] = None,  # daily max 10m wind speed (mph)
 ) -> Tuple[list, float, float]:
     hdd, cdd       = compute_hdd_cdd(avg_f)
     hdd_hi, cdd_hi = compute_hdd_cdd(hi_f)
@@ -413,9 +453,14 @@ def _build_features(
     hdd_lag7, cdd_lag7 = compute_hdd_cdd(lag7)
 
     # Humidity features: how much apparent temp deviates from dry-bulb hi
-    app_hi   = apparent_hi_f if apparent_hi_f is not None else hi_f
-    humid_amp = app_hi - hi_f          # signed: >0 = heat index amplification, <0 = wind chill
-    humid_cdd = max(0.0, humid_amp)    # positive-only: summer AC load amplification
+    app_hi    = apparent_hi_f if apparent_hi_f is not None else hi_f
+    humid_amp = app_hi - hi_f        # signed: >0 = heat index amplification, <0 = wind chill
+    humid_cdd = max(0.0, humid_amp)  # positive-only: summer AC load amplification
+
+    # Dewpoint depression: dry-bulb high minus dewpoint high (larger = drier air)
+    dew_depression = (hi_f - dewpoint_hi_f) if dewpoint_hi_f is not None else 0.0
+
+    wind_mph = wind_speed_mph if wind_speed_mph is not None else 0.0
 
     features = [
         hdd, cdd, hdd * cdd,                      # avg-based HDD/CDD + interaction (3)
@@ -433,8 +478,10 @@ def _build_features(
         roll7,                                     # 7-day rolling avg temp (1)
         humid_amp,                                 # heat index vs dry-bulb (1)
         humid_cdd,                                 # positive humidity amplification (1)
+        dew_depression,                            # dewpoint depression (°F) (1)
+        wind_mph,                                  # max wind speed (mph) (1)
     ]
-    return features, hdd, cdd  # 29 features total
+    return features, hdd, cdd  # 31 features total
 
 
 def _obs_to_features(o: LoadObservation) -> list:
@@ -448,6 +495,8 @@ def _obs_to_features(o: LoadObservation) -> list:
         lag7_f=o.temp_lag7_f,
         rolling7_f=o.rolling7_avg_f,
         apparent_hi_f=o.apparent_hi_f,
+        dewpoint_hi_f=o.dewpoint_hi_f,
+        wind_speed_mph=o.wind_speed_mph,
     )
     return feats
 
@@ -498,6 +547,8 @@ class LoadCorrectionModel:
         locations=None,                                  # ISO location list; defaults to PJM
         weighted_avg_fn=None,                            # ISO weighted-avg fn; defaults to PJM's
         forecast_apparent_hi_c: Dict[str, List[float]] = None,  # apparent_temp_max °C per location
+        forecast_dewpoint_c:    Dict[str, List[float]] = None,  # dew_point_2m_max °C per location
+        forecast_wind_kph:      Dict[str, List[float]] = None,  # wind_speed_10m_max km/h per location
     ) -> List[LoadForecast]:
         """
         Produce a LoadForecast for each date, propagating temperature
@@ -567,13 +618,38 @@ class LoadCorrectionModel:
                 }
             app_hi_f = _wt_avg(app_hi_c_vals) if app_hi_c_vals else None
 
+            # Dewpoint (°C → °F via _wt_avg which applies _c_to_f)
+            dew_c_vals = {}
+            if forecast_dewpoint_c:
+                dew_c_vals = {
+                    loc["label"]: (forecast_dewpoint_c.get(loc["label"]) or [None]*20)[i]
+                    for loc in _locs
+                    if (forecast_dewpoint_c.get(loc["label"]) or [None]*20)[i] is not None
+                }
+            dew_hi_f = _wt_avg(dew_c_vals) if dew_c_vals else None
+
+            # Wind speed (km/h → mph)
+            wind_f: Optional[float] = None
+            if forecast_wind_kph:
+                wkph_vals = {
+                    loc["label"]: (forecast_wind_kph.get(loc["label"]) or [None]*20)[i]
+                    for loc in _locs
+                    if (forecast_wind_kph.get(loc["label"]) or [None]*20)[i] is not None
+                }
+                if wkph_vals:
+                    tw = sum(loc["weight"] for loc in _locs if loc["label"] in wkph_vals)
+                    wind_f = (sum(loc["weight"] * wkph_vals[loc["label"]]
+                                  for loc in _locs if loc["label"] in wkph_vals) / tw) * 0.621371
+
             lag1  = _lag(i, 1)
             lag2  = _lag(i, 2)
             lag7  = _lag(i, 7)
             roll7 = _rolling7(i)
 
             feats, hdd, cdd = _build_features(avg_f, hi_f, lo_f, d, lag1, lag2, lag7, roll7,
-                                               apparent_hi_f=app_hi_f)
+                                               apparent_hi_f=app_hi_f,
+                                               dewpoint_hi_f=dew_hi_f,
+                                               wind_speed_mph=wind_f)
             mean_load = self.predict([feats])[0]
 
             # Uncertainty from GEFS spread
@@ -589,10 +665,12 @@ class LoadCorrectionModel:
             z = UNCERTAINTY_Z
             low_feats,  _, _ = _build_features(avg_f - z * spread_f, hi_f - z * spread_f,
                                                 lo_f - z * spread_f, d, lag1, lag2, lag7, roll7,
-                                                apparent_hi_f=app_hi_f)
+                                                apparent_hi_f=app_hi_f,
+                                                dewpoint_hi_f=dew_hi_f, wind_speed_mph=wind_f)
             high_feats, _, _ = _build_features(avg_f + z * spread_f, hi_f + z * spread_f,
                                                 lo_f + z * spread_f, d, lag1, lag2, lag7, roll7,
-                                                apparent_hi_f=app_hi_f)
+                                                apparent_hi_f=app_hi_f,
+                                                dewpoint_hi_f=dew_hi_f, wind_speed_mph=wind_f)
             p_low  = self.predict([low_feats])[0]
             p_high = self.predict([high_feats])[0]
 
@@ -667,6 +745,8 @@ def run_load_backtest(
                 temp_lag7_f=r.get("temp_lag7_f"),
                 rolling7_avg_f=r.get("rolling7_avg_f"),
                 apparent_hi_f=r.get("apparent_hi_f"),
+                dewpoint_hi_f=r.get("dewpoint_hi_f"),
+                wind_speed_mph=r.get("wind_speed_mph"),
             ))
         except (KeyError, ValueError):
             continue
