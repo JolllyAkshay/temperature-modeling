@@ -14,6 +14,7 @@ import math
 import os
 import pickle
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -157,6 +158,74 @@ def fetch_era5_daily_hi_lo(
         if mx is not None and mn is not None:
             result[date.fromisoformat(d_str)] = (float(mx), float(mn),
                                                   float(ap) if ap is not None else None)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GEFS ensemble spread
+# ---------------------------------------------------------------------------
+
+_GEFS_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+
+
+def fetch_gefs_spread(
+    locations: List[Dict],
+    session: requests.Session,
+    forecast_days: int = 15,
+) -> Dict[str, List[Optional[float]]]:
+    """
+    Fetch GEFS ensemble temperature spread (σ in °C) per location per day.
+
+    Calls Open-Meteo's free ensemble API (gfs_seamless, 30 perturbed members)
+    and returns the per-day standard deviation across members for each location.
+    Used as gefs_spread_c in predict_with_uncertainty to produce statistically
+    grounded 90 % confidence bands instead of the hardcoded 3 °F fallback.
+
+    Returns {label: [σ_day0, σ_day1, ...]}.  Values may be None on API error.
+    """
+    def _fetch_loc(loc: Dict):
+        try:
+            r = session.get(
+                _GEFS_ENSEMBLE_URL,
+                params={
+                    "latitude":    loc["lat"],
+                    "longitude":   loc["lon"],
+                    "models":      "gfs_seamless",
+                    "daily":       "temperature_2m_max",
+                    "forecast_days": forecast_days,
+                    "timezone":    "auto",
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            daily = r.json().get("daily", {})
+            member_arrays = [v for k, v in daily.items()
+                             if k.startswith("temperature_2m_max_member")]
+            if not member_arrays:
+                return loc["label"], None
+            n_days = len(member_arrays[0])
+            spreads: List[Optional[float]] = []
+            for i in range(n_days):
+                vals = [arr[i] for arr in member_arrays
+                        if i < len(arr) and arr[i] is not None]
+                if len(vals) < 2:
+                    spreads.append(None)
+                    continue
+                mean = sum(vals) / len(vals)
+                var  = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+                spreads.append(math.sqrt(var))
+            return loc["label"], spreads
+        except Exception as exc:
+            log.warning("GEFS spread fetch failed for %s: %s", loc.get("label"), exc)
+            return loc["label"], None
+
+    result: Dict[str, List[Optional[float]]] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(_fetch_loc, loc): loc for loc in locations}
+        for fut in as_completed(futs):
+            label, spreads = fut.result()
+            if spreads is not None:
+                result[label] = spreads
     return result
 
 

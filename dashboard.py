@@ -57,6 +57,7 @@ from temperature_modeling.pjm import PJM_LOAD_LOCATIONS
 from temperature_modeling.pjm_load import (
     LoadCorrectionModel, load_load_model,
     fetch_pjm_official_comparison, fetch_pjm_dataminer_7day, run_load_backtest,
+    fetch_gefs_spread,
 )
 from temperature_modeling.caiso import CAISO_LOAD_LOCATIONS
 from temperature_modeling.caiso_load import (
@@ -394,6 +395,15 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
 
     forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
 
+    # GEFS ensemble spread — real 30-member σ for uncertainty bands
+    gefs_spread_c: dict = {}
+    try:
+        gefs_spread_c = fetch_gefs_spread(locations, session, forecast_days=len(forecast_dates_list))
+        log.info("%s: GEFS spread fetched for %d/%d locations",
+                 iso.upper(), len(gefs_spread_c), len(locations))
+    except Exception:
+        log.exception("%s: GEFS spread fetch failed — using fallback 3°F spread", iso.upper())
+
     # ERA5 hindcast (last 16 days)
     era5_session = requests.Session()
     era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
@@ -446,7 +456,7 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
     # 15-day GFS forecast with uncertainty
     load_forecasts = model.predict_with_uncertainty(
         forecast_temps_c=avg_c, forecast_hi_c=hi_c, forecast_lo_c=lo_c,
-        gefs_spread_c={}, forecast_dates=forecast_dates_list,
+        gefs_spread_c=gefs_spread_c, forecast_dates=forecast_dates_list,
         recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
         locations=locations, weighted_avg_fn=weighted_avg_fn,
         forecast_apparent_hi_c=apparent_hi_c if apparent_hi_c else None,

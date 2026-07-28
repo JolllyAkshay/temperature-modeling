@@ -30,6 +30,7 @@ from temperature_modeling.pjm_load import (
     _build_features,
     load_load_model,
     fetch_era5_daily_hi_lo,
+    fetch_gefs_spread,
 )
 from temperature_modeling.net_load import fetch_net_load_forecast
 from temperature_modeling.price_forecast import forecast_prices
@@ -136,6 +137,15 @@ def generate_cache(iso, cfg):
     forecast_dates_list = [date.fromisoformat(d) for d in forecast_dates_strs]
     log.info("%s: GFS done — %d dates", iso.upper(), len(forecast_dates_list))
 
+    # GEFS ensemble spread
+    gefs_spread_c: dict = {}
+    try:
+        gefs_spread_c = fetch_gefs_spread(locations, session, forecast_days=len(forecast_dates_list))
+        log.info("%s: GEFS spread fetched for %d/%d locations",
+                 iso.upper(), len(gefs_spread_c), len(locations))
+    except Exception:
+        log.exception("%s: GEFS spread fetch failed — using fallback 3°F spread", iso.upper())
+
     # ERA5 hindcast
     era5_session = requests.Session()
     era5_session.headers["User-Agent"] = "precache-forecasts/1.0"
@@ -192,7 +202,7 @@ def generate_cache(iso, cfg):
     log.info("%s: running predict_with_uncertainty ...", iso.upper())
     load_forecasts = model.predict_with_uncertainty(
         forecast_temps_c=avg_c, forecast_hi_c=hi_c, forecast_lo_c=lo_c,
-        gefs_spread_c={}, forecast_dates=forecast_dates_list,
+        gefs_spread_c=gefs_spread_c, forecast_dates=forecast_dates_list,
         recent_avg_temps_f=recent_avg_f if len(recent_avg_f) >= 2 else None,
         locations=locations, weighted_avg_fn=weighted_avg_fn,
         forecast_apparent_hi_c=apparent_hi_c if apparent_hi_c else None,
