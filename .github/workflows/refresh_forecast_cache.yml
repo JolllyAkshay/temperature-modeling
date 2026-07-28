@@ -51,6 +51,8 @@ jobs:
           EOF
 
       - name: Generate forecast caches
+        env:
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: python precache_forecasts.py
 
       - name: Upload fresh caches to HuggingFace Space
