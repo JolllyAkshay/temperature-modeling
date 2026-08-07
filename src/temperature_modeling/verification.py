@@ -35,6 +35,9 @@ _ISO_EIA_REGION = {
     "caiso": "CAL",
     "ercot": "TEX",
     "miso":  "MISO",
+    "nyiso": "NY",
+    "isone": "NE",
+    "spp":   "SW",
 }
 
 

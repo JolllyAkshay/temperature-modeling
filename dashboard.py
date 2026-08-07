@@ -94,12 +94,14 @@ from temperature_modeling.spp_load import (
 )
 from temperature_modeling import _llm
 from temperature_modeling.ai_brief import generate_forecast_brief, generate_chat_response
-from temperature_modeling.datacenter_agent import load_datacenter_projects
 from temperature_modeling.verification import record_forecast, load_verification_stats
 from temperature_modeling.net_load import fetch_net_load_forecast
-from temperature_modeling.price_forecast import forecast_prices
+from temperature_modeling.price_forecast import forecast_prices, price_unavailable_reason
 from temperature_modeling.capacity_market import get_capacity_market_data, get_reserve_margin_color
 from temperature_modeling.ensemble import get_ensemble_forecast
+from temperature_modeling.carbon_intensity import fetch_carbon_intensity
+from temperature_modeling.demand_response import compute_dr_windows
+from temperature_modeling.theta_ensemble import predict_theta, blend_with_xgboost
 
 FORECAST_CACHE_TTL_HOURS = 3
 
@@ -185,17 +187,6 @@ except FileNotFoundError:
 except Exception:
     log.exception("Failed to load SPP model")
 
-
-# ---------------------------------------------------------------------------
-# Datacenter projects — loaded from agent-maintained cache (falls back to baseline)
-# ---------------------------------------------------------------------------
-_DC_PROJECTS = load_datacenter_projects()
-
-_STATUS_COLOR = {
-    "Operating": "#22c55e", "Operating / Expanding": "#22c55e",
-    "Under Construction": "#f97316", "Approved": "#2563eb",
-    "Announced": "#94a3b8",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +411,25 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
     except Exception:
         log.exception("%s: GEFS spread fetch failed — using fallback 3°F spread", iso.upper())
 
+    # ── Comparison data (EIA actuals) — fetched early to supply load autocorrelation lags ──
+    comparison: dict = {"actual": {}, "da_fcst": {}}
+    try:
+        comparison = cfg["comparison_fn"](session)
+    except Exception:
+        log.exception("%s: official comparison fetch failed — chart will show no actuals", iso.upper())
+
+    # Extract last 7 actual daily loads (MW) for load autocorrelation lag features
+    recent_actual_loads_mw = None
+    try:
+        actual_gw = comparison.get("actual", {})
+        if actual_gw:
+            sorted_act_dates = sorted(actual_gw.keys())[-7:]
+            loads_mw = [actual_gw[d] * 1000 for d in sorted_act_dates]
+            if loads_mw:
+                recent_actual_loads_mw = loads_mw
+    except Exception:
+        pass
+
     # ERA5 hindcast (last 16 days)
     era5_session = requests.Session()
     era5_session.headers["User-Agent"] = "load-forecast-dashboard/1.0"
@@ -457,14 +467,31 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
                          if d2 in era5_avg_hist.get(loc["label"], {})}
                 if c_map:
                     avg_f_hist[d2] = weighted_avg_fn(c_map)
-            for d2, avg_f in avg_f_hist.items():
+            # Build load lookup from EIA actuals for hindcast lag features
+            load_actual_mw_by_date = {
+                date.fromisoformat(ds): gw * 1000
+                for ds, gw in comparison.get("actual", {}).items()
+            }
+            hindcast_load_mw: dict = {}  # rolling predictions for forward-lag propagation
+            for d2, avg_f in sorted(avg_f_hist.items()):
                 lag1  = avg_f_hist.get(d2 - timedelta(days=1))
                 lag2  = avg_f_hist.get(d2 - timedelta(days=2))
                 lag7  = avg_f_hist.get(d2 - timedelta(days=7))
                 rv    = [avg_f_hist.get(d2 - timedelta(days=k)) for k in range(7)]
                 roll7 = sum(v for v in rv if v) / max(sum(1 for v in rv if v), 1)
-                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7)
-                hindcast[d2.isoformat()] = round(model.predict([feats])[0] / 1000, 2)
+                # Load lags: prefer EIA actuals, fall back to prior hindcast predictions
+                def _hl(dt):
+                    return load_actual_mw_by_date.get(dt) or hindcast_load_mw.get(dt)
+                ll1  = _hl(d2 - timedelta(days=1))
+                ll7  = _hl(d2 - timedelta(days=7))
+                llv  = [_hl(d2 - timedelta(days=k)) for k in range(1, 8)]
+                llv  = [v for v in llv if v is not None]
+                ll_r = sum(llv) / len(llv) if llv else None
+                feats, _, _ = _bf(avg_f, avg_f + 5, avg_f - 5, d2, lag1, lag2, lag7, roll7,
+                                   load_lag1_mw=ll1, load_lag7_mw=ll7, rolling7_load_mw=ll_r)
+                pred_mw = model.predict([feats])[0]
+                hindcast_load_mw[d2] = pred_mw
+                hindcast[d2.isoformat()] = round(pred_mw / 1000, 2)
         except Exception:
             log.exception("%s: hindcast computation failed", iso.upper())
             hindcast = {}
@@ -478,6 +505,7 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         forecast_apparent_hi_c=apparent_hi_c if apparent_hi_c else None,
         forecast_dewpoint_c=dewpoint_c if dewpoint_c else None,
         forecast_wind_kph=wind_kph if wind_kph else None,
+        recent_actual_loads_mw=recent_actual_loads_mw,
     )
     load_data = [{"date": lf.valid_date.isoformat(),
                   "mean_load_gw": round(lf.mean_load_mw / 1000, 2),
@@ -487,13 +515,6 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
                   "hdd":          round(lf.hdd, 1),
                   "cdd":          round(lf.cdd, 1)}
                  for lf in load_forecasts]
-
-    # Official benchmark data
-    comparison: dict = {"actual": {}, "da_fcst": {}}
-    try:
-        comparison = cfg["comparison_fn"](session)
-    except Exception:
-        log.exception("%s: official comparison fetch failed — chart will show no actuals", iso.upper())
 
     bench_data: dict = {}
     try:
@@ -506,6 +527,17 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         backtest = run_load_backtest(model, str(cfg["training_path"]))
     except Exception:
         log.exception("%s: backtest computation failed", iso.upper())
+
+    # ── AutoTheta ensemble blend (75% XGBoost + 25% Theta) ──────────────────
+    try:
+        hist_mw = [gw * 1000 for gw in backtest.get("actual_gw", [])]
+        if len(hist_mw) >= 60:
+            theta_fcst = predict_theta(iso, hist_mw, horizon=len(load_data))
+            if theta_fcst:
+                load_data = blend_with_xgboost(load_data, theta_fcst)
+                log.info("%s: AutoTheta blend applied", iso.upper())
+    except Exception:
+        log.exception("%s: AutoTheta blend failed — using XGBoost-only forecast", iso.upper())
 
     result = {
         "load":            load_data,
@@ -529,6 +561,7 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         "Day / Calendar":    [9, 10, 11, 12, 13, 14, 15, 16, 21, 22],
         "Recent temps":      [17, 18, 19, 20, 23, 24, 25, 26],
         "Humidity & Wind":   [27, 28, 29, 30],
+        "Load momentum":     [31, 32, 33],
     }
     try:
         d0 = forecast_dates_list[0]
@@ -552,8 +585,15 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         lag7_f  = recent_avg_f[-7] if len(recent_avg_f) >= 7 else avg_f0
         rv      = [recent_avg_f[-k] for k in range(1, 8) if k <= len(recent_avg_f)]
         roll7_f = sum(rv) / len(rv) if rv else avg_f0
+        # Load lags for SHAP day-0
+        ll1_shap = recent_actual_loads_mw[-1] if recent_actual_loads_mw else None
+        ll7_shap = recent_actual_loads_mw[-7] if recent_actual_loads_mw and len(recent_actual_loads_mw) >= 7 else None
+        ll_r7_shap = (sum(recent_actual_loads_mw[-7:]) / min(7, len(recent_actual_loads_mw))
+                      if recent_actual_loads_mw else None)
         feats_d0, _, _ = _bf(avg_f0, hi_f0, lo_f0, d0, lag1_f, lag2_f, lag7_f, roll7_f,
-                              apparent_hi_f=app_f0, dewpoint_hi_f=dew_f0, wind_speed_mph=wind_mph0)
+                              apparent_hi_f=app_f0, dewpoint_hi_f=dew_f0, wind_speed_mph=wind_mph0,
+                              load_lag1_mw=ll1_shap, load_lag7_mw=ll7_shap,
+                              rolling7_load_mw=ll_r7_shap)
         contribs = model.explain_prediction(feats_d0)
         if contribs:
             result["shap"] = {
@@ -563,6 +603,45 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
             }
     except Exception:
         log.exception("%s: SHAP computation failed — skipping explainability panel", iso.upper())
+
+    # ── Carbon + demand-response windows ─────────────────────────────────────
+    try:
+        daily_gw   = {d["date"]: d["mean_load_gw"] for d in load_data[:2]}
+        current_ci = fetch_carbon_intensity(iso, session)
+        if current_ci:
+            result["carbon"] = current_ci
+        dr = compute_dr_windows(iso, daily_gw, current_ci, session)
+        if dr:
+            result["demand_response"] = dr
+    except Exception:
+        log.exception("%s: carbon / DR computation failed", iso.upper())
+
+    # ── Demand percentile (uses backtest actual history) ──────────────────────
+    try:
+        today_gw = load_data[0]["mean_load_gw"] if load_data else None
+        if today_gw and backtest.get("dates"):
+            bt_dates   = backtest["dates"]
+            bt_actuals = backtest.get("actual_gw", [])
+            today_month = date.today().month
+            same_month  = [(d, gw) for d, gw in zip(bt_dates, bt_actuals)
+                           if int(d[5:7]) == today_month]
+            if len(same_month) >= 15:
+                vals = [gw for _, gw in same_month]
+                pct  = round(sum(1 for v in vals if v <= today_gw) / len(vals) * 100)
+                m_avg = round(sum(vals) / len(vals), 1)
+                m_max = max(vals)
+                # Last date in history when load exceeded today's forecast
+                higher = [(d, gw) for d, gw in same_month if gw > today_gw]
+                last_higher = higher[-1][0] if higher else None
+                result["percentile"] = {
+                    "percentile":      pct,
+                    "month_avg_gw":    m_avg,
+                    "month_max_gw":    round(m_max, 1),
+                    "last_higher_date": last_higher,
+                    "n_days":          len(same_month),
+                }
+    except Exception:
+        log.exception("%s: percentile computation failed", iso.upper())
 
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -657,25 +736,6 @@ _TAB_SEL   = {"padding": "10px 22px", "fontSize": "13px", "fontWeight": 600,
               "color": "#0f172a", "backgroundColor": "#ffffff",
               "borderTop": "2px solid #2563eb"}
 
-METHODOLOGY_NOTE = """
-**Methodology** — Separate machine learning models are trained for each ISO (PJM, CAISO, ERCOT, MISO) on 2 years of \
-hourly EIA demand data aggregated to daily averages, paired with ERA5 reanalysis temperatures. Temperature inputs are \
-population-weighted across 12 representative monitoring locations per ISO footprint. Features include \
-heating/cooling degree-days (HDD/CDD) from daily average, high, and low temperatures; day-of-week encoding; \
-US federal holiday and holiday-week flags; bridge-day indicators; T−1, T−2, and T−7 temperature lags; and a 7-day \
-rolling average temperature to capture heat-wave persistence and population acclimatisation (27 features total). \
-Forward forecasts use GFS NWP output via Open-Meteo (15-day horizon). Historical hindcast uses ERA5 reanalysis. \
-**ISO coverage:** PJM (Eastern US, ~65 GW peak) — 12 locations from Chicago to Washington DC; \
-CAISO (California, ~45 GW peak) — 12 locations from San Diego to Sacramento; \
-ERCOT (Texas, ~80 GW peak) — 12 locations from Houston to Amarillo; \
-MISO (Midcontinent, ~120 GW peak) — 12 locations from New Orleans to Fargo. \
-**Benchmarks:** PJM uses PJM DataMiner official 7-day forecast; CAISO uses CAISO OASIS 7-day system forecast; \
-ERCOT uses ERCOT public reports API when available, otherwise EIA day-ahead; MISO uses EIA day-ahead demand forecast. \
-**Accuracy note:** The hindcast MAPE shown (~0.4–0.5%) is measured under ERA5 observed temperatures on the \
-held-out 20% test set — it reflects model fit given known weather, not live forecast skill. \
-Forward forecast error, driven by GFS temperature uncertainty, is higher and consistent with industry norms of \
-1–3% day-ahead and 3–5% week-ahead for temperature-driven load models.
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +743,7 @@ Forward forecast error, driven by GFS temperature uncertainty, is higher and con
 # ---------------------------------------------------------------------------
 app = dash.Dash(
     __name__,
-    title="Grid Load Forecast — PJM & CAISO",
+    title="Grid Load Forecast — US Power Grid",
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
     suppress_callback_exceptions=True,
 )
@@ -748,6 +808,9 @@ app.layout = html.Div(
                         ),
                     ],
                 ),
+
+                # Extreme event alert (hidden when not needed)
+                html.Div(id="extreme-alert", style={"marginBottom": "12px"}),
 
                 # Summary cards
                 html.Div(id="load-cards",
@@ -830,6 +893,68 @@ app.layout = html.Div(
                     ],
                 ),
 
+                # ── Carbon intensity ──────────────────────────────────────────
+                html.Div(
+                    id="carbon-panel",
+                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                           "border": "1px solid #e2e8f0", "padding": "20px",
+                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+                           "marginBottom": "20px"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between",
+                                   "alignItems": "center", "marginBottom": "4px"},
+                            children=[
+                                html.Div("Grid Carbon Intensity",
+                                         style={"fontSize": "13px", "fontWeight": 600,
+                                                "color": "#0f172a"}),
+                                html.Span("EIA v2 fuel-type · ~12-24h lag",
+                                          style={"fontSize": "10px", "color": "#94a3b8",
+                                                 "background": "#f1f5f9",
+                                                 "borderRadius": "4px",
+                                                 "padding": "2px 7px"}),
+                            ],
+                        ),
+                        html.Div(id="carbon-intensity-number",
+                                 style={"marginBottom": "10px"}),
+                        dcc.Graph(id="carbon-fuel-mix-chart", style={"height": "200px"},
+                                  config={"displayModeBar": False}),
+                    ],
+                ),
+
+                # ── Demand-response windows ────────────────────────────────────
+                html.Div(
+                    id="dr-panel",
+                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                           "border": "1px solid #e2e8f0", "padding": "20px",
+                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+                           "marginBottom": "20px"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between",
+                                   "alignItems": "center", "marginBottom": "4px"},
+                            children=[
+                                html.Div("Flexible Load Opportunity Windows",
+                                         style={"fontSize": "13px", "fontWeight": 600,
+                                                "color": "#0f172a"}),
+                                html.Span("Best 4-hour blocks · next 48 h",
+                                          style={"fontSize": "10px", "color": "#94a3b8",
+                                                 "background": "#f1f5f9",
+                                                 "borderRadius": "4px",
+                                                 "padding": "2px 7px"}),
+                            ],
+                        ),
+                        html.Div("When to shift EV charging, HVAC pre-conditioning, or "
+                                 "industrial demand for lowest carbon and cost.",
+                                 style={"fontSize": "11px", "color": "#94a3b8",
+                                        "marginBottom": "10px"}),
+                        html.Div(id="dr-recommendation",
+                                 style={"marginBottom": "12px"}),
+                        dcc.Graph(id="dr-chart", style={"height": "220px"},
+                                  config={"displayModeBar": False}),
+                    ],
+                ),
+
                 # ── Day-ahead price forecast ───────────────────────────────────
                 html.Div(
                     id="price-forecast-panel",
@@ -854,6 +979,38 @@ app.layout = html.Div(
                         ),
                         dcc.Graph(id="price-forecast-chart", style={"height": "220px"},
                                   config={"displayModeBar": False}),
+                    ],
+                ),
+
+                # ── 12-Month Forward Curve ────────────────────────────────────
+                html.Div(
+                    id="forward-curve-panel",
+                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                           "border": "1px solid #e2e8f0", "padding": "20px",
+                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+                           "marginBottom": "20px"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "justifyContent": "space-between",
+                                   "alignItems": "center", "marginBottom": "12px"},
+                            children=[
+                                html.Div("12-Month Forward Price Curve",
+                                         style={"fontSize": "13px", "fontWeight": 600,
+                                                "color": "#0f172a"}),
+                                html.Span("OLS + EIA STEO gas curve",
+                                          style={"fontSize": "10px", "color": "#94a3b8",
+                                                 "background": "#f1f5f9",
+                                                 "borderRadius": "4px",
+                                                 "padding": "2px 7px"}),
+                            ],
+                        ),
+                        dcc.Graph(id="forward-curve-chart", style={"height": "280px"},
+                                  config={"displayModeBar": False}),
+                        dcc.Graph(id="spark-spread-chart", style={"height": "200px"},
+                                  config={"displayModeBar": False}),
+                        html.Div(id="forward-curve-stats",
+                                 style={"marginTop": "10px", "fontSize": "11px",
+                                        "color": "#94a3b8"}),
                     ],
                 ),
 
@@ -885,6 +1042,9 @@ app.layout = html.Div(
                     ],
                 ),
 
+                # ── Live forecast verification panel ──────────────────────────
+                html.Div(id="verification-panel"),
+
                 # ── Capacity market panel ─────────────────────────────────────
                 html.Div(
                     id="capacity-market-panel",
@@ -900,68 +1060,6 @@ app.layout = html.Div(
                     ],
                 ),
 
-                # ── Datacenter impact analysis ─────────────────────────────────
-                html.Div(
-                    style={"backgroundColor": "#ffffff", "borderRadius": "10px",
-                           "border": "1px solid #e2e8f0", "padding": "20px",
-                           "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
-                           "marginBottom": "20px"},
-                    children=[
-                        html.Div("Proposed Datacenter — Grid Impact Analysis",
-                                 style={"fontSize": "13px", "fontWeight": 600,
-                                        "color": "#0f172a", "marginBottom": "4px"}),
-                        html.Div(
-                            "Multi-dimensional impact analysis for approved and announced large datacenter "
-                            "projects in the selected ISO territory. Select one or more projects to model "
-                            "their combined effect on load, prices, emissions, and reserve margin. "
-                            "Assumes 90% capacity factor.",
-                            style={"fontSize": "11px", "color": "#94a3b8", "marginBottom": "16px"},
-                        ),
-                        html.Div(id="dc-project-table", style={"marginBottom": "16px"}),
-                        html.Div(id="dc-cards",
-                                 style={"display": "flex", "gap": "10px",
-                                        "flexWrap": "wrap", "marginBottom": "20px"}),
-                        # Load impact
-                        html.Div("Load Impact — 15-Day Forecast",
-                                 style={"fontSize": "11px", "fontWeight": 600,
-                                        "color": "#64748b", "textTransform": "uppercase",
-                                        "letterSpacing": "0.05em", "marginBottom": "6px"}),
-                        dcc.Graph(id="dc-chart", style={"height": "260px"},
-                                  config={"displayModeBar": False}),
-                        # Non-linear price impact
-                        html.Div("Price Impact — Non-Linear Merit Order Response",
-                                 style={"fontSize": "11px", "fontWeight": 600,
-                                        "color": "#64748b", "textTransform": "uppercase",
-                                        "letterSpacing": "0.05em",
-                                        "marginTop": "18px", "marginBottom": "4px"}),
-                        html.Div(
-                            "Price sensitivity rises non-linearly as load approaches grid capacity — "
-                            "peaking units are progressively more expensive. High-load days carry "
-                            "disproportionately higher marginal cost.",
-                            style={"fontSize": "11px", "color": "#94a3b8", "marginBottom": "8px"},
-                        ),
-                        dcc.Graph(id="dc-price-chart", style={"height": "240px"},
-                                  config={"displayModeBar": False}),
-                        # Emissions impact
-                        html.Div("Emissions Impact",
-                                 style={"fontSize": "11px", "fontWeight": 600,
-                                        "color": "#64748b", "textTransform": "uppercase",
-                                        "letterSpacing": "0.05em",
-                                        "marginTop": "18px", "marginBottom": "4px"}),
-                        html.Div(id="dc-emissions-div",
-                                 style={"fontSize": "12px", "color": "#475569",
-                                        "lineHeight": "1.7"}),
-
-                        # Research benchmark comparison
-                        html.Div("How Our Estimates Compare to Published Research",
-                                 style={"fontSize": "11px", "fontWeight": 600,
-                                        "color": "#64748b", "textTransform": "uppercase",
-                                        "letterSpacing": "0.05em",
-                                        "marginTop": "24px", "marginBottom": "10px"}),
-                        html.Div(id="dc-benchmark-table"),
-                    ],
-                ),
-
                 # ── Methodology note ───────────────────────────────────────────
                 html.Div(
                     style={"backgroundColor": "#f8fafc", "borderRadius": "10px",
@@ -973,14 +1071,16 @@ app.layout = html.Div(
                                         "color": "#475569", "textTransform": "uppercase",
                                         "letterSpacing": "0.06em", "marginBottom": "8px"}),
                         html.P(
-                            "Separate machine learning models are trained for each ISO (PJM, CAISO, ERCOT, MISO) "
-                            "on 2 years of hourly EIA demand data aggregated to daily averages, paired with ERA5 "
-                            "reanalysis temperatures population-weighted across 12 representative locations per ISO. "
-                            "Features include HDD/CDD from daily average, high, and low temperatures; day-of-week "
-                            "encoding; US federal holiday flags; T−1, T−2, and T−7 temperature lags; and a 7-day "
-                            "rolling average temperature to capture heat-wave persistence (27 features total). "
-                            "Forward forecasts use GFS NWP output via Open-Meteo (15-day horizon); historical "
-                            "hindcast uses ERA5 reanalysis.",
+                            "Separate XGBoost models trained for each of 7 ISOs on 2 years of hourly EIA demand "
+                            "data aggregated to daily averages, paired with ERA5 reanalysis temperatures "
+                            "population-weighted across 12 representative locations per ISO. "
+                            "34 features: HDD/CDD from daily average, high, and low temperatures; apparent "
+                            "temperature; dewpoint; wind speed; day-of-week encoding; US federal holiday flags; "
+                            "T−1, T−2, T−7 temperature lags; 7-day rolling temperature average; load autocorrelation "
+                            "lags (yesterday's actual load, 7 days ago, and 7-day rolling average). "
+                            "Uncertainty bands use Conformalized Quantile Regression (CQR) — guaranteed ≥90% "
+                            "empirical coverage. AutoTheta ensemble blended at 25% for trend-seasonality signal. "
+                            "Forward forecasts use GFS NWP via Open-Meteo (15-day horizon); hindcast uses ERA5.",
                             style={"fontSize": "12px", "color": "#64748b",
                                    "lineHeight": "1.7", "margin": "0 0 8px 0"},
                         ),
@@ -988,17 +1088,17 @@ app.layout = html.Div(
                             "ISO coverage — "
                             "PJM (Eastern US, ~65 GW peak): 12 locations from Chicago to Washington DC. "
                             "CAISO (California, ~45 GW peak): 12 locations from San Diego to Sacramento. "
-                            "ERCOT (Texas, ~80 GW peak): 12 locations weighted by population from Houston to Amarillo. "
+                            "ERCOT (Texas, ~80 GW peak): 12 locations from Houston to Amarillo. "
                             "MISO (Midcontinent, ~120 GW peak): 12 locations from New Orleans to Fargo. "
-                            "Benchmarks — PJM: PJM DataMiner official 7-day forecast. "
-                            "CAISO: CAISO OASIS 7-day system forecast. "
-                            "ERCOT: ERCOT public reports API (ERCOT_API_KEY) or EIA day-ahead. "
-                            "MISO: EIA day-ahead demand forecast. "
-                            "Accuracy note: the hindcast MAPE shown (~0.4–0.5%) is measured under ERA5 "
-                            "observed temperatures on the held-out 20% test set — it reflects model fit "
-                            "given known weather, not live forecast skill. Forward forecast error (GFS "
-                            "temperature uncertainty) is higher, consistent with industry norms of "
-                            "1–3% day-ahead and 3–5% week-ahead for temperature-driven load models.",
+                            "NYISO (New York, ~35 GW peak): 12 locations. "
+                            "ISO-NE (New England, ~28 GW peak): 12 locations. "
+                            "SPP (Southwest Power Pool, ~60 GW peak): 12 locations. "
+                            "Benchmarks — PJM: PJM DataMiner 7-day forecast. CAISO: OASIS 7-day system forecast. "
+                            "ERCOT: ERCOT public reports API or EIA day-ahead. MISO: EIA day-ahead demand. "
+                            "Accuracy note: the hindcast MAPE (~0.4–0.5%) reflects in-sample model fit under ERA5 "
+                            "observed temperatures — it does not represent live forecast skill. The 'Verified MAPE' "
+                            "card shows actual day-ahead error verified against EIA reported actuals. "
+                            "Live forward forecast error is consistent with industry norms of 1–3% day-ahead.",
                             style={"fontSize": "12px", "color": "#64748b",
                                    "lineHeight": "1.7", "margin": 0},
                         ),
@@ -1107,9 +1207,10 @@ app.layout = html.Div(
 
         # Store
         dcc.Store(id="load-forecast-store"),
+        dcc.Store(id="forward-curve-store"),
+        dcc.Store(id="carbon-store"),
         dcc.Store(id="ensemble-store"),
         dcc.Store(id="chat-history-store", data=[]),
-        dcc.Store(id="dc-selected-mw", data=0),
         dcc.Interval(id="daily-refresh", interval=24 * 60 * 60 * 1000, n_intervals=0),
         dcc.Interval(id="forecast-refresh", interval=15 * 60 * 1000, n_intervals=0),
     ],
@@ -1131,6 +1232,136 @@ def load_forecast_data(iso, n_clicks, _daily, _interval):
     return _fetch_iso_forecast(iso, force=force)
 
 
+@app.callback(
+    Output("forward-curve-store", "data"),
+    Input("iso-selector", "value"),
+    Input("daily-refresh", "n_intervals"),
+)
+def load_forward_curve_data(iso, _daily):
+    _cache_dir = _HERE / "api_cache"
+    _slow_fetch = {"spp"}  # ISOs that do a multi-minute HTTP crawl without a cache
+    if iso in _slow_fetch:
+        has_cache = (
+            (_cache_dir / f"{iso}_price_history_730d.json").exists()
+            or (_cache_dir / f"{iso}_price_history_400d.json").exists()
+        )
+        if not has_cache:
+            return None  # show "loading" state; warmup endpoint is building it
+    try:
+        from temperature_modeling.forward_curve import build_forward_curve
+        return build_forward_curve(iso, n_months=12)
+    except Exception as exc:
+        log.warning("Forward curve failed for %s: %s", iso, exc)
+        return None
+
+
+@app.callback(
+    Output("forward-curve-chart", "figure"),
+    Output("spark-spread-chart", "figure"),
+    Output("forward-curve-stats", "children"),
+    Input("forward-curve-store", "data"),
+    Input("iso-selector", "value"),
+)
+def render_forward_curve(data, iso):
+    if not data or not data.get("curve"):
+        _slow_fetch = {"spp"}
+        msg = "Price history cache warming — please refresh in ~20 min" if iso in _slow_fetch else "Forward curve loading…"
+        return _empty_fig(msg), _empty_fig(""), ""
+
+    curve = data["curve"]
+    months    = [m["month"] for m in curve]
+    base_avg  = [m["scenarios"]["base"]["monthly_avg"] for m in curve]
+    cold_avg  = [m["scenarios"]["cold"]["monthly_avg"] for m in curve]
+    hot_avg   = [m["scenarios"]["hot"]["monthly_avg"]  for m in curve]
+    base_on   = [m["scenarios"]["base"]["on_peak"]     for m in curve]
+    base_off  = [m["scenarios"]["base"]["off_peak"]    for m in curve]
+
+    _BLUE  = "#2563eb"
+    _RED   = "#ef4444"
+    _GREEN = "#16a34a"
+    _GRAY  = "#94a3b8"
+
+    fc_fig = go.Figure()
+    fc_fig.add_trace(go.Scatter(
+        x=months + months[::-1],
+        y=hot_avg + cold_avg[::-1],
+        fill="toself", fillcolor="rgba(37,99,235,0.08)",
+        line=dict(width=0), showlegend=True, name="Cold–Hot range",
+        hoverinfo="skip",
+    ))
+    fc_fig.add_trace(go.Scatter(
+        x=months, y=cold_avg, mode="lines",
+        line=dict(color=_GREEN, width=1.5, dash="dot"),
+        name="Cold", hovertemplate="%{x}<br>Cold: $%{y:.1f}/MWh<extra></extra>",
+    ))
+    fc_fig.add_trace(go.Scatter(
+        x=months, y=hot_avg, mode="lines",
+        line=dict(color=_RED, width=1.5, dash="dot"),
+        name="Hot", hovertemplate="%{x}<br>Hot: $%{y:.1f}/MWh<extra></extra>",
+    ))
+    fc_fig.add_trace(go.Scatter(
+        x=months, y=base_avg, mode="lines+markers",
+        line=dict(color=_BLUE, width=2.5),
+        marker=dict(size=5, color=_BLUE),
+        name="Base (strip)", hovertemplate="%{x}<br>Base: $%{y:.1f}/MWh<extra></extra>",
+    ))
+    fc_fig.add_trace(go.Scatter(
+        x=months, y=base_on, mode="lines",
+        line=dict(color=_BLUE, width=1, dash="dash"),
+        name="Peak (base)", hovertemplate="%{x}<br>On-peak: $%{y:.1f}/MWh<extra></extra>",
+    ))
+    fc_fig.add_trace(go.Scatter(
+        x=months, y=base_off, mode="lines",
+        line=dict(color=_BLUE, width=1, dash="longdash"),
+        name="Off-peak (base)", hovertemplate="%{x}<br>Off-peak: $%{y:.1f}/MWh<extra></extra>",
+    ))
+    fc_fig.update_layout(
+        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+        margin=dict(l=0, r=8, t=8, b=0),
+        legend=dict(orientation="h", y=-0.18, x=0, font=dict(size=10)),
+        yaxis=dict(title="$/MWh", gridcolor="#f1f5f9", tickfont=dict(size=10)),
+        xaxis=dict(tickfont=dict(size=10), tickangle=-30),
+        hovermode="x unified",
+    )
+
+    # Spark spread chart (base CCGT)
+    spark_ccgt = [m["scenarios"]["base"].get("spark_spread_ccgt") for m in curve]
+    spark_ct   = [m["scenarios"]["base"].get("spark_spread_ct")   for m in curve]
+    ss_fig = go.Figure()
+    ss_fig.add_trace(go.Bar(
+        x=months, y=spark_ccgt,
+        marker_color=[_BLUE if v and v > 0 else _RED for v in spark_ccgt],
+        name="Spark spread CCGT (7,000 BTU)",
+        hovertemplate="%{x}<br>CCGT spark: $%{y:.2f}<extra></extra>",
+    ))
+    ss_fig.add_trace(go.Scatter(
+        x=months, y=spark_ct, mode="lines+markers",
+        line=dict(color=_GRAY, width=1.5, dash="dash"),
+        marker=dict(size=4), name="CT spark (10,000 BTU)",
+        hovertemplate="%{x}<br>CT spark: $%{y:.2f}<extra></extra>",
+    ))
+    ss_fig.add_hline(y=0, line_color="#cbd5e1", line_width=1)
+    ss_fig.update_layout(
+        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+        margin=dict(l=0, r=8, t=4, b=0),
+        legend=dict(orientation="h", y=-0.25, x=0, font=dict(size=10)),
+        yaxis=dict(title="$/MWh", gridcolor="#f1f5f9", tickfont=dict(size=10)),
+        xaxis=dict(tickfont=dict(size=10), tickangle=-30),
+        hovermode="x unified",
+        title=dict(text="Spark Spreads — Base Scenario ($/MWh)", font=dict(size=11, color="#475569"), x=0),
+    )
+
+    model_src  = data.get("model_source", "ols")
+    rmse       = data.get("model_rmse_usd_mwh")
+    train_days = data.get("training_days")
+    gas_months = len(data.get("gas_curve", []))
+    rmse_str   = f"  |  RMSE ${rmse:.1f}/MWh" if rmse else ""
+    train_str  = f"  |  Trained on {train_days}d" if train_days else ""
+    stats_str  = f"Model: {model_src}{rmse_str}{train_str}  |  Gas curve: {gas_months} EIA STEO months"
+
+    return fc_fig, ss_fig, stats_str
+
+
 def _empty_fig(msg="Loading…"):
     f = go.Figure()
     f.update_layout(
@@ -1148,12 +1379,14 @@ def _empty_fig(msg="Loading…"):
     Output("load-cards", "children"),
     Output("forecast-subtitle", "children"),
     Output("load-forecast-chart", "figure"),
+    Output("extreme-alert", "children"),
+    Output("verification-panel", "children"),
     Input("load-forecast-store", "data"),
     Input("iso-selector", "value"),
 )
 def render(data, iso):
     if not data or not data.get("load"):
-        return ([], "", _empty_fig())
+        return ([], "", _empty_fig(), [], [])
 
     _iso_labels = {
         "pjm":   "PJM Interconnection",
@@ -1211,13 +1444,46 @@ def render(data, iso):
     v_col = ("#22c55e" if vstats["mape_7d"] is not None and vstats["mape_7d"] < 3
              else "#f97316")
 
+    # Percentile context
+    pct_data = data.get("percentile", {})
+    pct      = pct_data.get("percentile")
+    m_avg    = pct_data.get("month_avg_gw")
+    m_max    = pct_data.get("month_max_gw")
+    last_hi  = pct_data.get("last_higher_date", "")
+    pct_sub  = (f"avg {m_avg} GW · record {m_max} GW" if m_avg else "5-yr history")
+    pct_col  = ("#ef4444" if pct and pct >= 90 else
+                "#f97316" if pct and pct >= 75 else "#22c55e")
+    pct_str  = f"{pct}th %ile" if pct is not None else "—"
+
     summary_cards = [
         card("Today (GW)", f"{today_gw:.1f}", "GFS-based", load_color(today_gw)),
+        card("Monthly Rank", pct_str, pct_sub, pct_col),
         card("15-Day Peak", f"{peak_gw:.1f}", f"on {peak_lbl}", load_color(peak_gw)),
         card("15-Day Avg", f"{avg_gw:.1f}", "GW baseline", "#475569"),
         card("Hindcast MAPE", mape_str, "ERA5 obs. temps", mape_col),
         card("Verified MAPE 7d", v7, f"30d: {v30}  bias: {vbias}", v_col),
     ]
+
+    # Extreme event alert banner
+    alert_children = []
+    if pct is not None and pct >= 85:
+        last_hi_txt = f"  Last exceeded: {last_hi}." if last_hi else ""
+        alert_color = "#ef4444" if pct >= 95 else "#f97316"
+        alert_children = [html.Div(
+            style={"background": alert_color + "10", "border": f"1px solid {alert_color}40",
+                   "borderRadius": "8px", "padding": "10px 16px",
+                   "display": "flex", "gap": "10px", "alignItems": "center"},
+            children=[
+                html.Span("⚠️" if pct >= 95 else "🔶",
+                          style={"fontSize": "16px", "flexShrink": 0}),
+                html.Span(
+                    f"Extreme demand alert — today's {today_gw:.1f} GW forecast is the "
+                    f"{pct}th percentile for this calendar month "
+                    f"(5-yr avg {m_avg} GW, record {m_max} GW).{last_hi_txt}",
+                    style={"fontSize": "13px", "color": alert_color, "fontWeight": 500},
+                ),
+            ],
+        )]
 
     subtitle = f"{iso_label}  ·  GFS temperature input  ·  {len(dates)}-day horizon"
 
@@ -1356,7 +1622,67 @@ def render(data, iso):
         height=320,
     )
 
-    return summary_cards, subtitle, fig
+    # ── Live verification panel ───────────────────────────────────────────────
+    v_panel = []
+    records = vstats.get("records", [])
+    if records:
+        _th_style = {"padding": "6px 10px", "fontWeight": 600, "color": "#64748b",
+                     "fontSize": "11px", "borderBottom": "1px solid #e2e8f0",
+                     "textTransform": "uppercase", "letterSpacing": "0.04em"}
+        header = html.Thead(html.Tr([
+            html.Th("Date",        style=_th_style),
+            html.Th("Forecast MW", style={**_th_style, "textAlign": "right"}),
+            html.Th("Actual MW",   style={**_th_style, "textAlign": "right"}),
+            html.Th("Error %",     style={**_th_style, "textAlign": "right"}),
+        ]))
+        body_rows = []
+        for r in records[-14:]:
+            err = r["error_pct"]
+            err_col = "#22c55e" if abs(err) < 2 else "#f97316" if abs(err) < 5 else "#ef4444"
+            body_rows.append(html.Tr([
+                html.Td(r["date"],               style={"padding": "5px 10px", "fontSize": "12px"}),
+                html.Td(f"{r['forecast_mw']:,.0f}", style={"padding": "5px 10px", "fontSize": "12px",
+                                                            "textAlign": "right"}),
+                html.Td(f"{r['actual_mw']:,.0f}",   style={"padding": "5px 10px", "fontSize": "12px",
+                                                            "textAlign": "right"}),
+                html.Td(f"{err:+.1f}%",              style={"padding": "5px 10px", "fontSize": "12px",
+                                                             "textAlign": "right", "color": err_col,
+                                                             "fontWeight": 600}),
+            ], style={"borderBottom": "1px solid #f8fafc"}))
+        v_panel = [html.Div(
+            style={"backgroundColor": "#ffffff", "borderRadius": "10px",
+                   "border": "1px solid #e2e8f0", "padding": "20px",
+                   "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+                   "marginBottom": "20px"},
+            children=[
+                html.Div(
+                    style={"display": "flex", "alignItems": "baseline",
+                           "gap": "12px", "marginBottom": "10px"},
+                    children=[
+                        html.Div("Live Forecast Verification",
+                                 style={"fontSize": "13px", "fontWeight": 600,
+                                        "color": "#0f172a"}),
+                        html.Span(
+                            f"7d MAPE: {v7}  ·  30d: {v30}  ·  bias: {vbias}",
+                            style={"fontSize": "11px", "color": "#64748b"},
+                        ),
+                    ],
+                ),
+                html.Div(
+                    "Day-ahead forecasts vs EIA-reported actuals (most recent 14 verified days).",
+                    style={"fontSize": "11px", "color": "#94a3b8", "marginBottom": "10px"},
+                ),
+                html.Div(
+                    style={"overflowX": "auto"},
+                    children=[html.Table(
+                        [header, html.Tbody(body_rows)],
+                        style={"borderCollapse": "collapse", "width": "100%"},
+                    )],
+                ),
+            ],
+        )]
+
+    return summary_cards, subtitle, fig, alert_children, v_panel
 
 
 # ---------------------------------------------------------------------------
@@ -1414,6 +1740,258 @@ def render_shap(data):
 
 
 # ---------------------------------------------------------------------------
+# Carbon intensity callbacks
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("carbon-store", "data"),
+    Input("iso-selector", "value"),
+    Input("refresh-btn", "n_clicks"),
+    Input("forecast-refresh", "n_intervals"),
+)
+def load_carbon_data(iso, _clicks, _interval):
+    session = requests.Session()
+    session.headers["User-Agent"] = "grid-dashboard/1.0"
+    try:
+        return fetch_carbon_intensity(iso, session)
+    except Exception:
+        log.exception("Carbon intensity fetch failed for %s", iso.upper())
+        return {}
+
+
+@app.callback(
+    Output("carbon-intensity-number", "children"),
+    Output("carbon-fuel-mix-chart", "figure"),
+    Input("carbon-store", "data"),
+)
+def render_carbon(data):
+    empty_fig = _empty_fig("Carbon data unavailable (EIA_API_KEY required)")
+    if not data or not data.get("lbs_co2_per_mwh"):
+        return html.Div("Carbon data unavailable", style={"color": "#94a3b8", "fontSize": "13px"}), empty_fig
+
+    lbs       = data["lbs_co2_per_mwh"]
+    clean_pct = data.get("clean_pct", 0)
+    period    = data.get("period", "")
+    fuel_mix  = data.get("fuel_mix", {})
+    total_mw  = data.get("total_mw", 0)
+
+    # Color scale: green → yellow → orange → red
+    if lbs < 300:
+        ci_color = "#22c55e"
+        ci_label = "Very Clean"
+    elif lbs < 500:
+        ci_color = "#84cc16"
+        ci_label = "Clean"
+    elif lbs < 750:
+        ci_color = "#f97316"
+        ci_label = "Mixed"
+    else:
+        ci_color = "#ef4444"
+        ci_label = "Carbon Heavy"
+
+    period_label = period[-5:].replace("T", " ") + ":00 UTC" if period else ""
+
+    number_block = html.Div(
+        style={"display": "flex", "alignItems": "baseline", "gap": "16px", "flexWrap": "wrap"},
+        children=[
+            html.Div([
+                html.Span(f"{lbs:.0f}",
+                          style={"fontSize": "36px", "fontWeight": 700, "color": ci_color}),
+                html.Span(" lbs CO₂/MWh",
+                          style={"fontSize": "13px", "color": "#64748b", "marginLeft": "4px"}),
+            ]),
+            html.Span(ci_label,
+                      style={"fontSize": "11px", "fontWeight": 600,
+                             "background": ci_color + "18", "color": ci_color,
+                             "borderRadius": "4px", "padding": "3px 10px"}),
+            html.Span(f"{clean_pct:.0f}% zero-carbon",
+                      style={"fontSize": "12px", "color": "#64748b"}),
+            html.Span(f"{total_mw/1000:.1f} GW total · {period_label}",
+                      style={"fontSize": "11px", "color": "#94a3b8"}),
+        ],
+    )
+
+    # Fuel mix bar chart
+    _FUEL_COLORS: dict = {
+        "Natural Gas": "#f97316",
+        "Coal":        "#78716c",
+        "Oil":         "#b45309",
+        "Nuclear":     "#6366f1",
+        "Wind":        "#22c55e",
+        "Solar":       "#fbbf24",
+        "Hydro":       "#0ea5e9",
+        "Pumped Storage": "#94a3b8",
+        "Geothermal":  "#10b981",
+        "Other":       "#cbd5e1",
+    }
+    labels = list(fuel_mix.keys())
+    values = [fuel_mix[k] / 1000 for k in labels]  # MW → GW
+    colors = [_FUEL_COLORS.get(lbl, "#cbd5e1") for lbl in labels]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=values,
+        y=labels,
+        orientation="h",
+        marker_color=colors,
+        text=[f"{v:.1f} GW" for v in values],
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate="<b>%{y}</b>: %{x:.1f} GW<extra></extra>",
+    ))
+    fig.update_layout(
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        margin=dict(l=10, r=70, t=10, b=10),
+        xaxis=dict(
+            title=dict(text="Generation (GW)", font=dict(size=10)),
+            gridcolor="#f1f5f9", tickfont=dict(size=10),
+        ),
+        yaxis=dict(tickfont=dict(size=11), autorange="reversed"),
+        showlegend=False,
+        height=200,
+    )
+    return number_block, fig
+
+
+# ---------------------------------------------------------------------------
+# Demand-response callback
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output("dr-recommendation", "children"),
+    Output("dr-chart", "figure"),
+    Input("load-forecast-store", "data"),
+)
+def render_dr(data):
+    empty_fig = _empty_fig("Demand-response data unavailable")
+    if not data or "demand_response" not in data:
+        return html.Div("Loading…", style={"color": "#94a3b8", "fontSize": "13px"}), empty_fig
+
+    dr        = data["demand_response"]
+    hours     = dr.get("hours", [])
+    best      = dr.get("best_window", {})
+    low_ci    = dr.get("low_carbon_window", {})
+    low_cost  = dr.get("low_cost_window", {})
+
+    if not hours:
+        return html.Div("No hourly data", style={"color": "#94a3b8"}), empty_fig
+
+    # ── Recommendation chips ─────────────────────────────────────────────────
+    def _chip(icon, label, sublabel, color):
+        return html.Div(
+            style={"background": color + "0f", "border": f"1px solid {color}30",
+                   "borderRadius": "8px", "padding": "10px 14px",
+                   "display": "flex", "gap": "10px", "alignItems": "flex-start",
+                   "flex": "1", "minWidth": "200px"},
+            children=[
+                html.Span(icon, style={"fontSize": "20px", "flexShrink": 0}),
+                html.Div([
+                    html.Div(label,    style={"fontSize": "12px", "fontWeight": 700,
+                                              "color": color}),
+                    html.Div(sublabel, style={"fontSize": "11px", "color": "#475569",
+                                              "lineHeight": "1.4", "marginTop": "2px"}),
+                ]),
+            ],
+        )
+
+    best_label    = best.get("label", "—")
+    best_date     = best.get("date", "")
+    best_reason   = best.get("reason", "")
+    ci_label      = low_ci.get("label", "—")
+    ci_pct        = low_ci.get("carbon_reduction_pct", 0)
+    cost_label    = low_cost.get("label", "—")
+    cost_pct      = low_cost.get("cost_reduction_pct", 0)
+    ci_date       = low_ci.get("date", "")
+    cost_date     = low_cost.get("date", "")
+
+    def _fmt_date(d):
+        if not d: return ""
+        try:
+            dt = date.fromisoformat(d)
+            return "Today" if dt == date.today() else "Tomorrow"
+        except Exception:
+            return d
+
+    recs = html.Div(
+        style={"display": "flex", "gap": "10px", "flexWrap": "wrap", "marginBottom": "4px"},
+        children=[
+            _chip("⚡", f"Best Overall: {best_label} ({_fmt_date(best_date)})",
+                  best_reason, "#2563eb"),
+            _chip("🌿", f"Lowest Carbon: {ci_label} ({_fmt_date(ci_date)})",
+                  f"{ci_pct}% less CO₂ than average hour", "#22c55e"),
+            _chip("💰", f"Lowest Cost: {cost_label} ({_fmt_date(cost_date)})",
+                  f"~{cost_pct}% below peak load pricing", "#f97316"),
+        ],
+    )
+
+    # ── 48-hour stacked chart ────────────────────────────────────────────────
+    ts_labels = [h["ts"].replace("T", " ") for h in hours]
+    solars    = [h["solar_gw"]  for h in hours]
+    winds     = [h["wind_gw"]   for h in hours]
+    nets      = [h["net_load_gw"] for h in hours]
+
+    fig = go.Figure()
+
+    # Net load (gray)
+    fig.add_trace(go.Bar(
+        x=ts_labels, y=nets,
+        name="Net Load (ex-renewables)",
+        marker_color="#cbd5e1",
+        hovertemplate="<b>%{x}</b><br>Net load: %{y:.1f} GW<extra></extra>",
+    ))
+    # Wind
+    fig.add_trace(go.Bar(
+        x=ts_labels, y=winds,
+        name="Wind",
+        marker_color="#34d399",
+        hovertemplate="<b>%{x}</b><br>Wind: %{y:.1f} GW<extra></extra>",
+    ))
+    # Solar
+    fig.add_trace(go.Bar(
+        x=ts_labels, y=solars,
+        name="Solar",
+        marker_color="#fbbf24",
+        hovertemplate="<b>%{x}</b><br>Solar: %{y:.1f} GW<extra></extra>",
+    ))
+
+    # Highlight best window with a rectangle
+    if best.get("start_h") is not None and best.get("date"):
+        hi_date = best["date"]
+        hi_s    = best["start_h"]
+        hi_e    = best["end_h"]
+        hi_ts_s = f"{hi_date} {hi_s:02d}:00"
+        hi_ts_e = f"{hi_date} {hi_e:02d}:00"
+        fig.add_vrect(
+            x0=hi_ts_s, x1=hi_ts_e,
+            fillcolor="rgba(37,99,235,0.10)",
+            line=dict(color="#2563eb", width=1.5, dash="dot"),
+            annotation_text="Best window",
+            annotation_font_size=9,
+            annotation_font_color="#2563eb",
+            annotation_position="top left",
+        )
+
+    fig.update_layout(
+        barmode="stack",
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#334155", size=11),
+        legend=dict(orientation="h", y=-0.28, font=dict(size=10),
+                    bgcolor="rgba(0,0,0,0)", x=0),
+        margin=dict(l=60, r=20, t=10, b=70),
+        xaxis=dict(
+            tickformat="%#d %b %H:%M" if os.name == "nt" else "%-d %b %H:%M",
+            tickangle=-45, tickfont=dict(size=9), linecolor="#e2e8f0",
+            gridcolor="#f8fafc",
+        ),
+        yaxis=dict(gridcolor="#f1f5f9", tickformat=".0f", ticksuffix=" GW",
+                   linecolor="#e2e8f0"),
+        height=220,
+        hovermode="x unified",
+    )
+    return recs, fig
+
+
+# ---------------------------------------------------------------------------
 # Price forecast callback
 # ---------------------------------------------------------------------------
 @app.callback(
@@ -1423,8 +2001,9 @@ def render_shap(data):
 )
 def render_price_chart(data, iso):
     if not data or not data.get("price_forecast"):
+        msg = price_unavailable_reason(iso or "")
         fig = go.Figure()
-        fig.add_annotation(text="Price data unavailable (EIA_API_KEY required)",
+        fig.add_annotation(text=msg,
                            xref="paper", yref="paper", x=0.5, y=0.5,
                            showarrow=False, font=dict(color="#94a3b8", size=12))
         fig.update_layout(paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
@@ -1795,387 +2374,7 @@ def render_chat(history):
 
 
 # ---------------------------------------------------------------------------
-# Datacenter impact callback
-# ---------------------------------------------------------------------------
-@app.callback(
-    Output("dc-project-table", "children"),
-    Input("iso-selector", "value"),
-)
-def render_project_table(iso):
-    projects = _DC_PROJECTS.get(iso, [])
-
-    def _badge(status):
-        col = _STATUS_COLOR.get(status, "#94a3b8")
-        return html.Span(status, style={
-            "backgroundColor": col + "18", "color": col,
-            "border": f"1px solid {col}40",
-            "borderRadius": "4px", "padding": "1px 7px",
-            "fontSize": "10px", "fontWeight": 600,
-        })
-
-    rows = []
-    for p in projects:
-        rows.append(html.Tr([
-            html.Td(
-                dcc.Checklist(
-                    id={"type": "dc-proj-check", "id": p["id"]},
-                    options=[{"label": "", "value": p["id"]}],
-                    value=[p["id"]],  # default: all selected
-                    inputStyle={"cursor": "pointer"},
-                ),
-                style={"width": "30px", "verticalAlign": "middle"},
-            ),
-            html.Td(html.Div([
-                html.Div(p["name"],
-                         style={"fontSize": "12px", "fontWeight": 600, "color": "#0f172a"}),
-                html.Div(p["operator"],
-                         style={"fontSize": "10px", "color": "#94a3b8"}),
-            ]), style={"verticalAlign": "middle", "paddingRight": "12px"}),
-            html.Td(p["location"],
-                    style={"fontSize": "11px", "color": "#64748b", "verticalAlign": "middle"}),
-            html.Td(f"{p['mw']:,} MW",
-                    style={"fontSize": "12px", "fontWeight": 700, "color": "#0f172a",
-                           "textAlign": "right", "verticalAlign": "middle",
-                           "paddingRight": "12px"}),
-            html.Td(_badge(p["status"]), style={"verticalAlign": "middle"}),
-        ], style={"borderBottom": "1px solid #f1f5f9"}))
-
-    return html.Table(
-        style={"width": "100%", "borderCollapse": "collapse"},
-        children=[
-            html.Thead(html.Tr([
-                html.Th("", style={"width": "30px"}),
-                html.Th("Project", style=_th),
-                html.Th("Location", style=_th),
-                html.Th("Capacity", style={**_th, "textAlign": "right"}),
-                html.Th("Status", style=_th),
-            ])),
-            html.Tbody(rows),
-        ],
-    )
-
-
-_th = {"fontSize": "10px", "color": "#94a3b8", "textTransform": "uppercase",
-       "letterSpacing": "0.05em", "padding": "4px 0 8px 0", "fontWeight": 600}
-
-
-@app.callback(
-    Output("dc-cards", "children"),
-    Output("dc-chart", "figure"),
-    Output("dc-price-chart", "figure"),
-    Output("dc-emissions-div", "children"),
-    Output("dc-benchmark-table", "children"),
-    Input("load-forecast-store", "data"),
-    Input("iso-selector", "value"),
-    Input({"type": "dc-proj-check", "id": ALL}, "value"),
-)
-def render_datacenter(data, iso, check_values):
-    projects  = _DC_PROJECTS.get(iso, [])
-    selected  = {v[0] for v in (check_values or []) if v}
-    total_mw  = sum(p["mw"] for p in projects if p["id"] in selected)
-    dc_mw     = total_mw or 0
-
-    empty = ([], _empty_fig("Select projects above to model their grid impact"),
-             _empty_fig(), "", "")
-    if not data or not data.get("load") or dc_mw == 0:
-        return empty
-
-    load_list   = data["load"]
-    dates       = [d["date"]         for d in load_list]
-    means       = [d["mean_load_gw"] for d in load_list]
-    actual_dict = data.get("comparison", {}).get("actual", {})
-    pm          = data.get("price_model", {})
-    p_slope     = pm.get("slope")
-    p_int       = pm.get("intercept")
-
-    CF      = 0.90
-    dc_gw   = dc_mw * CF / 1000
-    ann_gwh = dc_gw * 8760            # annual energy, GWh
-
-    avg_load = sum(means) / len(means) if means else 1
-    peak_historical = max(actual_dict.values()) if actual_dict else max(means) * 1.15
-    peak_forecast   = max(means)
-    pct_increase    = dc_gw / avg_load * 100
-    augmented       = [gw + dc_gw for gw in means]
-
-    # ── Non-linear merit-order price sensitivity ───────────────────────────────
-    # Calibrated from ISO market data: price sensitivity rises exponentially
-    # as load approaches grid capacity (peakers progressively more expensive).
-    # ERCOT uses scarcity pricing (ORDC) so sensitivity is higher near peak.
-    _base_sens_map = {"pjm": 5.5, "caiso": 7.0, "ercot": 8.0, "miso": 5.0}
-    base_sens = _base_sens_map.get(iso, 5.5)   # $/MWh per GW at reference load
-    nl_exp    = 4.4                              # exponential steepness
-    ref_ratio = 0.70                             # reference load ratio
-
-    def _price_sens(load_gw):
-        ratio = load_gw / peak_historical
-        return base_sens * (2.718 ** (nl_exp * max(0, ratio - ref_ratio)))
-
-    # Daily price delta (non-linear)
-    daily_price_delta_base = [round(_price_sens(gw) * dc_gw, 1) for gw in means]
-    daily_price_delta_aug  = [round(_price_sens(gw + dc_gw) * dc_gw, 1) for gw in means]
-
-    # Baseline + augmented projected prices
-    base_prices = (
-        [round(p_slope * gw + p_int, 1) for gw in means]
-        if p_slope is not None else []
-    )
-    aug_prices = (
-        [round(p_slope * (gw + dc_gw) + p_int, 1) for gw in means]
-        if p_slope is not None else []
-    )
-
-    avg_delta = sum(daily_price_delta_base) / len(daily_price_delta_base)
-    peak_delta = max(daily_price_delta_base)
-
-    # ── Emissions (EPA eGRID 2023 marginal rates) ─────────────────────────────
-    # PJM: 1,264 | CAISO: 876 | ERCOT (ERCT): 1,050 | MISO (MROW/SRSO): 1,580
-    _lbs_map = {"pjm": 1264, "caiso": 876, "ercot": 1050, "miso": 1580}
-    lbs_per_mwh   = _lbs_map.get(iso, 1264)
-    tons_per_mwh  = lbs_per_mwh / 2204.62
-    ann_co2_ktons = ann_gwh * 1000 * tons_per_mwh / 1000   # kilotonnes
-    ann_co2_mtons = ann_co2_ktons / 1000                   # megatonnes
-
-    # ── Reserve margin impact ─────────────────────────────────────────────────
-    # PJM target 20% (current 14.8%) | CAISO 15% (current 16.0%)
-    # ERCOT target 10.75% (current ~10.5%, historically tight)
-    # MISO target 18.1% (current ~20.3%)
-    _rm_target_map  = {"pjm": 20.0, "caiso": 15.0, "ercot": 10.75, "miso": 18.1}
-    _rm_current_map = {"pjm": 14.8, "caiso": 16.0, "ercot": 10.5,  "miso": 20.3}
-    rm_target  = _rm_target_map.get(iso, 20.0)
-    rm_current = _rm_current_map.get(iso, 14.8)
-    rm_delta   = dc_gw / (peak_historical + dc_gw) * 100   # % reduction in reserve
-
-    # ── Capacity market cost ──────────────────────────────────────────────────
-    # PJM Dec-2025: $333.44/MW-day | CAISO RA: ~$80/MW-day
-    # ERCOT: energy-only market, no capacity payment ($0) but high scarcity pricing
-    # MISO Planning Resource Auction: ~$35/MW-day (zone-dependent)
-    _cap_map = {"pjm": 333.44, "caiso": 80.0, "ercot": 0.0, "miso": 35.0}
-    cap_price_per_mw_day = _cap_map.get(iso, 333.44)
-    ann_cap_cost_m       = dc_mw * cap_price_per_mw_day * 365 / 1e6
-
-    # ── Interconnection cost estimate ─────────────────────────────────────────
-    # PJM 2024: ~$145M/GW | CAISO: ~$145M/GW
-    # ERCOT: large queue backlog, ~$160M/GW (ERCOT nodal interconnection)
-    # MISO: less congested queue, ~$120M/GW (MISO Generator Interconnection Process)
-    _intercon_map = {"pjm": 145, "caiso": 145, "ercot": 160, "miso": 120}
-    intercon_cost_m = dc_gw * _intercon_map.get(iso, 145)
-
-    # ── REC / Carbon neutrality cost ─────────────────────────────────────────
-    # PJM Class I RECs: ~$40/MWh | CAISO: ~$15/MWh (abundant solar)
-    # ERCOT: ~$8/MWh (abundant wind, cheapest RECs in US)
-    # MISO: ~$20/MWh (growing wind but coal-heavy grid → higher offset needed)
-    _rec_map = {"pjm": 40, "caiso": 15, "ercot": 8, "miso": 20}
-    rec_mwh = _rec_map.get(iso, 40)
-    ann_rec_cost_m = ann_gwh * rec_mwh / 1e3
-
-    # ── Summary cards ─────────────────────────────────────────────────────────
-    n_proj = len(selected)
-    dc_cards = [
-        card("Projects Selected", str(n_proj),            f"{dc_mw:,} MW total",     "#0f172a"),
-        card("Continuous Load",   f"{dc_gw:.2f} GW",      "90% CF, 24/7",            "#2563eb"),
-        card("Load Increase",     f"+{pct_increase:.1f}%","vs 15-day avg",            "#f97316"),
-        card("Avg Price Impact",  f"+${avg_delta:.1f}",   "$/MWh (non-linear avg)",   "#7c3aed"),
-        card("Peak Day Price",    f"+${peak_delta:.1f}",  "$/MWh on peak day",        "#ef4444"),
-        card("Annual CO₂",        f"{ann_co2_ktons:.0f}", "kt CO₂/yr (marginal)",     "#64748b"),
-        card("Reserve Margin",    f"−{rm_delta:.2f}%",    f"from {rm_current:.1f}% current", "#dc2626"),
-        card("Capacity Cost",     f"${ann_cap_cost_m:.1f}M","$/yr (market rate)",    "#0284c7"),
-        card("Interconnection",   f"~${intercon_cost_m:.0f}M","one-time est.",       "#475569"),
-    ]
-
-    # ── Load impact chart ─────────────────────────────────────────────────────
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=dates, y=means, mode="lines+markers", name="Baseline",
-        line=dict(color="#94a3b8", width=2), marker=dict(size=4),
-        hovertemplate="<b>%{x|%d %b}</b><br>Baseline: %{y:.1f} GW<extra></extra>",
-    ))
-    fig.add_trace(go.Scatter(
-        x=dates, y=augmented, mode="lines+markers",
-        name=f"With {dc_mw:,} MW DC",
-        line=dict(color="#2563eb", width=2.5), marker=dict(size=4),
-        fill="tonexty", fillcolor="rgba(37,99,235,0.08)",
-        hovertemplate="<b>%{x|%d %b}</b><br>With DC: %{y:.1f} GW<extra></extra>",
-    ))
-    fig.update_layout(
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        font=dict(color="#334155", size=11),
-        legend=dict(orientation="h", y=-0.30, font=dict(size=10),
-                    bgcolor="rgba(0,0,0,0)", x=0),
-        margin=dict(l=60, r=20, t=10, b=80),
-        xaxis=dict(type="date", tickformat="%d %b", gridcolor="#f8fafc",
-                   tickangle=-30, tickfont=dict(size=10), linecolor="#e2e8f0", dtick="D1"),
-        yaxis=dict(gridcolor="#f1f5f9", tickformat=".1f", ticksuffix=" GW",
-                   title=dict(text="Load (GW)", font=dict(size=11, color="#64748b")),
-                   linecolor="#e2e8f0"),
-        height=260,
-    )
-
-    # ── Non-linear price impact chart ─────────────────────────────────────────
-    # Show daily price delta as bars, colored by load-ratio tier
-    bar_colors = []
-    for gw in means:
-        ratio = gw / peak_historical
-        if ratio > 0.90:
-            bar_colors.append("#ef4444")   # red — high scarcity
-        elif ratio > 0.80:
-            bar_colors.append("#f97316")   # amber — elevated
-        else:
-            bar_colors.append("#7c3aed")   # purple — normal
-
-    dc_pfig = go.Figure()
-    dc_pfig.add_trace(go.Bar(
-        x=dates, y=daily_price_delta_base,
-        name="Price delta ($/MWh)",
-        marker_color=bar_colors,
-        hovertemplate="<b>%{x|%d %b}</b><br>Price impact: +$%{y:.1f}/MWh<extra></extra>",
-    ))
-    if base_prices:
-        dc_pfig.add_trace(go.Scatter(
-            x=dates, y=base_prices, mode="lines", name="Baseline price",
-            line=dict(color="#94a3b8", width=1.5, dash="dot"),
-            yaxis="y2",
-            hovertemplate="<b>%{x|%d %b}</b><br>Base: $%{y:.0f}/MWh<extra></extra>",
-        ))
-        dc_pfig.update_layout(yaxis2=dict(
-            title=dict(text="Price ($/MWh)", font=dict(size=10, color="#94a3b8")),
-            overlaying="y", side="right", showgrid=False,
-            tickformat=".0f", tickprefix="$",
-            tickfont=dict(color="#94a3b8", size=9),
-        ))
-
-    dc_pfig.add_hline(y=avg_delta, line_dash="dot", line_color="#7c3aed",
-                      line_width=1.5,
-                      annotation_text=f"avg +${avg_delta:.1f}/MWh",
-                      annotation_font_size=9, annotation_font_color="#7c3aed",
-                      annotation_position="top right")
-    dc_pfig.update_layout(
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        font=dict(color="#334155", size=11),
-        legend=dict(orientation="h", y=-0.35, font=dict(size=10),
-                    bgcolor="rgba(0,0,0,0)", x=0),
-        margin=dict(l=60, r=55 if base_prices else 20, t=10, b=85),
-        xaxis=dict(type="date", tickformat="%d %b", gridcolor="#f8fafc",
-                   tickangle=-30, tickfont=dict(size=10), linecolor="#e2e8f0", dtick="D1"),
-        yaxis=dict(gridcolor="#f1f5f9", tickformat=".1f", tickprefix="+$",
-                   title=dict(text="Marginal Price Increase ($/MWh)",
-                              font=dict(size=11, color="#64748b")),
-                   linecolor="#e2e8f0"),
-        height=240,
-        barmode="overlay",
-    )
-    # Tier legend annotation
-    dc_pfig.add_annotation(
-        x=1.0, y=1.06, xref="paper", yref="paper", showarrow=False,
-        text="<span style='color:#7c3aed'>■</span> Normal  "
-             "<span style='color:#f97316'>■</span> Elevated  "
-             "<span style='color:#ef4444'>■</span> Peak scarcity",
-        font=dict(size=9, color="#64748b"), align="right",
-    )
-
-    # ── Emissions text block ───────────────────────────────────────────────────
-    carbon_price_usd = 50   # $/tonne CO2 (EU ETS reference)
-    social_cost_m = ann_co2_ktons * carbon_price_usd / 1e3  # $M/yr social cost
-    _dc_iso_labels = {"pjm": "PJM", "caiso": "CAISO", "ercot": "ERCOT", "miso": "MISO",
-                      "nyiso": "NYISO", "isone": "ISO-NE", "spp": "SPP"}
-    iso_label = _dc_iso_labels.get(iso, iso.upper())
-    emissions_text = [
-        html.Span(f"Annual marginal CO₂ emissions: "),
-        html.Strong(f"{ann_co2_ktons:.0f} kt CO₂/yr"),
-        html.Span(f" ({ann_co2_mtons:.2f} Mt) — based on EPA eGRID 2023 marginal "
-                  f"rate for {iso_label} ({lbs_per_mwh:,} lbs/MWh). "),
-        html.Br(),
-        html.Span(f"Social cost of carbon (~$50/t): "),
-        html.Strong(f"~${social_cost_m:.1f}M/yr"),
-        html.Span(f".  Carbon neutrality via RECs (~${rec_mwh}/MWh): "),
-        html.Strong(f"~${ann_rec_cost_m:.1f}M/yr"),
-        html.Span("."),
-        html.Br(),
-        html.Span(
-            f"Note: marginal emission rates reflect the actual generators dispatched "
-            f"to meet incremental load — higher than average grid rates because "
-            f"baseload (nuclear, hydro) is already committed.",
-            style={"color": "#94a3b8", "fontSize": "11px"},
-        ),
-    ]
-
-    # ── Research benchmark comparison table ───────────────────────────────────
-    per_gw_dc = max(dc_gw, 0.001)
-    our_co2   = ann_co2_ktons / per_gw_dc          # kt/GW
-    our_cap   = ann_cap_cost_m / (dc_mw / 1000)    # $M/GW/yr
-    our_intercon = intercon_cost_m / per_gw_dc      # $M/GW
-
-    def _align(ours, pub_lo, pub_hi, unit, note=""):
-        mid = (pub_lo + pub_hi) / 2
-        pct = (ours - mid) / mid * 100 if mid else 0
-        if abs(pct) < 15:
-            verdict, col = "Aligned", "#22c55e"
-        elif pct < 0:
-            verdict, col = "Conservative", "#f97316"
-        else:
-            verdict, col = "Above research", "#ef4444"
-        return [
-            html.Span(f"{ours:.0f} {unit}",
-                      style={"fontWeight": 700, "color": "#0f172a"}),
-            html.Span(f"  vs  {pub_lo:.0f}–{pub_hi:.0f} {unit} (published)",
-                      style={"color": "#64748b", "fontSize": "11px"}),
-            html.Span(f"  {verdict}" + (f"  — {note}" if note else ""),
-                      style={"color": col, "fontSize": "11px", "fontWeight": 600}),
-        ]
-
-    bm_rows = [
-        ("Interconnection cost", _align(
-            our_intercon, 145, 240, "$M/GW",
-            "UCS: $147M/GW; LBNL mean: $240M/GW")),
-        ("Capacity market cost", _align(
-            our_cap, 110, 125, "$M/GW/yr",
-            "PJM Dec-2025 auction $333.44/MW-day — exact match")),
-        ("CO₂ — marginal emissions", _align(
-            our_co2, 450, 580, "kt CO₂/GW/yr",
-            "EPA eGRID 2023 marginal rate; MIT/CMU confirm MEF is correct method")),
-        ("Price sensitivity (avg)", [
-            html.Span(f"${avg_delta / dc_gw:.1f}/MWh per GW",
-                      style={"fontWeight": 700, "color": "#0f172a"}),
-            html.Span("  vs  IEEFA: 'factor of 10×' in capacity prices; no published $/MWh/GW spot figure",
-                      style={"color": "#64748b", "fontSize": "11px"}),
-            html.Span("  Conservative — spot price impact understudied",
-                      style={"color": "#f97316", "fontSize": "11px", "fontWeight": 600}),
-        ]),
-        ("Reserve margin impact", [
-            html.Span(f"−{rm_delta:.2f}% per {dc_gw:.1f} GW",
-                      style={"fontWeight": 700, "color": "#0f172a"}),
-            html.Span("  Harvard Belfer Centre confirms thinning margins; no published $/GW figure",
-                      style={"color": "#64748b", "fontSize": "11px"}),
-            html.Span("  Directionally correct — no benchmark to validate magnitude",
-                      style={"color": "#94a3b8", "fontSize": "11px", "fontWeight": 600}),
-        ]),
-    ]
-
-    bm_table = html.Table(
-        style={"width": "100%", "borderCollapse": "collapse"},
-        children=[
-            html.Thead(html.Tr([
-                html.Th("Metric", style=_th),
-                html.Th("Our estimate vs published range", style=_th),
-            ])),
-            html.Tbody([
-                html.Tr([
-                    html.Td(label,
-                            style={"fontSize": "12px", "color": "#475569",
-                                   "fontWeight": 500, "padding": "8px 12px 8px 0",
-                                   "verticalAlign": "top", "whiteSpace": "nowrap",
-                                   "borderBottom": "1px solid #f1f5f9"}),
-                    html.Td(cells,
-                            style={"fontSize": "12px", "padding": "8px 0",
-                                   "borderBottom": "1px solid #f1f5f9",
-                                   "lineHeight": "1.6"}),
-                ])
-                for label, cells in bm_rows
-            ]),
-        ],
-    )
-
-    return dc_cards, fig, dc_pfig, emissions_text, bm_table
+# (Datacenter impact panel removed — underlying data kept in api_cache/)
 
 
 # ---------------------------------------------------------------------------

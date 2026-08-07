@@ -120,6 +120,9 @@ class LoadObservation:
     apparent_hi_f: Optional[float] = None  # daily max apparent temperature / heat index (°F)
     dewpoint_hi_f: Optional[float] = None  # daily max dewpoint temperature (°F)
     wind_speed_mph: Optional[float] = None # daily max 10m wind speed (mph)
+    load_lag1_mw: Optional[float] = None       # yesterday's daily avg load (MW)
+    load_lag7_mw: Optional[float] = None       # 7 days ago daily avg load (MW)
+    rolling7_load_mw: Optional[float] = None   # 7-day trailing avg load (MW)
 
 
 @dataclass

@@ -4,7 +4,8 @@ Day-ahead electricity price fetching and regression-based forecast.
 Data sources:
   - CAISO: CAISO OASIS PRC_LMP (DAM, TH_NP15_GEN-APND + TH_SP15_GEN-APND) + EIA load
   - MISO: docs.misoenergy.org YYYYMMDD_da_exante_lmp.csv (8 hub nodes) + EIA load
-  - PJM / ERCOT: EIA v2 wholesale-markets/prices + rto/region-data (endpoint defunct as of 2026)
+  - PJM:   PJM DataMiner2 DA hub LMPs (PJM_API_KEY, free at pjm.com) + EIA load
+  - ERCOT: ERCOT public NP reports (np6-86-cd DA settlement prices) + EIA load
   - NYISO: NYISO public day-ahead zone LMP CSVs (mis.nyiso.com) + EIA load
   - ISO-NE: ISO-NE webservices REST API (configure _ISONE_API_USER / _ISONE_API_PASS)
   - SPP: SPP Marketplace public DA-LMP-SL files (SPPNORTH_HUB + SPPSOUTH_HUB) + EIA load
@@ -18,6 +19,7 @@ import io
 import logging
 import math
 import os
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -27,7 +29,6 @@ import requests
 
 log = logging.getLogger(__name__)
 
-_EIA_PRICE_URL  = "https://api.eia.gov/v2/electricity/wholesale-markets/prices/data/"
 _EIA_LOAD_URL   = "https://api.eia.gov/v2/electricity/rto/region-data/data/"
 _EIA_NG_URL     = "https://api.eia.gov/v2/natural-gas/pri/fut/data/"   # daily Henry Hub spot
 _NYISO_LMP_URL  = "https://mis.nyiso.com/public/csv/damlbmp/{date}damlbmp_zone.csv"
@@ -49,14 +50,58 @@ _MISO_LMP_URL = "https://docs.misoenergy.org/marketreports/{date}_da_exante_lmp.
 _ISONE_API_USER = os.environ.get("ISONE_API_USER", "")
 _ISONE_API_PASS = os.environ.get("ISONE_API_PASS", "")
 
-# EIA respondent codes for load and price (EIA wholesale prices endpoint)
-# SPP is NOT listed here — EIA does not collect SPP wholesale prices; use SPP Marketplace instead
-_ISO_EIA = {
-    "pjm":   {"load_region": "PJM",  "price_region": "PJM",  "price_type": "DA"},
-    "caiso": {"load_region": "CAL",  "price_region": "CAL",  "price_type": "DA"},
-    "ercot": {"load_region": "TEX",  "price_region": "TEX",  "price_type": "DA"},
-    "miso":  {"load_region": "MISO", "price_region": "MIDW", "price_type": "DA"},
-}
+# PJM DataMiner2 DA LMPs — free API key registration at pjm.com
+_PJM_DATAMINER_URL   = "https://dataminer2.pjm.com/feed/da_hrl_lmps/excel"
+_PJM_DATAMINER_KEY   = os.environ.get("PJM_API_KEY", "")
+_PJM_WESTERN_HUB_ID  = 1   # pnode_id for PJM Western Hub (main reference)
+
+# ERCOT DAM Settlement Point Prices — NP4-190-CD (register at api.ercot.com)
+_ERCOT_NP_URL         = "https://api.ercot.com/api/public-reports/np4-190-cd/dam_stlmnt_pnt_prices"
+_ERCOT_API_KEY        = os.environ.get("ERCOT_API_KEY", "")
+_ERCOT_USERNAME       = os.environ.get("ERCOT_USERNAME", "")
+_ERCOT_PASSWORD       = os.environ.get("ERCOT_PASSWORD", "")
+_ERCOT_HUB_NODES      = {"HB_BUSAVG", "HB_WEST", "HB_NORTH", "HB_SOUTH", "HB_HOUSTON"}
+# Azure B2C ROPC token endpoint for api.ercot.com
+_ERCOT_TOKEN_URL = (
+    "https://ercotb2c.b2clogin.com/ercotb2c.onmicrosoft.com"
+    "/B2C_1_PUBAPI-ROPC-FLOW/oauth2/v2.0/token"
+)
+_ERCOT_CLIENT_ID = "fec253ea-0d06-4272-a5e6-b478baeecd70"
+_ercot_bearer_cache: dict = {}   # {token, expires_at}
+
+
+def _ercot_bearer_token() -> str:
+    """Fetch (or return cached) ERCOT OAuth id_token via ROPC flow."""
+    import time as _time
+    cached = _ercot_bearer_cache
+    if cached.get("token") and _time.time() < cached.get("expires_at", 0) - 60:
+        return cached["token"]
+    if not (_ERCOT_USERNAME and _ERCOT_PASSWORD):
+        return ""
+    try:
+        r = requests.post(
+            _ERCOT_TOKEN_URL,
+            data={
+                "grant_type":    "password",
+                "username":      _ERCOT_USERNAME,
+                "password":      _ERCOT_PASSWORD,
+                "client_id":     _ERCOT_CLIENT_ID,
+                "scope":         f"openid {_ERCOT_CLIENT_ID} offline_access",
+                "response_type": "id_token",
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            j = r.json()
+            token = j.get("id_token") or j.get("access_token", "")
+            cached["token"]      = token
+            cached["expires_at"] = _time.time() + int(j.get("expires_in", 3600))
+            log.info("ERCOT: OAuth token obtained (expires in %ds)", j.get("expires_in", 3600))
+            return token
+        log.warning("ERCOT token fetch HTTP %d: %s", r.status_code, r.text[:300])
+    except Exception as exc:
+        log.warning("ERCOT token fetch failed: %s", exc)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -78,20 +123,33 @@ def _eia_get(url: str, params: dict) -> list:
 
 
 def _eia_load_daily(respondent: str, start: str, end: str) -> dict:
-    """Return {date_str: avg_mw} from EIA hourly demand."""
-    rows = _eia_get(_EIA_LOAD_URL, {
-        "frequency":            "hourly",
-        "data[0]":              "value",
-        "facets[respondent][]": respondent,
-        "facets[type][]":       "D",
-        "start": start, "end": end, "length": 5000,
-    })
+    """Return {date_str: avg_mw} from EIA hourly demand. Paginates for long date ranges."""
     daily: dict = {}
-    for row in rows:
-        d = row.get("period", "")[:10]
-        v = row.get("value")
-        if d and v is not None:
-            daily.setdefault(d, []).append(float(v))
+    offset = 0
+    page_size = 5000   # EIA hard limit per request
+
+    while True:
+        rows = _eia_get(_EIA_LOAD_URL, {
+            "frequency":            "hourly",
+            "data[0]":              "value",
+            "facets[respondent][]": respondent,
+            "facets[type][]":       "D",
+            "start":  start,
+            "end":    end,
+            "length": page_size,
+            "offset": offset,
+        })
+        if not rows:
+            break
+        for row in rows:
+            d = row.get("period", "")[:10]
+            v = row.get("value")
+            if d and v is not None:
+                daily.setdefault(d, []).append(float(v))
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
     return {d: sum(vs) / len(vs) for d, vs in daily.items()}
 
 
@@ -108,7 +166,7 @@ def fetch_henry_hub_daily(start: str, end: str) -> dict:
         "facets[series][]": "RNGWHHD",
         "start":            start,
         "end":              end,
-        "length":           500,
+        "length":           1000,  # supports ~2 years of daily NG spot prices
         "sort[0][column]":  "period",
         "sort[0][direction]": "asc",
     })
@@ -145,51 +203,120 @@ def fetch_henry_hub_daily(start: str, end: str) -> dict:
 # ISO-specific price fetchers
 # ---------------------------------------------------------------------------
 
+_NYISO_MONTHLY_ZIP_URL = "http://mis.nyiso.com/public/csv/damlbmp/{ym}01damlbmp_zone_csv.zip"
+_NYISO_RECENT_CSV_URL  = "https://mis.nyiso.com/public/csv/damlbmp/{date}damlbmp_zone.csv"
+_NYISO_RECENT_DAYS     = 7   # use individual CSVs only for the most recent days
+
+
+def _parse_nyiso_csv(text: str) -> dict[str, list[float]]:
+    """
+    Parse NYISO DA LMP CSV → {date_str: [lmp, ...]}.
+    NYISO timestamps are 'MM/DD/YYYY HH:MM' — convert to YYYY-MM-DD.
+    """
+    price_by_date: dict[str, list[float]] = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        ts = row.get("Time Stamp", "")
+        if not ts:
+            continue
+        # Parse MM/DD/YYYY HH:MM → YYYY-MM-DD
+        try:
+            parts = ts.split()[0].split("/")   # ['MM', 'DD', 'YYYY']
+            d = f"{parts[2]}-{parts[0]:0>2}-{parts[1]:0>2}"
+        except (IndexError, ValueError):
+            continue
+        try:
+            price_by_date.setdefault(d, []).append(float(row["LBMP ($/MWHr)"]))
+        except (KeyError, ValueError, TypeError):
+            pass
+    return price_by_date
+
+
 def _fetch_nyiso_price_history(days: int = 90) -> list:
     """
-    Fetch NYISO day-ahead zone LMP history from NYISO's public CSV files.
-    No authentication required. Pairs with EIA load for the regression model.
+    Fetch NYISO day-ahead zone LMP history.
+    - History (> 7 days old): monthly zip archives from mis.nyiso.com
+    - Recent (≤ 7 days): individual daily CSV files
+    No authentication required.
     """
     end_dt   = date.today() - timedelta(days=1)
     start_dt = end_dt - timedelta(days=days - 1)
     session  = requests.Session()
     session.headers["User-Agent"] = "grid-dashboard/1.0"
 
+    price_by_date: dict[str, list[float]] = {}
+
+    # --- Monthly zip archives for bulk history ---
+    archive_end = end_dt - timedelta(days=_NYISO_RECENT_DAYS)
+    if start_dt <= archive_end:
+        months: list[tuple[int, int]] = []
+        cur = start_dt.replace(day=1)
+        while cur <= archive_end:
+            months.append((cur.year, cur.month))
+            cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+        def _fetch_month_zip(ym: tuple[int, int]) -> dict[str, list[float]]:
+            year, month = ym
+            url = _NYISO_MONTHLY_ZIP_URL.format(ym=f"{year}{month:02d}")
+            try:
+                r = session.get(url, timeout=60)
+                if r.status_code != 200 or not r.content:
+                    return {}
+                result: dict[str, list[float]] = {}
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    for name in z.namelist():
+                        if not name.endswith(".csv"):
+                            continue
+                        text = z.read(name).decode("utf-8", errors="replace")
+                        for d, prices in _parse_nyiso_csv(text).items():
+                            result.setdefault(d, []).extend(prices)
+                return result
+            except Exception:
+                return {}
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for month_data in pool.map(_fetch_month_zip, months):
+                for d, prices in month_data.items():
+                    price_by_date.setdefault(d, []).extend(prices)
+
+    # --- Individual CSVs for recent days ---
+    recent_start = max(start_dt, end_dt - timedelta(days=_NYISO_RECENT_DAYS - 1))
+
     def _fetch_day(d: date):
-        url = _NYISO_LMP_URL.format(date=d.strftime("%Y%m%d"))
+        url = _NYISO_RECENT_CSV_URL.format(date=d.strftime("%Y%m%d"))
         try:
             r = session.get(url, timeout=15)
             if r.status_code != 200:
-                return d.isoformat(), None
-            reader = csv.DictReader(io.StringIO(r.text))
-            prices = []
-            for row in reader:
-                try:
-                    prices.append(float(row["LBMP ($/MWHr)"]))
-                except (KeyError, ValueError, TypeError):
-                    pass
-            return d.isoformat(), (sum(prices) / len(prices)) if prices else None
+                return {}
+            return _parse_nyiso_csv(r.text)
         except Exception:
-            return d.isoformat(), None
+            return {}
 
-    dates = [end_dt - timedelta(days=i) for i in range(days)]
-    price_by_date: dict = {}
+    recent_dates = [recent_start + timedelta(days=i)
+                    for i in range((end_dt - recent_start).days + 1)]
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for d_str, price in pool.map(_fetch_day, dates):
-            if price is not None:
-                price_by_date[d_str] = price
+        for day_data in pool.map(_fetch_day, recent_dates):
+            for d, prices in day_data.items():
+                price_by_date.setdefault(d, []).extend(prices)
+
+    # Average prices per day and filter to requested window
+    target = {(end_dt - timedelta(days=i)).isoformat() for i in range(days)}
+    daily_price = {
+        d: sum(vs) / len(vs)
+        for d, vs in price_by_date.items()
+        if vs and d in target
+    }
 
     daily_load = _eia_load_daily("NYIS", start_dt.isoformat(), end_dt.isoformat())
 
     result = []
-    for d in sorted(set(price_by_date) & set(daily_load)):
+    for d in sorted(set(daily_price) & set(daily_load)):
         result.append({
             "date":          d,
             "load_mw":       round(daily_load[d]),
-            "price_usd_mwh": round(price_by_date[d], 2),
+            "price_usd_mwh": round(daily_price[d], 2),
         })
 
-    log.info("NYISO: fetched %d days of price history (NYISO CSV + EIA load)", len(result))
+    log.info("NYISO: fetched %d days of price history (monthly zips + EIA load)", len(result))
     return result
 
 
@@ -399,6 +526,8 @@ def _fetch_miso_price_history(days: int = 90) -> list:
 
     dates = [end_dt - timedelta(days=i) for i in range(days)]
     price_by_date: dict = {}
+    # Cap at 5 workers — MISO files are ~1MB each; too many concurrent requests
+    # overwhelm both the server and the local connection
     with ThreadPoolExecutor(max_workers=5) as pool:
         for d_str, price in pool.map(_fetch_day, dates):
             if price is not None:
@@ -440,33 +569,42 @@ def _fetch_caiso_price_history(days: int = 90) -> list:
         chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end_dt + timedelta(days=1))
         start_str = chunk_start.strftime("%Y%m%dT00:00-0000")
         end_str   = chunk_end.strftime("%Y%m%dT00:00-0000")
-        try:
-            r = session.get(
-                _CAISO_OASIS_URL,
-                params={
-                    "queryname":     "PRC_LMP",
-                    "market_run_id": "DAM",
-                    "node":          ",".join(_CAISO_HUB_NODES),
-                    "startdatetime": start_str,
-                    "enddatetime":   end_str,
-                    "version":       1,
-                    "resultformat":  6,
-                },
-                timeout=60,
-            )
-            if r.status_code == 200 and r.content:
-                z = zipfile.ZipFile(io.BytesIO(r.content))
-                raw = z.read(z.namelist()[0]).decode("utf-8")
-                for row in csv.DictReader(raw.splitlines()):
-                    if row.get("LMP_TYPE", "").strip() != "LMP":
-                        continue
-                    d = row.get("OPR_DT", "")[:10]
-                    try:
-                        price_by_date.setdefault(d, []).append(float(row.get("MW", "nan")))
-                    except (ValueError, TypeError):
-                        pass
-        except Exception:
-            log.warning("CAISO OASIS: request failed for %s -> %s", start_str, end_str)
+        for attempt in range(3):
+            try:
+                r = session.get(
+                    _CAISO_OASIS_URL,
+                    params={
+                        "queryname":     "PRC_LMP",
+                        "market_run_id": "DAM",
+                        "node":          ",".join(_CAISO_HUB_NODES),
+                        "startdatetime": start_str,
+                        "enddatetime":   end_str,
+                        "version":       1,
+                        "resultformat":  6,
+                    },
+                    timeout=60,
+                )
+                if r.status_code == 429:
+                    wait = 10 * (attempt + 1)
+                    log.info("CAISO OASIS: rate-limited, waiting %ds", wait)
+                    time.sleep(wait)
+                    continue
+                if r.status_code == 200 and r.content:
+                    z = zipfile.ZipFile(io.BytesIO(r.content))
+                    raw = z.read(z.namelist()[0]).decode("utf-8")
+                    for row in csv.DictReader(raw.splitlines()):
+                        if row.get("LMP_TYPE", "").strip() != "LMP":
+                            continue
+                        d = row.get("OPR_DT", "")[:10]
+                        try:
+                            price_by_date.setdefault(d, []).append(float(row.get("MW", "nan")))
+                        except (ValueError, TypeError):
+                            pass
+                break
+            except Exception:
+                log.warning("CAISO OASIS: request failed for %s -> %s", start_str, end_str)
+                break
+        time.sleep(5)   # polite inter-chunk delay to avoid 429s
         chunk_start = chunk_end
 
     target = {(end_dt - timedelta(days=i)).isoformat() for i in range(days)}
@@ -490,10 +628,173 @@ def _fetch_caiso_price_history(days: int = 90) -> list:
     return result
 
 
+def _fetch_pjm_price_history(days: int = 90) -> list:
+    """
+    Fetch PJM day-ahead LMPs from PJM DataMiner2 API (Western Hub, pnode_id=1).
+    Requires PJM_API_KEY env var — free registration at pjm.com/data/dataminer.
+    Pairs with EIA PJM demand for the regression model.
+    """
+    if not _PJM_DATAMINER_KEY:
+        log.info("PJM: no DataMiner2 key — set PJM_API_KEY (free at pjm.com)")
+        return []
+
+    end_dt   = date.today() - timedelta(days=1)
+    start_dt = end_dt - timedelta(days=days - 1)
+    session  = requests.Session()
+    session.headers["Ocp-Apim-Subscription-Key"] = _PJM_DATAMINER_KEY
+    session.headers["User-Agent"] = "grid-dashboard/1.0"
+
+    price_by_date: dict = {}
+    start_row = 1
+    page_size = 50000
+
+    while True:
+        try:
+            r = session.get(
+                _PJM_DATAMINER_URL,
+                params={
+                    "startRow":               start_row,
+                    "endRow":                 start_row + page_size - 1,
+                    "pnode_id":               _PJM_WESTERN_HUB_ID,
+                    "datetime_beginning_ept": start_dt.strftime("%Y-%m-%d 00:00"),
+                    "datetime_ending_ept":    end_dt.strftime("%Y-%m-%d 23:00"),
+                },
+                timeout=60,
+            )
+            if r.status_code != 200:
+                log.warning("PJM DataMiner2: HTTP %d", r.status_code)
+                break
+            reader = csv.DictReader(io.StringIO(r.text))
+            rows = list(reader)
+            if not rows:
+                break
+            for row in rows:
+                period = (row.get("datetime_beginning_ept") or row.get("DateTime Beginning (EPT)") or "")[:10]
+                lmp_raw = row.get("total_lmp_da") or row.get("Total LMP DA") or row.get("LMP")
+                if period and lmp_raw:
+                    try:
+                        price_by_date.setdefault(period, []).append(float(lmp_raw))
+                    except (ValueError, TypeError):
+                        pass
+            if len(rows) < page_size:
+                break
+            start_row += page_size
+        except Exception:
+            log.exception("PJM DataMiner2: price fetch failed")
+            break
+
+    if not price_by_date:
+        return []
+
+    daily_load = _eia_load_daily("PJM", start_dt.isoformat(), end_dt.isoformat())
+
+    result = []
+    for d in sorted(set(price_by_date) & set(daily_load)):
+        result.append({
+            "date":          d,
+            "load_mw":       round(daily_load[d]),
+            "price_usd_mwh": round(sum(price_by_date[d]) / len(price_by_date[d]), 2),
+        })
+
+    log.info("PJM: fetched %d days of price history (DataMiner2 + EIA load)", len(result))
+    return result
+
+
+def _fetch_ercot_price_history(days: int = 90) -> list:
+    """
+    Fetch ERCOT day-ahead settlement point prices from ERCOT's report API.
+    Requires ERCOT_API_KEY + ERCOT_USERNAME + ERCOT_PASSWORD (api.ercot.com).
+    Uses HB_BUSAVG hub (load-weighted average) when available, falls back to hub average.
+    Pairs with EIA ERCOT (TEX) demand data for the regression model.
+    """
+    if not _ERCOT_API_KEY:
+        log.info("ERCOT: no API key — set ERCOT_API_KEY (register at api.ercot.com)")
+        return []
+
+    bearer = _ercot_bearer_token()
+    if not bearer:
+        log.info("ERCOT: no OAuth token — set ERCOT_USERNAME + ERCOT_PASSWORD")
+        return []
+
+    end_dt   = date.today() - timedelta(days=1)
+    start_dt = end_dt - timedelta(days=days - 1)
+    session  = requests.Session()
+    session.headers["User-Agent"]                = "grid-dashboard/1.0"
+    session.headers["Ocp-Apim-Subscription-Key"] = _ERCOT_API_KEY
+    session.headers["Authorization"]             = f"Bearer {bearer}"
+
+    # NP4-190-CD returns array-format rows: [deliveryDate, hourEnding, settlementPoint, price, DSTFlag]
+    # Filter at API level for HB_BUSAVG to avoid fetching all ~26k rows/day.
+    # Fall back to HB_HUBAVG if HB_BUSAVG returns nothing.
+    def _fetch_hub(hub: str) -> dict[str, list[float]]:
+        by_date: dict[str, list[float]] = {}
+        page = 1
+        page_size = 8760  # 365 days × 24h fits in one page
+        while True:
+            try:
+                r = session.get(
+                    _ERCOT_NP_URL,
+                    params={
+                        "deliveryDateFrom": start_dt.strftime("%Y-%m-%d"),
+                        "deliveryDateTo":   end_dt.strftime("%Y-%m-%d"),
+                        "settlementPoint":  hub,
+                        "size":             page_size,
+                        "page":             page,
+                    },
+                    timeout=60,
+                )
+                if r.status_code != 200:
+                    log.warning("ERCOT NP API: HTTP %d for %s", r.status_code, hub)
+                    break
+                payload = r.json()
+                rows = payload.get("data", [])
+                for row in rows:
+                    # row = [deliveryDate, hourEnding, settlementPoint, price, DSTFlag]
+                    if not isinstance(row, (list, tuple)) or len(row) < 4:
+                        continue
+                    d = str(row[0])[:10]
+                    try:
+                        by_date.setdefault(d, []).append(float(row[3]))
+                    except (TypeError, ValueError):
+                        pass
+                total = payload.get("_meta", {}).get("totalRecords", len(rows))
+                if page * page_size >= total or len(rows) < page_size:
+                    break
+                page += 1
+            except Exception as exc:
+                log.warning("ERCOT NP API: page %d failed: %s", page, exc)
+                break
+        return by_date
+
+    price_by_date = _fetch_hub("HB_BUSAVG")
+    if not price_by_date:
+        log.info("ERCOT: HB_BUSAVG empty, trying HB_HUBAVG")
+        price_by_date = _fetch_hub("HB_HUBAVG")
+
+    daily_prices = {d: sum(v) / len(v) for d, v in price_by_date.items() if v}
+
+    if not daily_prices:
+        log.info("ERCOT: NP4-190-CD returned no hub price data")
+        return []
+
+    daily_load = _eia_load_daily("TEX", start_dt.isoformat(), end_dt.isoformat())
+
+    result = []
+    for d in sorted(set(daily_prices) & set(daily_load)):
+        result.append({
+            "date":          d,
+            "load_mw":       round(daily_load[d]),
+            "price_usd_mwh": round(daily_prices[d], 2),
+        })
+
+    log.info("ERCOT: fetched %d days of price history (NP4-190-CD + EIA load)", len(result))
+    return result
+
+
 def fetch_price_history(iso: str, days: int = 90) -> list:
     """
     Return [{date, load_mw, price_usd_mwh}] for the last `days` days.
-    Dispatches to ISO-specific fetchers for CAISO, NYISO, ISO-NE, and SPP.
+    Dispatches to ISO-specific fetchers for all supported ISOs.
     """
     if iso == "caiso":
         return _fetch_caiso_price_history(days)
@@ -505,60 +806,30 @@ def fetch_price_history(iso: str, days: int = 90) -> list:
         return _fetch_isone_price_history(days)
     if iso == "spp":
         return _fetch_spp_price_history(days)
+    if iso == "pjm":
+        return _fetch_pjm_price_history(days)
+    if iso == "ercot":
+        return _fetch_ercot_price_history(days)
 
-    cfg = _ISO_EIA.get(iso)
-    if not cfg:
-        return []
+    log.info("%s: no price fetcher configured", iso.upper())
+    return []
 
-    end_dt   = date.today() - timedelta(days=1)
-    start_dt = end_dt - timedelta(days=days)
-    start, end = start_dt.isoformat(), end_dt.isoformat()
 
-    load_rows = _eia_get(_EIA_LOAD_URL, {
-        "frequency":            "hourly",
-        "data[0]":              "value",
-        "facets[respondent][]": cfg["load_region"],
-        "facets[type][]":       "D",
-        "start": start, "end": end, "length": 5000,
-    })
-    price_rows = _eia_get(_EIA_PRICE_URL, {
-        "frequency":            "hourly",
-        "data[0]":              "price",
-        "facets[respondent][]": cfg["price_region"],
-        "facets[type][]":       cfg["price_type"],
-        "start": start, "end": end, "length": 5000,
-    })
-
-    daily_load:  dict = {}
-    daily_price: dict = {}
-
-    for row in load_rows:
-        d = row.get("period", "")[:10]
-        v = row.get("value")
-        if d and v is not None:
-            daily_load.setdefault(d, []).append(float(v))
-
-    for row in price_rows:
-        d = row.get("period", "")[:10]
-        v = row.get("price")
-        if d and v is not None:
-            try:
-                daily_price.setdefault(d, []).append(float(v))
-            except (TypeError, ValueError):
-                pass
-
-    result = []
-    for d in sorted(set(daily_load) & set(daily_price)):
-        load_vals  = daily_load[d]
-        price_vals = daily_price[d]
-        result.append({
-            "date":          d,
-            "load_mw":       round(sum(load_vals)  / len(load_vals)),
-            "price_usd_mwh": round(sum(price_vals) / len(price_vals), 2),
-        })
-
-    log.info("%s: fetched %d days of load+price history from EIA", iso.upper(), len(result))
-    return result
+def price_unavailable_reason(iso: str) -> str:
+    """Return a user-facing explanation of why price data is unavailable for this ISO."""
+    if iso == "pjm":
+        if not os.environ.get("PJM_API_KEY"):
+            return "Set PJM_API_KEY for price data (free at pjm.com/data/dataminer)"
+        return "PJM price data temporarily unavailable"
+    if iso == "ercot":
+        if not os.environ.get("ERCOT_API_KEY"):
+            return "Set ERCOT_API_KEY for price data (register at api.ercot.com)"
+        return "ERCOT price data temporarily unavailable"
+    if iso == "isone":
+        if not os.environ.get("ISONE_API_USER"):
+            return "Set ISONE_API_USER + ISONE_API_PASS for price data (iso-ne.com)"
+        return "ISO-NE price data temporarily unavailable"
+    return "Price data unavailable for this ISO"
 
 
 def _attach_ng_prices(history: list) -> list:
@@ -591,6 +862,20 @@ def _fit_price_model(history: list) -> dict | None:
     if len(rows) < 7:
         log.warning("Insufficient price history for regression (%d rows)", len(rows))
         return None
+
+    # Winsorise extreme price spikes before fitting — scarcity events ($500+/MWh)
+    # bias the OLS log-linear seasonal coefficients upward, producing winter base
+    # forecasts that look like scarcity, not normal weather.
+    # Cap: 3× the 95th percentile of the raw price distribution.
+    prices_sorted = sorted(r["price_usd_mwh"] for r in rows)
+    p95_idx  = max(0, int(0.95 * len(prices_sorted)) - 1)
+    p95      = prices_sorted[p95_idx]
+    winsor_cap = 3.0 * p95
+    n_winsorised = sum(1 for r in rows if r["price_usd_mwh"] > winsor_cap)
+    if n_winsorised:
+        log.info("Price model: winsorising %d rows above $%.0f/MWh (3×p95 $%.0f)",
+                 n_winsorised, winsor_cap, p95)
+    rows = [{**r, "price_usd_mwh": min(r["price_usd_mwh"], winsor_cap)} for r in rows]
 
     rows_with_ng = [r for r in rows if r.get("ng_price") and r["ng_price"] > 0]
     use_ng = len(rows_with_ng) >= len(rows) // 2
@@ -657,6 +942,18 @@ def forecast_prices(iso: str, load_forecast: list) -> list:
     ng_vals = [r["ng_price"] for r in history if r.get("ng_price") and r["ng_price"] > 0]
     ng_forecast = sum(ng_vals[-7:]) / len(ng_vals[-7:]) if ng_vals else None
 
+    # Sanity bounds: reject forecast if regression wildly extrapolates
+    train_prices = [r["price"] for r in history if r.get("price") and r["price"] > 0]
+    max_train_price = max(train_prices) if train_prices else 500.0
+    price_ceiling = max(max_train_price * 20, 2000.0)   # 20× max training price or $2000
+
+    # Reject entire forecast if training data spans < 30 days (seasonal regression unreliable)
+    unique_months = {date.fromisoformat(r["date"]).month for r in history if r.get("date")}
+    if len(unique_months) < 2:
+        log.warning("%s: price history spans only 1 calendar month — forecast suppressed to avoid extrapolation",
+                    iso.upper())
+        return []
+
     results = []
     for day in load_forecast:
         load_mw = day.get("mean_load_gw", 0) * 1000
@@ -679,6 +976,12 @@ def forecast_prices(iso: str, load_forecast: list) -> list:
             continue
 
         price = math.exp(sum(c * xi for c, xi in zip(coeffs, x)))
+
+        if price > price_ceiling:
+            log.warning("%s: predicted price $%.0f/MWh exceeds sanity ceiling $%.0f — suppressing forecast",
+                        iso.upper(), price, price_ceiling)
+            return []
+
         results.append({
             "date":           day["date"],
             "forecast_price": round(price, 2),

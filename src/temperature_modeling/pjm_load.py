@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 HDD_CDD_BASE_F: float = 65.0   # standard base temperature for HDD/CDD calculation
 UNCERTAINTY_Z:  float = 1.645  # z-score for 90% confidence interval (5th/95th pct)
-N_FEATURES:     int   = 31     # total feature vector length expected by the model
+N_FEATURES:     int   = 34     # total feature vector length expected by the model
 
 try:
     import holidays as _holidays_lib
@@ -398,6 +398,13 @@ def build_load_training_data(
         roll7_vals = [v for v in roll7_vals if v is not None]
         rolling7_f = sum(roll7_vals) / len(roll7_vals) if roll7_vals else None
 
+        # Load autocorrelation lags
+        load_lag1 = load_daily.get(d - timedelta(days=1))
+        load_lag7 = load_daily.get(d - timedelta(days=7))
+        ll_vals = [load_daily.get(d - timedelta(days=k)) for k in range(1, 8)]
+        ll_vals = [v for v in ll_vals if v is not None]
+        rolling7_load = sum(ll_vals) / len(ll_vals) if ll_vals else None
+
         obs.append(LoadObservation(
             date=d,
             hdd=hdd, cdd=cdd,
@@ -413,9 +420,12 @@ def build_load_training_data(
             temp_lag2_f=lag2_f,
             temp_lag7_f=lag7_f,
             rolling7_avg_f=rolling7_f,
-            apparent_hi_f=apparent_hi_by_date.get(d),           # already °F (via weighted_avg_temp_f)
-            dewpoint_hi_f=dewpoint_hi_by_date.get(d),        # already °F (via weighted_avg_temp_f)
+            apparent_hi_f=apparent_hi_by_date.get(d),
+            dewpoint_hi_f=dewpoint_hi_by_date.get(d),
             wind_speed_mph=wind_speed_by_date.get(d),
+            load_lag1_mw=load_lag1,
+            load_lag7_mw=load_lag7,
+            rolling7_load_mw=rolling7_load,
         ))
     return obs
 
@@ -436,6 +446,9 @@ def _build_features(
     apparent_hi_f: Optional[float] = None,   # daily max apparent temp (heat index) °F
     dewpoint_hi_f: Optional[float] = None,   # daily max dewpoint temperature (°F)
     wind_speed_mph: Optional[float] = None,  # daily max 10m wind speed (mph)
+    load_lag1_mw:  Optional[float] = None,   # yesterday's actual load (MW)
+    load_lag7_mw:  Optional[float] = None,   # 7-days-ago actual load (MW)
+    rolling7_load_mw: Optional[float] = None, # 7-day rolling avg load (MW)
 ) -> Tuple[list, float, float]:
     hdd, cdd       = compute_hdd_cdd(avg_f)
     hdd_hi, cdd_hi = compute_hdd_cdd(hi_f)
@@ -480,8 +493,12 @@ def _build_features(
         humid_cdd,                                 # positive humidity amplification (1)
         dew_depression,                            # dewpoint depression (°F) (1)
         wind_mph,                                  # max wind speed (mph) (1)
+        # Load autocorrelation features (0.0 = missing sentinel; XGBoost handles gracefully)
+        load_lag1_mw      if load_lag1_mw      is not None else 0.0,  # yesterday load (MW)
+        load_lag7_mw      if load_lag7_mw      is not None else 0.0,  # 7-days-ago load (MW)
+        rolling7_load_mw  if rolling7_load_mw  is not None else 0.0,  # 7-day rolling load (MW)
     ]
-    return features, hdd, cdd  # 31 features total
+    return features, hdd, cdd  # 34 features total
 
 
 def _obs_to_features(o: LoadObservation) -> list:
@@ -497,6 +514,9 @@ def _obs_to_features(o: LoadObservation) -> list:
         apparent_hi_f=o.apparent_hi_f,
         dewpoint_hi_f=o.dewpoint_hi_f,
         wind_speed_mph=o.wind_speed_mph,
+        load_lag1_mw=o.load_lag1_mw,
+        load_lag7_mw=o.load_lag7_mw,
+        rolling7_load_mw=o.rolling7_load_mw,
     )
     return feats
 
@@ -509,7 +529,11 @@ class LoadCorrectionModel:
     """XGBoost model: daily PJM RTO load (MW) from temperature features."""
 
     def __init__(self):
-        self._model = None
+        self._model     = None
+        self._model_p10 = None   # p10 quantile model (lower confidence band)
+        self._model_p90 = None   # p90 quantile model (upper confidence band)
+        self._conformal_width_mw: Optional[float] = None  # symmetric conformal bound
+        self._cqr_delta: Optional[float] = None           # CQR calibration offset (MW)
 
     def fit(self, observations: List[LoadObservation]) -> "LoadCorrectionModel":
         try:
@@ -520,15 +544,56 @@ class LoadCorrectionModel:
         X = [_obs_to_features(o) for o in observations]
         y = [o.actual_load_mw for o in observations]
 
-        self._model = XGBRegressor(
-            n_estimators=500,
-            max_depth=5,
-            learning_rate=0.04,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
+        # Reserve last 20% as calibration set; quantile models trained on 80%
+        # so calibration residuals are truly out-of-sample for the quantile models.
+        n = len(observations)
+        n_cal   = min(200, max(30, n // 5))
+        n_train = n - n_cal
+        X_train, y_train = X[:n_train], y[:n_train]
+        X_cal,   y_cal   = X[n_train:],  y[n_train:]
+
+        _base_params = dict(
+            n_estimators=500, max_depth=5, learning_rate=0.04,
+            subsample=0.8, colsample_bytree=0.8, random_state=42,
         )
+        # Main model: trained on ALL data for best point-forecast generalisation
+        self._model = XGBRegressor(**_base_params)
         self._model.fit(X, y)
+
+        # Quantile models: trained on 80% so calibration set is out-of-sample
+        try:
+            self._model_p10 = XGBRegressor(
+                **_base_params, objective="reg:quantileerror", quantile_alpha=0.1,
+            )
+            self._model_p10.fit(X_train, y_train)
+            self._model_p90 = XGBRegressor(
+                **_base_params, objective="reg:quantileerror", quantile_alpha=0.9,
+            )
+            self._model_p90.fit(X_train, y_train)
+            log.info("Quantile models (p10/p90) trained OK")
+        except Exception:
+            log.warning("Quantile model training failed — falling back to GEFS spread")
+            self._model_p10 = None
+            self._model_p90 = None
+
+        # ── Conformal calibration (Romano et al. 2019 CQR + symmetric fallback) ──
+        q_idx = min(int(math.ceil(0.90 * (n_cal + 1))) - 1, n_cal - 1)
+
+        cal_mean = list(self._model.predict(X_cal))
+        scores   = sorted(abs(a - p) for a, p in zip(y_cal, cal_mean))
+        self._conformal_width_mw = float(scores[q_idx])
+
+        if self._model_p10 is not None:
+            cal_p10 = list(self._model_p10.predict(X_cal))
+            cal_p90 = list(self._model_p90.predict(X_cal))
+            # CQR score: > 0 means interval missed y; < 0 means y was inside
+            cqr = sorted(max(p10 - y, y - p90) for y, p10, p90 in zip(y_cal, cal_p10, cal_p90))
+            self._cqr_delta = float(cqr[q_idx])
+            log.info("CQR calibration: δ=%.0f MW, symmetric width=%.0f MW",
+                     self._cqr_delta, self._conformal_width_mw)
+        else:
+            self._cqr_delta = None
+
         return self
 
     def predict(self, feature_rows: List[list]) -> List[float]:
@@ -560,12 +625,13 @@ class LoadCorrectionModel:
         forecast_lo_c:         Dict[str, List[float]],  # daily low °C per location
         gefs_spread_c:         Dict[str, List[float]],  # GEFS spread °C (optional)
         forecast_dates:        List[date],
-        recent_avg_temps_f:    List[float] = None,      # [T-2, T-1] actual °F for lag init
+        recent_avg_temps_f:    List[float] = None,      # recent actual avg temps °F (oldest→newest)
         locations=None,                                  # ISO location list; defaults to PJM
         weighted_avg_fn=None,                            # ISO weighted-avg fn; defaults to PJM's
         forecast_apparent_hi_c: Dict[str, List[float]] = None,  # apparent_temp_max °C per location
         forecast_dewpoint_c:    Dict[str, List[float]] = None,  # dew_point_2m_max °C per location
         forecast_wind_kph:      Dict[str, List[float]] = None,  # wind_speed_10m_max km/h per location
+        recent_actual_loads_mw: List[float] = None,     # recent actual daily loads MW (oldest→newest)
     ) -> List[LoadForecast]:
         """
         Produce a LoadForecast for each date, propagating temperature
@@ -593,7 +659,6 @@ class LoadCorrectionModel:
             j = i - lag
             if j >= 0:
                 return forecast_avg_f[j]
-            # Before the forecast window — use recent actual temps if provided
             if recent_avg_temps_f is not None:
                 idx = len(recent_avg_temps_f) + j  # j is negative
                 if 0 <= idx < len(recent_avg_temps_f):
@@ -602,6 +667,25 @@ class LoadCorrectionModel:
 
         def _rolling7(i):
             vals = [_lag(i, k) for k in range(7)]
+            vals = [v for v in vals if v is not None]
+            return sum(vals) / len(vals) if vals else None
+
+        # Load autocorrelation lag helpers: use forecast mean for future days,
+        # recent actuals for pre-forecast days (mirrors temperature lag pattern)
+        forecast_mean_loads: List[Optional[float]] = []
+
+        def _load_lag(i, lag):
+            j = i - lag
+            if j >= 0:
+                return forecast_mean_loads[j] if j < len(forecast_mean_loads) else None
+            if recent_actual_loads_mw is not None:
+                idx = len(recent_actual_loads_mw) + j
+                if 0 <= idx < len(recent_actual_loads_mw):
+                    return recent_actual_loads_mw[idx]
+            return None
+
+        def _rolling7_load(i):
+            vals = [_load_lag(i, k) for k in range(1, 8)]
             vals = [v for v in vals if v is not None]
             return sum(vals) / len(vals) if vals else None
 
@@ -662,34 +746,60 @@ class LoadCorrectionModel:
             lag2  = _lag(i, 2)
             lag7  = _lag(i, 7)
             roll7 = _rolling7(i)
+            ll1   = _load_lag(i, 1)
+            ll7   = _load_lag(i, 7)
+            ll_r7 = _rolling7_load(i)
 
             feats, hdd, cdd = _build_features(avg_f, hi_f, lo_f, d, lag1, lag2, lag7, roll7,
                                                apparent_hi_f=app_hi_f,
                                                dewpoint_hi_f=dew_hi_f,
-                                               wind_speed_mph=wind_f)
+                                               wind_speed_mph=wind_f,
+                                               load_lag1_mw=ll1,
+                                               load_lag7_mw=ll7,
+                                               rolling7_load_mw=ll_r7)
             mean_load = self.predict([feats])[0]
+            forecast_mean_loads.append(mean_load)  # used as lag for subsequent days
 
-            # Uncertainty from GEFS spread
-            total_w = total_ws = 0.0
-            for loc in _locs:
-                spreads = gefs_spread_c.get(loc["label"])
-                if spreads and i < len(spreads) and spreads[i] is not None:
-                    w = loc["weight"]
-                    total_ws += w * spreads[i] * 9 / 5
-                    total_w  += w
-            spread_f = (total_ws / total_w) if total_w > 0 else 3.0  # fallback 3°F
-
-            z = UNCERTAINTY_Z
-            low_feats,  _, _ = _build_features(avg_f - z * spread_f, hi_f - z * spread_f,
-                                                lo_f - z * spread_f, d, lag1, lag2, lag7, roll7,
-                                                apparent_hi_f=app_hi_f,
-                                                dewpoint_hi_f=dew_hi_f, wind_speed_mph=wind_f)
-            high_feats, _, _ = _build_features(avg_f + z * spread_f, hi_f + z * spread_f,
-                                                lo_f + z * spread_f, d, lag1, lag2, lag7, roll7,
-                                                apparent_hi_f=app_hi_f,
-                                                dewpoint_hi_f=dew_hi_f, wind_speed_mph=wind_f)
-            p_low  = self.predict([low_feats])[0]
-            p_high = self.predict([high_feats])[0]
+            # Confidence bands: prefer CQR-calibrated quantile models; fall back to GEFS spread
+            if self._model_p10 is not None and self._model_p90 is not None:
+                p_low  = float(self._model_p10.predict([feats])[0])
+                p_high = float(self._model_p90.predict([feats])[0])
+                # Apply CQR calibration — guarantees ≥90% empirical coverage
+                # Use getattr for backward-compat with PKLs trained before conformal was added
+                cqr_delta = getattr(self, '_cqr_delta', None)
+                if cqr_delta is not None:
+                    delta = max(0.0, cqr_delta)
+                    p_low  -= delta
+                    p_high += delta
+            else:
+                total_w = total_ws = 0.0
+                for loc in _locs:
+                    spreads = gefs_spread_c.get(loc["label"])
+                    if spreads and i < len(spreads) and spreads[i] is not None:
+                        w = loc["weight"]
+                        total_ws += w * spreads[i] * 9 / 5
+                        total_w  += w
+                spread_f = (total_ws / total_w) if total_w > 0 else 3.0
+                z = UNCERTAINTY_Z
+                low_feats,  _, _ = _build_features(avg_f - z * spread_f, hi_f - z * spread_f,
+                                                    lo_f - z * spread_f, d, lag1, lag2, lag7, roll7,
+                                                    apparent_hi_f=app_hi_f,
+                                                    dewpoint_hi_f=dew_hi_f, wind_speed_mph=wind_f,
+                                                    load_lag1_mw=ll1, load_lag7_mw=ll7,
+                                                    rolling7_load_mw=ll_r7)
+                high_feats, _, _ = _build_features(avg_f + z * spread_f, hi_f + z * spread_f,
+                                                    lo_f + z * spread_f, d, lag1, lag2, lag7, roll7,
+                                                    apparent_hi_f=app_hi_f,
+                                                    dewpoint_hi_f=dew_hi_f, wind_speed_mph=wind_f,
+                                                    load_lag1_mw=ll1, load_lag7_mw=ll7,
+                                                    rolling7_load_mw=ll_r7)
+                p_low  = self.predict([low_feats])[0]
+                p_high = self.predict([high_feats])[0]
+                # Apply symmetric conformal width if available (getattr for backward compat)
+                conf_w = getattr(self, '_conformal_width_mw', None)
+                if conf_w is not None:
+                    p_low  = mean_load - conf_w
+                    p_high = mean_load + conf_w
 
             results.append(LoadForecast(
                 valid_date=d,
@@ -764,6 +874,9 @@ def run_load_backtest(
                 apparent_hi_f=r.get("apparent_hi_f"),
                 dewpoint_hi_f=r.get("dewpoint_hi_f"),
                 wind_speed_mph=r.get("wind_speed_mph"),
+                load_lag1_mw=r.get("load_lag1_mw"),
+                load_lag7_mw=r.get("load_lag7_mw"),
+                rolling7_load_mw=r.get("rolling7_load_mw"),
             ))
         except (KeyError, ValueError):
             continue
@@ -772,6 +885,17 @@ def run_load_backtest(
         return {}
 
     obs.sort(key=lambda o: o.date)
+
+    # Compute load autocorrelation lags from actual_load_mw if not stored in JSON
+    if obs and obs[0].load_lag1_mw is None:
+        load_by_date = {o.date: o.actual_load_mw for o in obs}
+        for o in obs:
+            o.load_lag1_mw = load_by_date.get(o.date - timedelta(days=1))
+            o.load_lag7_mw = load_by_date.get(o.date - timedelta(days=7))
+            vals = [load_by_date.get(o.date - timedelta(days=k)) for k in range(1, 8)]
+            vals = [v for v in vals if v is not None]
+            o.rolling7_load_mw = sum(vals) / len(vals) if vals else None
+
     features      = [_obs_to_features(o) for o in obs]
     predicted_mw  = model.predict(features)
 

@@ -9,7 +9,7 @@ pinned: false
 
 # Grid Load & Price Dashboard
 
-15-day electricity load forecast and day-ahead price analysis for PJM and CAISO ISO territories.
+15-day electricity load forecasts, day-ahead price outlooks, and 12-month forward price curves for all 7 major US ISOs: PJM, CAISO, ERCOT, MISO, NYISO, ISO-NE, and SPP.
 
 ## Installation
 

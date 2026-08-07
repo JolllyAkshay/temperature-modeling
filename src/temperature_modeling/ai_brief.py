@@ -17,6 +17,7 @@ from datetime import date
 from pathlib import Path
 
 from ._llm import complete, is_available, provider_label
+from .verification import load_verification_stats
 
 log = logging.getLogger(__name__)
 
@@ -40,11 +41,17 @@ _ISO_CONTEXT = {
 
 _BRIEF_SYSTEM = (
     "You are an expert energy market analyst specialising in US electricity grid operations. "
-    "Write concise, factual, analyst-style forecast briefs for grid operators and energy traders. "
-    "Be precise with numbers. "
-    "If any day in the forecast shows avg_temp_f above 90°F or below 20°F, open with that weather "
-    "alert and its projected load impact before anything else. Otherwise lead with the peak load date "
-    "and magnitude. Write in flowing prose — no bullet points, no headers — 3 to 5 sentences maximum."
+    "You receive a multi-signal intelligence package — load forecast, historical percentile rank, "
+    "SHAP model attribution, real-time carbon intensity, demand-response windows, and price outlook. "
+    "Your job is to synthesise these into ONE coherent 4-5 sentence analyst narrative that connects "
+    "the signals and delivers a concrete, actionable insight. "
+    "Do NOT list the signals separately. Weave them into a story: WHY is load at this level, "
+    "WHAT does it mean for carbon and price, and WHAT should a grid operator or flexible load "
+    "customer do about it. "
+    "If load is above the 85th percentile, open with that as the lead risk. "
+    "If a strong demand-response window exists (solar peak, wind surge, off-peak trough), "
+    "close with that recommendation. "
+    "Plain prose only — no markdown, no bullet points, no headers."
 )
 
 _CHAT_SYSTEM_TEMPLATE = (
@@ -71,7 +78,9 @@ def _brief_cache_valid(iso: str) -> bool:
         return False
     try:
         data = json.loads(path.read_text())
-        return data.get("date") == date.today().isoformat() and bool(data.get("brief"))
+        return (data.get("date") == date.today().isoformat()
+                and data.get("version") == "v3"
+                and bool(data.get("brief")))
     except (json.JSONDecodeError, OSError):
         return False
 
@@ -87,18 +96,15 @@ def _build_context_block(iso: str, forecast_data: dict) -> str:
     peak_gw   = max(means) if means else 0
     peak_date = dates[means.index(peak_gw)] if means else "—"
     avg_gw    = sum(means) / len(means) if means else 0
+    today_gw  = means[0] if means else None
 
-    recent_actual = dict(list(comparison.get("actual", {}).items())[-7:])
-    da_fcst       = comparison.get("da_fcst", {})
-
+    da_fcst = comparison.get("da_fcst", {})
     daily = []
-    for d in load_list:
+    for d in load_list[:7]:   # 7-day horizon is enough for the brief
         row: dict = {
             "date":        d["date"],
             "mean_gw":     d["mean_load_gw"],
-            "low_gw":      d["low_load_gw"],
-            "high_gw":     d["high_load_gw"],
-            "ci_width_gw": round(d["high_load_gw"] - d["low_load_gw"], 2),
+            "band_gw":     round(d["high_load_gw"] - d["low_load_gw"], 1),
         }
         if d.get("avg_temp_f") is not None:
             row["avg_temp_f"] = round(d["avg_temp_f"], 1)
@@ -106,19 +112,113 @@ def _build_context_block(iso: str, forecast_data: dict) -> str:
             row["vs_iso_da_gw"] = round(d["mean_load_gw"] - da_fcst[d["date"]], 2)
         daily.append(row)
 
+    # ── Percentile context ────────────────────────────────────────────────────
+    percentile_block = {}
+    pct_data = forecast_data.get("percentile", {})
+    if pct_data and today_gw:
+        percentile_block = {
+            "today_percentile_for_month": pct_data.get("percentile"),
+            "month_avg_gw": pct_data.get("month_avg_gw"),
+            "month_max_gw": pct_data.get("month_max_gw"),
+            "last_higher_date": pct_data.get("last_higher_date"),
+            "interpretation": (
+                "EXTREME demand event — top 10% for this calendar month"
+                if (pct_data.get("percentile") or 0) >= 90
+                else "Elevated demand" if (pct_data.get("percentile") or 0) >= 75
+                else "Normal demand range"
+            ),
+        }
+
+    # ── SHAP top driver ───────────────────────────────────────────────────────
+    shap_block = {}
+    shap = forecast_data.get("shap", {})
+    if shap:
+        groups = shap.get("groups", {})
+        if groups:
+            top_group = max(groups, key=lambda k: abs(groups[k]))
+            shap_block = {
+                "top_driver": top_group,
+                "top_driver_mw": groups[top_group],
+                "all_drivers": groups,
+                "base_mw": shap.get("base_mw"),
+            }
+
+    # ── Carbon intensity ──────────────────────────────────────────────────────
+    ci_block = {}
+    ci = forecast_data.get("carbon", {})
+    if ci:
+        lbs = ci.get("lbs_co2_per_mwh", 0)
+        ci_block = {
+            "lbs_co2_per_mwh": lbs,
+            "clean_pct": ci.get("clean_pct"),
+            "top_fuels": dict(list(ci.get("fuel_mix", {}).items())[:3]),
+            "label": (
+                "very clean (<300)" if lbs < 300
+                else "clean (300-500)" if lbs < 500
+                else "mixed (500-750)" if lbs < 750
+                else "carbon-heavy (>750)"
+            ),
+        }
+
+    # ── Demand-response recommendation ───────────────────────────────────────
+    dr_block = {}
+    dr = forecast_data.get("demand_response", {})
+    if dr:
+        best = dr.get("best_window", {})
+        low_ci = dr.get("low_carbon_window", {})
+        low_cost = dr.get("low_cost_window", {})
+        dr_block = {
+            "best_window": best.get("label"),
+            "best_window_reason": best.get("reason"),
+            "low_carbon_window": low_ci.get("label"),
+            "carbon_reduction_pct": low_ci.get("carbon_reduction_pct"),
+            "low_cost_window": low_cost.get("label"),
+            "cost_reduction_pct": low_cost.get("cost_reduction_pct"),
+        }
+
+    # ── Price outlook ─────────────────────────────────────────────────────────
+    price_block = {}
+    prices = forecast_data.get("price_forecast", [])
+    if prices:
+        p_vals = [p["forecast_price"] for p in prices[:7]]
+        price_block = {
+            "today_price": prices[0]["forecast_price"] if prices else None,
+            "peak_price": max(p_vals) if p_vals else None,
+            "peak_price_date": prices[p_vals.index(max(p_vals))]["date"] if p_vals else None,
+            "7day_avg_price": round(sum(p_vals) / len(p_vals), 1) if p_vals else None,
+        }
+
+    # ── Live forecast verification ────────────────────────────────────────────
+    live_accuracy = {}
+    try:
+        vstats = load_verification_stats(iso)
+        if vstats["n_verified"] >= 7:
+            live_accuracy = {
+                "live_mape_7d":   vstats["mape_7d"],
+                "live_mape_30d":  vstats["mape_30d"],
+                "live_bias_mw":   vstats["bias_mw"],
+                "n_verified_days": vstats["n_verified"],
+                "note": "actual day-ahead error vs EIA reported actuals",
+            }
+    except Exception:
+        pass
+
     return json.dumps({
-        "iso":              iso.upper(),
-        "iso_context":      _ISO_CONTEXT.get(iso, iso.upper()),
-        "today":            date.today().isoformat(),
-        "forecast_days":    len(load_list),
-        "today_gw":         means[0] if means else None,
-        "peak_gw":          round(peak_gw, 2),
-        "peak_date":        peak_date,
-        "avg_gw_15day":     round(avg_gw, 2),
-        "model_mape_test":  backtest.get("mape_test"),
-        "daily_forecast":   daily,
-        "recent_actual_gw": recent_actual,
-        "monthly_mape":     backtest.get("monthly_mape", {}),
+        "iso":             iso.upper(),
+        "iso_context":     _ISO_CONTEXT.get(iso, iso.upper()),
+        "today":           date.today().isoformat(),
+        "today_gw":        today_gw,
+        "peak_gw":         round(peak_gw, 2),
+        "peak_date":       peak_date,
+        "avg_gw_15day":    round(avg_gw, 2),
+        "model_mape_test": backtest.get("mape_test"),
+        "7day_forecast":   daily,
+        "demand_percentile": percentile_block,
+        "load_driver_shap":  shap_block,
+        "grid_carbon":       ci_block,
+        "dr_opportunity":    dr_block,
+        "price_outlook":     price_block,
+        "live_accuracy":     live_accuracy,
     }, indent=2)
 
 
@@ -146,14 +246,19 @@ def generate_forecast_brief(iso: str, forecast_data: dict) -> str:
 
     context = _build_context_block(iso, forecast_data)
     prompt = (
-        f"Generate a concise analyst-style forecast brief for the {iso.upper()} grid load outlook below.\n\n"
+        f"Write a 4-5 sentence analyst brief for {iso.upper()} using the multi-signal intelligence below.\n\n"
         f"{context}\n\n"
-        "Lead with the headline risk or opportunity (peak load, heat event, cold snap, notable pattern). "
-        "Include the peak date, magnitude, and any demand anomaly visible across the 15-day window. "
-        "Plain prose only — no markdown."
+        "Synthesise the signals into a coherent narrative — connect the load level (and its percentile rank "
+        "if available) to the specific weather or calendar driver identified by SHAP, then connect that to "
+        "the carbon and price implications, and close with the best demand-response window. "
+        "If the percentile is >= 85, open with that as the headline risk. "
+        "If live_accuracy is present and has n_verified_days >= 7, cite the live_mape_30d as the model's "
+        "actual observed accuracy (e.g. 'this model has averaged X% error on day-ahead forecasts over the "
+        "past 30 days, verified against EIA actuals'). "
+        "Be specific: use the actual numbers. Plain prose only — no markdown."
     )
 
-    brief = complete(_BRIEF_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=350)
+    brief = complete(_BRIEF_SYSTEM, [{"role": "user", "content": prompt}], max_tokens=450)
     if not brief:
         return ""
     log.info("%s brief generated via %s (%d chars)", iso.upper(), provider_label(), len(brief))
@@ -161,7 +266,7 @@ def generate_forecast_brief(iso: str, forecast_data: dict) -> str:
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         _BRIEF_CACHES[iso].write_text(
-            json.dumps({"date": date.today().isoformat(), "brief": brief})
+            json.dumps({"date": date.today().isoformat(), "version": "v3", "brief": brief})
         )
     except OSError:
         pass
