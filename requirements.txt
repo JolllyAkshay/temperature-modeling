@@ -11,3 +11,6 @@ pandas==3.0.1
 scikit-learn==1.8.0
 xgboost==3.2.0
 gunicorn==23.0.0
+statsforecast>=1.7
+fastapi>=0.115
+uvicorn[standard]>=0.30
