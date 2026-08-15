@@ -32,4 +32,6 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 7860
 
-CMD ["gunicorn", "dashboard:server", "--bind", "0.0.0.0:7860", "--timeout", "300", "--workers", "1"]
+CMD ["gunicorn", "dashboard:server", "--bind", "0.0.0.0:7860", "--timeout", "300", \
+     "--workers", "1", "--worker-class", "gthread", "--threads", "4", \
+     "--max-requests", "200", "--max-requests-jitter", "50"]
