@@ -548,11 +548,17 @@ def _fetch_iso_forecast(iso: str, force: bool = False) -> dict:
         "hindcast":        hindcast,
     }
     # Enrich result with net load and price forecast before caching
-    net_load = fetch_net_load_forecast(iso, forecast_dates_list, session)
-    result["net_load"] = net_load
+    try:
+        result["net_load"] = fetch_net_load_forecast(iso, forecast_dates_list, session)
+    except Exception:
+        log.exception("%s: net load computation failed", iso.upper())
+        result["net_load"] = []
 
-    prices = forecast_prices(iso, load_data)
-    result["price_forecast"] = prices
+    try:
+        result["price_forecast"] = forecast_prices(iso, load_data)
+    except Exception:
+        log.exception("%s: price forecast failed", iso.upper())
+        result["price_forecast"] = []
 
     # ── SHAP explanation for day-0 forecast ──────────────────────────────────
     _SHAP_GROUPS = {

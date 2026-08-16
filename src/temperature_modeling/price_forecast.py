@@ -16,6 +16,7 @@ Forecast: multivariate OLS — log(price) ~ log(load) + weekday + seasonal + log
 
 import csv
 import io
+import json
 import logging
 import math
 import os
@@ -28,6 +29,36 @@ import numpy as np
 import requests
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Disk cache for slow, rate-limited price-history fetches (CAISO OASIS
+# chunking, SPP per-day file downloads). Without this, every dashboard
+# forecast request re-runs the full external fetch — 30-50s each time.
+# ---------------------------------------------------------------------------
+_PRICE_HISTORY_CACHE_TTL_H = 6
+
+
+def _read_price_history_cache(path: str) -> list | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        age_h = (time.time() - os.path.getmtime(path)) / 3600
+        if age_h >= _PRICE_HISTORY_CACHE_TTL_H:
+            return None
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data or None
+    except Exception:
+        return None
+
+
+def _write_price_history_cache(path: str, data: list) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        log.warning("Could not write price history cache to %s", path)
 
 _EIA_LOAD_URL   = "https://api.eia.gov/v2/electricity/rto/region-data/data/"
 _EIA_NG_URL     = "https://api.eia.gov/v2/natural-gas/pri/fut/data/"   # daily Henry Hub spot
@@ -367,7 +398,22 @@ def _fetch_isone_price_history(days: int = 90) -> list:
     return result
 
 
+_SPP_PRICE_HISTORY_CACHE = os.path.join(
+    os.path.dirname(__file__), "..", "..", "api_cache", "spp_price_history_90d.json"
+)
+
+
 def _fetch_spp_price_history(days: int = 90) -> list:
+    cached = _read_price_history_cache(_SPP_PRICE_HISTORY_CACHE)
+    if cached is not None:
+        return cached
+    result = _fetch_spp_price_history_live(days)
+    if result:
+        _write_price_history_cache(_SPP_PRICE_HISTORY_CACHE, result)
+    return result
+
+
+def _fetch_spp_price_history_live(days: int = 90) -> list:
     """
     Fetch SPP day-ahead hub LMP from SPP Marketplace public DA-LMP-SL CSV files.
     No authentication required.
@@ -547,7 +593,22 @@ def _fetch_miso_price_history(days: int = 90) -> list:
     return result
 
 
+_CAISO_PRICE_HISTORY_CACHE = os.path.join(
+    os.path.dirname(__file__), "..", "..", "api_cache", "caiso_price_history_90d.json"
+)
+
+
 def _fetch_caiso_price_history(days: int = 90) -> list:
+    cached = _read_price_history_cache(_CAISO_PRICE_HISTORY_CACHE)
+    if cached is not None:
+        return cached
+    result = _fetch_caiso_price_history_live(days)
+    if result:
+        _write_price_history_cache(_CAISO_PRICE_HISTORY_CACHE, result)
+    return result
+
+
+def _fetch_caiso_price_history_live(days: int = 90) -> list:
     """
     Fetch CAISO day-ahead LMP history from CAISO OASIS (PRC_LMP, DAM market).
     No authentication required. Averages TH_NP15_GEN-APND and TH_SP15_GEN-APND
