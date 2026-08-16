@@ -10,6 +10,7 @@ COPY src/ src/
 RUN pip install --no-cache-dir -e . --no-deps
 
 COPY dashboard.py .
+COPY api.py .
 COPY api_cache/pjm_load_model.pkl   api_cache/pjm_load_model.pkl
 COPY api_cache/caiso_load_model.pkl api_cache/caiso_load_model.pkl
 COPY api_cache/ercot_load_model.pkl api_cache/ercot_load_model.pkl

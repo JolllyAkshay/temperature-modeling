@@ -14,3 +14,4 @@ gunicorn==23.0.0
 statsforecast>=1.7
 fastapi>=0.115
 uvicorn[standard]>=0.30
+a2wsgi>=1.10

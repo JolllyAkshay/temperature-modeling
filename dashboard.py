@@ -2384,6 +2384,23 @@ server = app.server  # expose Flask server for gunicorn
 
 
 # ---------------------------------------------------------------------------
+# Mount the FastAPI REST layer (api.py) at /fastapi on the same Flask server.
+# Wrapped defensively — a problem here must not take down the dashboard.
+# ---------------------------------------------------------------------------
+try:
+    from a2wsgi import ASGIMiddleware
+    from werkzeug.middleware.dispatcher import DispatcherMiddleware
+    from api import app as _fastapi_app
+
+    server.wsgi_app = DispatcherMiddleware(
+        server.wsgi_app, {"/fastapi": ASGIMiddleware(_fastapi_app)}
+    )
+    logging.getLogger(__name__).info("FastAPI layer mounted at /fastapi")
+except Exception:
+    logging.getLogger(__name__).exception("FastAPI layer failed to mount — dashboard continues without it")
+
+
+# ---------------------------------------------------------------------------
 # REST API routes (served by the same Flask server as the dashboard)
 # ---------------------------------------------------------------------------
 from flask import jsonify, request as flask_request
