@@ -23,9 +23,9 @@ COPY api_cache/pjm_load_training.json   api_cache/pjm_load_training.json
 COPY api_cache/caiso_load_training.json api_cache/caiso_load_training.json
 COPY api_cache/ercot_load_training.json api_cache/ercot_load_training.json
 COPY api_cache/miso_load_training.json  api_cache/miso_load_training.json
-# nyiso/isone/spp training JSONs intentionally omitted here — never uploaded to
-# the Space repo, and dashboard.py already handles their absence gracefully
-# (backtest panel degrades per-ISO instead of crashing). Re-add once generated.
+COPY api_cache/nyiso_load_training.json api_cache/nyiso_load_training.json
+COPY api_cache/isone_load_training.json api_cache/isone_load_training.json
+COPY api_cache/spp_load_training.json   api_cache/spp_load_training.json
 
 RUN mkdir -p api_cache
 
