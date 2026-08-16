@@ -296,16 +296,10 @@ class TestLocationWeights:
         from temperature_modeling.pjm import PJM_LOAD_LOCATIONS
         self._check(PJM_LOAD_LOCATIONS, "PJM")
 
-    def test_pjm_weights_sum_warning(self):
-        """PJM weights currently sum to ~0.90 — document this known gap."""
+    def test_pjm_weights_sum(self):
         from temperature_modeling.pjm import PJM_LOAD_LOCATIONS
         total = sum(loc["weight"] for loc in PJM_LOAD_LOCATIONS)
-        # This test documents the known discrepancy. If someone fixes the weights,
-        # this assertion will flip and should be updated to abs(total - 1.0) < 0.01.
-        assert abs(total - 1.0) > 0.05, (
-            "PJM weights now sum close to 1.0 — update this test and remove the "
-            "warning in pjm.py"
-        )
+        assert abs(total - 1.0) < 0.01, f"PJM weights sum to {total}, expected 1.0"
 
 
 # ---------------------------------------------------------------------------
