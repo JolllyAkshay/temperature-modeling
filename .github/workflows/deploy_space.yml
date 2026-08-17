@@ -1,0 +1,62 @@
+name: Deploy to HuggingFace Space
+
+# Mirrors all git-tracked code to the Space on every push to master, so the
+# Space can never silently drift from GitHub again (the root cause of two
+# separate production incidents: a broken Docker build from a file that was
+# never uploaded, and a runtime crash from a stale src/ tree).
+#
+# Deliberately non-destructive and scoped to code only:
+#   - never deletes files on the Space, only creates/updates
+#   - never touches api_cache/ (models, training data, forecast caches) —
+#     those are managed by retraining scripts and refresh_forecast_cache.yml,
+#     not by this workflow, and most of them aren't even in git
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install huggingface_hub
+        run: pip install huggingface_hub
+
+      - name: Build sync staging tree
+        run: |
+          mkdir -p /tmp/space_sync
+          git archive HEAD | tar -x -C /tmp/space_sync
+          rm -rf /tmp/space_sync/.github
+          rm -rf /tmp/space_sync/api_cache
+
+      - name: Sync to HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python - <<'EOF'
+          import os
+          from huggingface_hub import HfApi
+
+          api = HfApi()
+          api.upload_folder(
+              folder_path="/tmp/space_sync",
+              path_in_repo=".",
+              repo_id="JollyAkshay/grid-dashboard",
+              repo_type="space",
+              token=os.environ["HF_TOKEN"],
+              commit_message=f"Sync from GitHub {os.environ['COMMIT_SHA'][:8]}",
+          )
+          print("Synced.")
+          EOF
