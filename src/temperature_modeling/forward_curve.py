@@ -184,11 +184,39 @@ def _add_months(d: date, n: int) -> date:
 # Henry Hub forward curve — EIA STEO (free, monthly publication, 18m horizon)
 # ---------------------------------------------------------------------------
 
+_HH_FUTURES_CACHE = _CACHE_DIR / "hh_futures_cache.json"
+
+
+def _write_hh_futures_cache(result: dict[str, float]) -> None:
+    try:
+        _CACHE_DIR.mkdir(exist_ok=True)
+        _HH_FUTURES_CACHE.write_text(json.dumps(result))
+    except OSError:
+        log.warning("Could not write HH futures cache to %s", _HH_FUTURES_CACHE)
+
+
 def fetch_hh_futures(n_months: int = 14) -> dict[str, float]:
     """
     Return {YYYY-MM: $/MMBtu} from EIA STEO Henry Hub forecast.
     Falls back to latest EIA spot price held flat if STEO unavailable.
+
+    Henry Hub is a single national price — identical for every ISO — so this
+    is cached once and shared across all 7 ISOs instead of being refetched
+    from EIA on every build_forward_curve() call. Only genuine EIA responses
+    (STEO or spot-fallback) are cached; the last-resort $3.50 placeholder is
+    never cached, so a transient EIA hiccup doesn't freeze a fake price for
+    24 hours.
     """
+    if _HH_FUTURES_CACHE.exists():
+        try:
+            age_h = (time.time() - _HH_FUTURES_CACHE.stat().st_mtime) / 3600
+            if age_h < _CACHE_MAX_AGE_H:
+                cached = json.loads(_HH_FUTURES_CACHE.read_text())
+                if cached:
+                    return cached
+        except Exception:
+            pass
+
     api_key = os.environ.get("EIA_API_KEY", "")
     today   = date.today()
     current_ym = today.strftime("%Y-%m")
@@ -220,6 +248,7 @@ def fetch_hh_futures(n_months: int = 14) -> dict[str, float]:
                     result[period] = float(value)
             if result:
                 log.info("HH futures: loaded %d months from EIA STEO", len(result))
+                _write_hh_futures_cache(result)
                 return result
         except Exception:
             log.warning("EIA STEO fetch failed — falling back to spot price")
@@ -246,11 +275,12 @@ def fetch_hh_futures(n_months: int = 14) -> dict[str, float]:
                     d = _add_months(today, i)
                     result[d.strftime("%Y-%m")] = spot
                 log.info("HH futures: using flat spot price $%.2f from EIA", spot)
+                _write_hh_futures_cache(result)
                 return result
         except Exception:
             log.warning("EIA HH spot fallback also failed")
 
-    # Last resort: hardcoded $3.50 flat
+    # Last resort: hardcoded $3.50 flat — never cached, so the next call retries EIA
     log.warning("HH futures: no EIA data — using $3.50 placeholder")
     for i in range(n_months):
         d = _add_months(today, i)
