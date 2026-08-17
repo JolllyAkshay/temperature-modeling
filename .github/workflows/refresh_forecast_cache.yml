@@ -87,3 +87,78 @@ jobs:
               )
               print(f"  done", flush=True)
           EOF
+
+      - name: Download existing forward-curve archive + price history
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          from huggingface_hub import hf_hub_download
+          from huggingface_hub.utils import EntryNotFoundError
+
+          repo = "JollyAkshay/grid-dashboard"
+          token = os.environ["HF_TOKEN"]
+          isos = ["pjm", "caiso", "ercot", "miso", "nyiso", "isone", "spp"]
+          days = {"pjm": 730, "ercot": 730, "isone": 730, "nyiso": 730, "spp": 730,
+                  "caiso": 400, "miso": 400}
+
+          # Existing archive (if any) so today's snapshot appends instead of
+          # starting the history over from a fresh checkout every run.
+          filenames = [f"api_cache/{iso}_forward_curve_history.jsonl" for iso in isos]
+          filenames += [f"api_cache/{iso}_price_history_{days[iso]}d.json" for iso in isos]
+          filenames.append("api_cache/hh_futures_cache.json")
+
+          for filename in filenames:
+              try:
+                  hf_hub_download(repo_id=repo, repo_type="space",
+                                   filename=filename, local_dir=".", token=token)
+                  print(f"Downloaded {filename}", flush=True)
+              except EntryNotFoundError:
+                  print(f"{filename} doesn't exist yet on the Space — starting fresh", flush=True)
+          EOF
+
+      - name: Build forward curves (this appends today's snapshot to the archive)
+        env:
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+        run: |
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, "src")
+          from temperature_modeling.forward_curve import build_forward_curve
+
+          for iso in ["pjm", "caiso", "ercot", "miso", "nyiso", "isone", "spp"]:
+              try:
+                  result = build_forward_curve(iso, n_months=12)
+                  print(f"{iso}: {result['model_source']}", flush=True)
+              except Exception as exc:
+                  print(f"{iso}: FAILED — {exc}", flush=True)
+          EOF
+
+      - name: Upload forward-curve archive + price history to HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import glob
+          import os
+          from huggingface_hub import upload_file
+
+          repo = "JollyAkshay/grid-dashboard"
+          token = os.environ["HF_TOKEN"]
+
+          patterns = [
+              "api_cache/*_forward_curve_history.jsonl",
+              "api_cache/*_price_history_*d.json",
+              "api_cache/hh_futures_cache.json",
+          ]
+          for pattern in patterns:
+              for path in glob.glob(pattern):
+                  print(f"Uploading {path} ...", flush=True)
+                  upload_file(
+                      path_or_fileobj=path, path_in_repo=path,
+                      repo_id=repo, repo_type="space",
+                      token=token,
+                  )
+                  print(f"  done", flush=True)
+          EOF
