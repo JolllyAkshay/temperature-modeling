@@ -549,3 +549,104 @@ def load_forward_curve_history(iso: str, from_month: str = "", to_month: str = "
         snapshots.append(rec)
 
     return sorted(snapshots, key=lambda r: r.get("snapshot_date", ""))
+
+
+def _month_diff(from_ym: str, to_ym: str) -> int:
+    """Calendar months between two YYYY-MM strings (e.g. 2026-06 -> 2026-09 = 3)."""
+    fy, fm = int(from_ym[:4]), int(from_ym[5:7])
+    ty, tm = int(to_ym[:4]), int(to_ym[5:7])
+    return (ty - fy) * 12 + (tm - fm)
+
+
+def backtest_forward_curve(iso: str) -> dict[str, Any]:
+    """
+    Compare archived forward-curve snapshots against realized settlement
+    prices, for delivery months that have since fully completed.
+
+    Realized monthly averages come from the same cached price history used
+    to fit the model. A month only counts as "realized" once it's fully in
+    the past (never the current month) and has at least 20 days of price
+    data — a handful of scattered days isn't a reliable settlement average.
+
+    Returns
+    -------
+    dict with:
+        iso, n_snapshots, n_comparisons, mape, bias_usd_mwh,
+        by_lead_months: {lead_months: {n, mape, bias_usd_mwh}} — accuracy
+            broken out by how many months ahead the prediction was made,
+            since a 1-month-ahead prediction and a 12-month-ahead one
+            aren't the same claim and shouldn't be averaged together,
+        records: the individual predicted-vs-actual comparisons.
+    """
+    snapshots = load_forward_curve_history(iso)
+    empty = {"iso": iso, "n_snapshots": len(snapshots), "n_comparisons": 0,
+             "mape": None, "bias_usd_mwh": None, "by_lead_months": {}, "records": []}
+    if not snapshots:
+        return empty
+
+    history = _load_price_history(iso)
+    monthly_actuals: dict[str, list[float]] = {}
+    for row in history:
+        d = row.get("date", "")
+        price = row.get("price_usd_mwh")
+        if d and price is not None:
+            monthly_actuals.setdefault(d[:7], []).append(price)
+
+    current_ym = date.today().strftime("%Y-%m")
+    realized: dict[str, float] = {
+        ym: sum(prices) / len(prices)
+        for ym, prices in monthly_actuals.items()
+        if ym < current_ym and len(prices) >= 20
+    }
+
+    records: list[dict] = []
+    for snap in snapshots:
+        snap_date = snap.get("snapshot_date", "")
+        snap_ym = snap_date[:7]
+        if not snap_ym:
+            continue
+        for entry in snap.get("curve", []):
+            ym = entry.get("month")
+            if not ym or ym not in realized:
+                continue
+            predicted = entry.get("scenarios", {}).get("base", {}).get("monthly_avg")
+            if predicted is None:
+                continue
+            actual = realized[ym]
+            error = predicted - actual
+            records.append({
+                "snapshot_date":     snap_date,
+                "delivery_month":    ym,
+                "lead_months":       _month_diff(snap_ym, ym),
+                "predicted_usd_mwh": round(predicted, 2),
+                "actual_usd_mwh":    round(actual, 2),
+                "error_usd_mwh":     round(error, 2),
+                "pct_error":         round(error / actual * 100, 1) if actual else None,
+            })
+
+    if not records:
+        return empty
+
+    def _mape(recs: list[dict]) -> float | None:
+        pcts = [abs(r["pct_error"]) for r in recs if r["pct_error"] is not None]
+        return round(sum(pcts) / len(pcts), 1) if pcts else None
+
+    def _bias(recs: list[dict]) -> float:
+        return round(sum(r["error_usd_mwh"] for r in recs) / len(recs), 2)
+
+    by_lead: dict[int, list[dict]] = {}
+    for r in records:
+        by_lead.setdefault(r["lead_months"], []).append(r)
+
+    return {
+        "iso":             iso,
+        "n_snapshots":     len(snapshots),
+        "n_comparisons":   len(records),
+        "mape":            _mape(records),
+        "bias_usd_mwh":    _bias(records),
+        "by_lead_months":  {
+            lead: {"n": len(recs), "mape": _mape(recs), "bias_usd_mwh": _bias(recs)}
+            for lead, recs in sorted(by_lead.items())
+        },
+        "records": sorted(records, key=lambda r: (r["snapshot_date"], r["delivery_month"])),
+    }

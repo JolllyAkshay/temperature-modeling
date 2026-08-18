@@ -140,12 +140,14 @@ def root():
         "docs":    "/docs",
         "isos":    _SUPPORTED_ISOS,
         "endpoints": {
-            "forecast":      "/v1/forecast/{iso}",
-            "prices":        "/v1/prices/{iso}",
-            "forward_curve": "/v1/forward-curve/{iso}",
-            "net_load":      "/v1/net-load/{iso}",
-            "carbon":        "/v1/carbon/{iso}",
-            "accuracy":      "/v1/accuracy/{iso}",
+            "forecast":               "/v1/forecast/{iso}",
+            "prices":                 "/v1/prices/{iso}",
+            "forward_curve":          "/v1/forward-curve/{iso}",
+            "forward_curve_history":  "/v1/forward-curve/history/{iso}",
+            "forward_curve_accuracy": "/v1/forward-curve/accuracy/{iso}",
+            "net_load":               "/v1/net-load/{iso}",
+            "carbon":                 "/v1/carbon/{iso}",
+            "accuracy":               "/v1/accuracy/{iso}",
         },
     }
 
@@ -463,6 +465,29 @@ def get_forward_curve_history(
         "snapshots": len(snapshots),
         "records":   snapshots,
     }
+
+
+@app.get("/v1/forward-curve/accuracy/{iso}", tags=["model"])
+def get_forward_curve_accuracy(iso: str, _key: str = Security(_require_key)):
+    """
+    Backtest: archived forward-curve predictions vs realized settlement
+    prices, for delivery months that have since fully completed.
+
+    `by_lead_months` breaks accuracy out by how many months ahead each
+    prediction was made — a 1-month-ahead prediction and a 12-month-ahead
+    one aren't the same claim and shouldn't be averaged together.
+
+    Returns n_comparisons=0 until the archive has snapshots old enough
+    to compare against a completed delivery month (accumulates daily via
+    the scheduled cache-refresh job).
+    """
+    from temperature_modeling.forward_curve import backtest_forward_curve
+
+    iso = _validate_iso(iso)
+    try:
+        return backtest_forward_curve(iso)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Backtest failed: {exc}")
 
 
 @app.post("/v1/forward-curve/warm/{iso}", tags=["admin"])
