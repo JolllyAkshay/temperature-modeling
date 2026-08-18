@@ -531,6 +531,10 @@ def load_forward_curve_history(iso: str, from_month: str = "", to_month: str = "
     """
     archive_path = _CACHE_DIR / f"{iso}_forward_curve_history.jsonl"
     if not archive_path.exists():
+        # Fresh container restart — local disk has nothing yet, but the
+        # scheduled Action keeps a persisted copy on the Space repo itself.
+        _download_from_hub(f"api_cache/{iso}_forward_curve_history.jsonl")
+    if not archive_path.exists():
         return []
 
     snapshots = []
