@@ -23,7 +23,7 @@ import os
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import requests
@@ -82,9 +82,12 @@ _ISONE_API_USER = os.environ.get("ISONE_API_USER", "")
 _ISONE_API_PASS = os.environ.get("ISONE_API_PASS", "")
 
 # PJM DataMiner2 DA LMPs — free API key registration at pjm.com
-_PJM_DATAMINER_URL   = "https://dataminer2.pjm.com/feed/da_hrl_lmps/excel"
+# Note: dataminer2.pjm.com is the *website*; the actual REST API is on
+# api.pjm.com and needs rowCount (not endRow) and a single
+# "{start}to{end}" value for date-range filters (not two separate params).
+_PJM_DATAMINER_URL   = "https://api.pjm.com/api/v1/da_hrl_lmps"
 _PJM_DATAMINER_KEY   = os.environ.get("PJM_API_KEY", "")
-_PJM_WESTERN_HUB_ID  = 1   # pnode_id for PJM Western Hub (main reference)
+_PJM_WESTERN_HUB_ID  = 1   # pnode_id=1 is the PJM-RTO system-wide reference price
 
 # ERCOT DAM Settlement Point Prices — NP4-190-CD (register at api.ercot.com)
 _ERCOT_NP_URL         = "https://api.ercot.com/api/public-reports/np4-190-cd/dam_stlmnt_pnt_prices"
@@ -719,45 +722,58 @@ def _fetch_pjm_price_history(days: int = 90) -> list:
     session  = requests.Session()
     session.headers["Ocp-Apim-Subscription-Key"] = _PJM_DATAMINER_KEY
     session.headers["User-Agent"] = "grid-dashboard/1.0"
+    session.headers["Accept"] = "text/csv"   # API defaults to JSON without this
 
     price_by_date: dict = {}
-    start_row = 1
     page_size = 50000
 
-    while True:
-        try:
-            r = session.get(
-                _PJM_DATAMINER_URL,
-                params={
-                    "startRow":               start_row,
-                    "endRow":                 start_row + page_size - 1,
-                    "pnode_id":               _PJM_WESTERN_HUB_ID,
-                    "datetime_beginning_ept": start_dt.strftime("%Y-%m-%d 00:00"),
-                    "datetime_ending_ept":    end_dt.strftime("%Y-%m-%d 23:00"),
-                },
-                timeout=60,
-            )
-            if r.status_code != 200:
-                log.warning("PJM DataMiner2: HTTP %d", r.status_code)
+    # PJM caps a single query's date range at 366 days — chunk for longer windows
+    _CHUNK_DAYS = 366
+    chunk_start = start_dt
+    while chunk_start <= end_dt:
+        chunk_end = min(chunk_start + timedelta(days=_CHUNK_DAYS - 1), end_dt)
+        date_range = f"{chunk_start.strftime('%Y-%m-%dT00:00')}to{chunk_end.strftime('%Y-%m-%dT23:00')}"
+        start_row = 1
+
+        while True:
+            try:
+                r = session.get(
+                    _PJM_DATAMINER_URL,
+                    params={
+                        "rowCount":               page_size,
+                        "startRow":               start_row,
+                        "pnode_id":               _PJM_WESTERN_HUB_ID,
+                        "datetime_beginning_ept": date_range,
+                    },
+                    timeout=60,
+                )
+                if r.status_code != 200:
+                    log.warning("PJM DataMiner2: HTTP %d", r.status_code)
+                    break
+                reader = csv.DictReader(io.StringIO(r.text))
+                rows = list(reader)
+                if not rows:
+                    break
+                for row in rows:
+                    # Column comes back as "8/3/2026 12:00:00 AM" (M/D/YYYY), not ISO —
+                    # find it by suffix since the BOM can prefix the first column name.
+                    raw_dt = next((v for k, v in row.items()
+                                   if k.endswith("datetime_beginning_ept")), None)
+                    lmp_raw = row.get("total_lmp_da")
+                    if raw_dt and lmp_raw:
+                        try:
+                            period = datetime.strptime(raw_dt, "%m/%d/%Y %I:%M:%S %p").date().isoformat()
+                            price_by_date.setdefault(period, []).append(float(lmp_raw))
+                        except (ValueError, TypeError):
+                            pass
+                if len(rows) < page_size:
+                    break
+                start_row += page_size
+            except Exception:
+                log.exception("PJM DataMiner2: price fetch failed")
                 break
-            reader = csv.DictReader(io.StringIO(r.text))
-            rows = list(reader)
-            if not rows:
-                break
-            for row in rows:
-                period = (row.get("datetime_beginning_ept") or row.get("DateTime Beginning (EPT)") or "")[:10]
-                lmp_raw = row.get("total_lmp_da") or row.get("Total LMP DA") or row.get("LMP")
-                if period and lmp_raw:
-                    try:
-                        price_by_date.setdefault(period, []).append(float(lmp_raw))
-                    except (ValueError, TypeError):
-                        pass
-            if len(rows) < page_size:
-                break
-            start_row += page_size
-        except Exception:
-            log.exception("PJM DataMiner2: price fetch failed")
-            break
+
+        chunk_start = chunk_end + timedelta(days=1)
 
     if not price_by_date:
         return []
