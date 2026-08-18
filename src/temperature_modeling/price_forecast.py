@@ -1040,6 +1040,20 @@ def _fit_price_model(history: list) -> dict | None:
     # last slice as an out-of-sample calibration set — same split convention
     # as the load model — and only attempt this with enough data for a
     # small-N linear quantile fit to be meaningful at all.
+    #
+    # Tried a randomized/stratified split instead, on the theory that a tail
+    # split starves calibration of whichever season is least recent — it
+    # measurably helped ISO-NE's coverage (54%→78% on a true holdout test)
+    # but made PJM/ERCOT/NYISO measurably worse (e.g. PJM 94.5%→74.7%),
+    # because those ISOs have 2 years of history with genuine price drift
+    # over time, where calibrating against the *most recent* regime is
+    # actually more correct than diluting it with older data. Net effect
+    # across all 7 ISOs was worse, not better, so kept the chronological
+    # split. ISO-NE's shortfall (measured ~54-78% vs the 90% target) looks
+    # like a real data-depth limitation — its history is ~7 months, not
+    # even a full seasonal cycle — rather than something a split strategy
+    # alone fixes; it should improve as the archive naturally accumulates
+    # more history over time.
     if n >= 30:
         n_cal   = min(200, max(10, n // 5))
         n_train = n - n_cal
