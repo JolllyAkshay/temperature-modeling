@@ -339,8 +339,13 @@ def _predict_monthly_price(
     ng_price: float,
     model: dict | None,
     iso: str,
-) -> float:
-    """Predict monthly average price ($/MWh)."""
+) -> tuple[float, float | None, float | None]:
+    """
+    Predict monthly average price ($/MWh).
+    Returns (price, low, high) — low/high are CQR-calibrated quantile bounds
+    when the model has them (None for the fallback heuristic, which has no
+    statistical uncertainty estimate of its own).
+    """
     if model:
         coeffs = model["coeffs"]
         use_ng = model.get("use_ng", False)
@@ -355,7 +360,10 @@ def _predict_monthly_price(
         x.append(1.0)
         if len(x) == len(coeffs):
             raw = math.exp(sum(c * xi for c, xi in zip(coeffs, x)))
-            return min(max(raw, _PRICE_FLOOR), _PRICE_CAP)
+            price = min(max(raw, _PRICE_FLOOR), _PRICE_CAP)
+            from .price_forecast import _price_bounds  # noqa: PLC0415
+            low, high = _price_bounds(x, model, price)
+            return price, min(max(low, _PRICE_FLOOR), _PRICE_CAP), min(max(high, _PRICE_FLOOR), _PRICE_CAP)
 
     # Fallback heuristic: base price + gas pass-through + load-above-base sensitivity
     # Uses the ISO's own typical base load (not a fixed 50 GW) so small ISOs respond correctly
@@ -366,7 +374,7 @@ def _predict_monthly_price(
     load_above = max(load_gw - base_gw, 0.0)
     # Marginal cost ramp: $1.50/MWh per GW above base load (approximates merit-order steepening)
     price = base_price + ng_price * 5.0 + load_above * 1.5
-    return float(min(max(price, _PRICE_FLOOR), _PRICE_CAP))
+    return float(min(max(price, _PRICE_FLOOR), _PRICE_CAP)), None, None
 
 
 # ---------------------------------------------------------------------------
@@ -435,12 +443,12 @@ def build_forward_curve(iso: str, n_months: int = 12) -> dict[str, Any]:
         for scenario_name, temp_offset in [("cold", -std_temp), ("base", 0.0), ("hot", +std_temp)]:
             temp    = normal_temp + temp_offset
             load_gw = _monthly_load_gw(iso, temp)
-            price   = _predict_monthly_price(load_gw * 1000, month, ng_price, model, iso)
+            price, low, high = _predict_monthly_price(load_gw * 1000, month, ng_price, model, iso)
             # If OLS blows up for this month, fall back to heuristic
             if price > _price_ceiling:
                 log.warning("%s %s: OLS price $%.0f exceeds ceiling $%.0f — using heuristic",
                             iso.upper(), ym, price, _price_ceiling)
-                price = _predict_monthly_price(load_gw * 1000, month, ng_price, None, iso)
+                price, low, high = _predict_monthly_price(load_gw * 1000, month, ng_price, None, iso)
             on_peak, off_peak = _split_peak_offpeak(price, iso, month)
 
             # Spark spread and implied heat rate — computed from displayed (rounded)
@@ -462,6 +470,8 @@ def build_forward_curve(iso: str, n_months: int = 12) -> dict[str, Any]:
                 "avg_temp_f":          round(temp, 1),
                 "load_gw":             round(load_gw, 2),
                 "monthly_avg":         round(price, 2),
+                "low_usd_mwh":         round(low, 2) if low is not None else None,
+                "high_usd_mwh":        round(high, 2) if high is not None else None,
                 "on_peak":             on_peak,
                 "off_peak":            off_peak,
                 "implied_heat_rate":   implied_hr,   # BTU/kWh; compare to your plant HR

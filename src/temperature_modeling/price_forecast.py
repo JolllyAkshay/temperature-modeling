@@ -947,12 +947,39 @@ def _attach_ng_prices(history: list) -> list:
 # Regression model (log-linear load → price, optional NG co-variate)
 # ---------------------------------------------------------------------------
 
+def _price_quantile_coeffs(X: "np.ndarray", y: "np.ndarray", quantile: float) -> list[float] | None:
+    """
+    Fit a linear quantile regression (same log-price target/features as the
+    OLS fit). X's last column is already a constant-1.0 intercept term
+    (matching the existing OLS convention), so fit_intercept=False — otherwise
+    QuantileRegressor would add a second, separate intercept on top of it.
+    """
+    try:
+        from sklearn.linear_model import QuantileRegressor
+        # solver="highs" is exact LP, no regularisation bias from alpha's default L1 term
+        reg = QuantileRegressor(quantile=quantile, alpha=0.0, solver="highs", fit_intercept=False)
+        reg.fit(X, y)
+        return list(reg.coef_)
+    except Exception:
+        log.warning("Price quantile regression failed (q=%.2f)", quantile)
+        return None
+
+
 def _fit_price_model(history: list) -> dict | None:
     """
     Fit OLS: log(price) ~ log(load) + weekday + sin_month + cos_month [+ log(ng_price)] + intercept.
     If Henry Hub NG prices are available for ≥ half the rows the model uses 6 features;
     otherwise falls back to 5 features (no NG term).
-    Returns {"coeffs": list, "rmse": float, "use_ng": bool} or None if insufficient data.
+
+    Also fits p10/p90 linear quantile regressions on the same features, with a
+    conformal calibration step (Romano et al. 2019 CQR — same methodology
+    already used for the load model) on a held-out time slice, so the
+    resulting low/high bounds have a real empirical coverage guarantee
+    instead of being a flat ±RMSE band around the point estimate.
+
+    Returns {"coeffs": list, "rmse": float, "use_ng": bool,
+             "p10_coeffs": list | None, "p90_coeffs": list | None,
+             "cqr_delta_usd_mwh": float | None} or None if insufficient data.
     """
     rows = [r for r in history if r["price_usd_mwh"] > 0 and r["load_mw"] > 0]
     if len(rows) < 7:
@@ -1004,7 +1031,64 @@ def _fit_price_model(history: list) -> dict | None:
 
     log.info("Price model: %d features (%s NG), RMSE $%.2f/MWh",
              len(coeffs), "with" if use_ng else "without", rmse)
-    return {"coeffs": coeffs.tolist(), "rmse": round(rmse, 2), "use_ng": use_ng}
+
+    p10_coeffs = p90_coeffs = None
+    cqr_delta  = None
+    n = len(fit_rows)
+
+    # Rows are date-ordered (fetch_price_history returns sorted). Reserve the
+    # last slice as an out-of-sample calibration set — same split convention
+    # as the load model — and only attempt this with enough data for a
+    # small-N linear quantile fit to be meaningful at all.
+    if n >= 30:
+        n_cal   = min(200, max(10, n // 5))
+        n_train = n - n_cal
+        X_train, y_train = X_arr[:n_train], y_arr[:n_train]
+        X_cal,   y_cal   = X_arr[n_train:], y_arr[n_train:]
+
+        p10_coeffs = _price_quantile_coeffs(X_train, y_train, 0.10)
+        p90_coeffs = _price_quantile_coeffs(X_train, y_train, 0.90)
+
+        if p10_coeffs is not None and p90_coeffs is not None:
+            p10c = np.array(p10_coeffs)
+            p90c = np.array(p90_coeffs)
+            cal_actual = np.exp(y_cal)
+            cal_p10    = np.exp(X_cal @ p10c)
+            cal_p90    = np.exp(X_cal @ p90c)
+
+            # CQR score: > 0 means the [p10, p90] interval missed the actual
+            # price; sorted 90th-percentile order statistic gives the delta
+            # that, added to both bounds, guarantees ≥90% empirical coverage
+            # on this held-out slice.
+            q_idx = min(int(math.ceil(0.90 * (n_cal + 1))) - 1, n_cal - 1)
+            cqr_scores = sorted(max(p10 - a, a - p90)
+                                 for a, p10, p90 in zip(cal_actual, cal_p10, cal_p90))
+            cqr_delta = float(cqr_scores[q_idx])
+            log.info("Price CQR calibration: δ=$%.2f/MWh (n_cal=%d)", cqr_delta, n_cal)
+
+    return {
+        "coeffs":            coeffs.tolist(),
+        "rmse":              round(rmse, 2),
+        "use_ng":            use_ng,
+        "p10_coeffs":        p10_coeffs,
+        "p90_coeffs":        p90_coeffs,
+        "cqr_delta_usd_mwh": cqr_delta,
+    }
+
+
+def _price_bounds(x: list, model: dict, point_price: float) -> tuple[float, float]:
+    """
+    Return (low, high) $/MWh for a feature row, using CQR-calibrated quantile
+    bounds when the model has them, falling back to a flat ±RMSE band
+    (the old behavior) otherwise.
+    """
+    p10c, p90c, delta = model.get("p10_coeffs"), model.get("p90_coeffs"), model.get("cqr_delta_usd_mwh")
+    if p10c is not None and p90c is not None and delta is not None and len(x) == len(p10c):
+        low  = math.exp(sum(c * xi for c, xi in zip(p10c, x))) - delta
+        high = math.exp(sum(c * xi for c, xi in zip(p90c, x))) + delta
+        return max(low, 1.0), max(high, low)
+    rmse = model.get("rmse", 0.0)
+    return max(point_price - rmse, 0), point_price + rmse
 
 
 def forecast_prices(iso: str, load_forecast: list) -> list:
@@ -1078,12 +1162,15 @@ def forecast_prices(iso: str, load_forecast: list) -> list:
                         iso.upper(), price, price_ceiling)
             return []
 
+        low, high = _price_bounds(x, model, price)
+
         results.append({
             "date":           day["date"],
             "forecast_price": round(price, 2),
-            "low_price":      round(max(price - rmse, 0), 2),
-            "high_price":     round(price + rmse, 2),
+            "low_price":      round(low, 2),
+            "high_price":     round(high, 2),
             "model_rmse":     rmse,
+            "band_source":    "cqr" if model.get("cqr_delta_usd_mwh") is not None else "rmse",
         })
 
     log.info("%s: price forecast complete — %d days, model RMSE $%.2f/MWh",
