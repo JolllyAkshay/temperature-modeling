@@ -130,7 +130,7 @@ def _ercot_bearer_token() -> str:
             token = j.get("id_token") or j.get("access_token", "")
             cached["token"]      = token
             cached["expires_at"] = _time.time() + int(j.get("expires_in", 3600))
-            log.info("ERCOT: OAuth token obtained (expires in %ds)", j.get("expires_in", 3600))
+            log.info("ERCOT: OAuth token obtained (expires in %ss)", j.get("expires_in", 3600))
             return token
         log.warning("ERCOT token fetch HTTP %d: %s", r.status_code, r.text[:300])
     except Exception as exc:
