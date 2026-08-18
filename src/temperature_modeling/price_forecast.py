@@ -354,8 +354,13 @@ def _fetch_nyiso_price_history(days: int = 90) -> list:
 def _fetch_isone_price_history(days: int = 90) -> list:
     """
     Fetch ISO-NE day-ahead hub LMP from ISO-NE webservices REST API.
-    Requires free account at iso-ne.com — set ISONE_API_USER + ISONE_API_PASS env vars.
+    Requires free account at iso-ne.com — set ISONE_API_USER + ISONE_API_PASS env vars
+    (your ISO Express login works directly as HTTP Basic Auth, no separate key).
     Hub: Massachusetts Hub (node 4000).
+
+    The API is per-day-per-location only (no date-range endpoint) —
+    GET /hourlylmp/da/final/day/{yyyymmdd}/location/4000.json — so this
+    fetches one day at a time, in parallel.
     """
     if not _ISONE_API_USER or not _ISONE_API_PASS:
         log.info("ISO-NE: no API credentials — set ISONE_API_USER + ISONE_API_PASS")
@@ -367,21 +372,31 @@ def _fetch_isone_price_history(days: int = 90) -> list:
     session.auth = (_ISONE_API_USER, _ISONE_API_PASS)
     session.headers["Accept"] = "application/json"
 
+    def _fetch_day(d: date) -> tuple[str, float | None]:
+        url = f"{_ISONE_API_BASE}/hourlylmp/da/final/day/{d.strftime('%Y%m%d')}/location/4000.json"
+        try:
+            r = session.get(url, timeout=30)
+            if r.status_code != 200:
+                return d.isoformat(), None
+            lmps = [
+                float(entry["LmpTotal"])
+                for entry in r.json().get("HourlyLmps", {}).get("HourlyLmp", [])
+                if entry.get("LmpTotal") is not None
+            ]
+            avg = (sum(lmps) / len(lmps)) if lmps else None
+            return d.isoformat(), avg
+        except Exception:
+            return d.isoformat(), None
+
+    dates = [end_dt - timedelta(days=i) for i in range(days)]
     price_by_date: dict = {}
-    try:
-        url = (f"{_ISONE_API_BASE}/hourlylmp/da/final/hourly/"
-               f"{start_dt.strftime('%Y%m%d')}/{end_dt.strftime('%Y%m%d')}.json")
-        r = session.get(url, timeout=30)
-        r.raise_for_status()
-        for entry in r.json().get("HourlyLmps", {}).get("HourlyLmp", []):
-            if str(entry.get("Location", {}).get("@LocId", "")) != "4000":
-                continue
-            period = entry.get("BeginDate", "")[:10]
-            lmp = entry.get("LmpTotal")
-            if period and lmp is not None:
-                price_by_date.setdefault(period, []).append(float(lmp))
-    except Exception:
-        log.exception("ISO-NE: price fetch failed")
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for d_str, avg in pool.map(_fetch_day, dates):
+            if avg is not None:
+                price_by_date[d_str] = [avg]
+
+    if not price_by_date:
+        log.warning("ISO-NE: no price data returned for any requested day")
         return []
 
     daily_load = _eia_load_daily("ISNE", start_dt.isoformat(), end_dt.isoformat())

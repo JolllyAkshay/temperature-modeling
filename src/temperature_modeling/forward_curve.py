@@ -105,10 +105,10 @@ _HISTORY_DAYS: dict[str, int] = {
     "nyiso":  730,   # monthly zip archives, ~21s
     "spp":    730,   # monthly folder listing, fast
     "pjm":    730,   # single paginated API (requires PJM_API_KEY)
-    "isone":  730,   # single range request (requires ISONE credentials)
     "ercot":  730,   # paginated (requires ERCOT_API_KEY)
     "caiso":  400,   # 28-day chunks, 5s inter-chunk delay → ~3 min for 400d
     "miso":   400,   # per-day 1MB files → ~2 min for 400d at 5 workers
+    "isone":  400,   # per-day API, no bulk/range endpoint → same profile as MISO
 }
 
 
