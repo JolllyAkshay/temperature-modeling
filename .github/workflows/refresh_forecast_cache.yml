@@ -9,7 +9,10 @@ on:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # SPP's price history is per-day file downloads and alone measured ~5min
+    # cold; with 7 ISOs' worth of forecast + forward-curve building in one
+    # run, 15min was too tight a margin.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo

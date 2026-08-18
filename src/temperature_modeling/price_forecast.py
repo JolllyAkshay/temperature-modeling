@@ -416,18 +416,20 @@ def _fetch_isone_price_history(days: int = 90) -> list:
     return result
 
 
-_SPP_PRICE_HISTORY_CACHE = os.path.join(
-    os.path.dirname(__file__), "..", "..", "api_cache", "spp_price_history_90d.json"
-)
+def _spp_price_history_cache_path(days: int) -> str:
+    return os.path.join(
+        os.path.dirname(__file__), "..", "..", "api_cache", f"spp_price_history_{days}d.json"
+    )
 
 
 def _fetch_spp_price_history(days: int = 90) -> list:
-    cached = _read_price_history_cache(_SPP_PRICE_HISTORY_CACHE)
+    cache_path = _spp_price_history_cache_path(days)
+    cached = _read_price_history_cache(cache_path)
     if cached is not None:
         return cached
     result = _fetch_spp_price_history_live(days)
     if result:
-        _write_price_history_cache(_SPP_PRICE_HISTORY_CACHE, result)
+        _write_price_history_cache(cache_path, result)
     return result
 
 
@@ -611,18 +613,20 @@ def _fetch_miso_price_history(days: int = 90) -> list:
     return result
 
 
-_CAISO_PRICE_HISTORY_CACHE = os.path.join(
-    os.path.dirname(__file__), "..", "..", "api_cache", "caiso_price_history_90d.json"
-)
+def _caiso_price_history_cache_path(days: int) -> str:
+    return os.path.join(
+        os.path.dirname(__file__), "..", "..", "api_cache", f"caiso_price_history_{days}d.json"
+    )
 
 
 def _fetch_caiso_price_history(days: int = 90) -> list:
-    cached = _read_price_history_cache(_CAISO_PRICE_HISTORY_CACHE)
+    cache_path = _caiso_price_history_cache_path(days)
+    cached = _read_price_history_cache(cache_path)
     if cached is not None:
         return cached
     result = _fetch_caiso_price_history_live(days)
     if result:
-        _write_price_history_cache(_CAISO_PRICE_HISTORY_CACHE, result)
+        _write_price_history_cache(cache_path, result)
     return result
 
 

@@ -103,12 +103,15 @@ _CACHE_MAX_AGE_H = 24
 # (still covers all 12 months; prevents multi-minute downloads).
 _HISTORY_DAYS: dict[str, int] = {
     "nyiso":  730,   # monthly zip archives, ~21s
-    "spp":    730,   # monthly folder listing, fast
-    "pjm":    730,   # single paginated API (requires PJM_API_KEY)
+    "pjm":    730,   # single paginated API, chunked at 366d (requires PJM_API_KEY)
     "ercot":  730,   # paginated (requires ERCOT_API_KEY)
     "caiso":  400,   # 28-day chunks, 5s inter-chunk delay → ~3 min for 400d
     "miso":   400,   # per-day 1MB files → ~2 min for 400d at 5 workers
     "isone":  400,   # per-day API, no bulk/range endpoint → same profile as MISO
+    # spp is per-day file downloads despite the folder-listing step being fast —
+    # 730d measured at ~7.5 min live; 400d keeps this in the same ballpark as
+    # the other per-day fetchers above.
+    "spp":    400,
 }
 
 
