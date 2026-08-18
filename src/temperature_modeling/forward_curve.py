@@ -362,7 +362,7 @@ def _predict_monthly_price(
             raw = math.exp(sum(c * xi for c, xi in zip(coeffs, x)))
             price = min(max(raw, _PRICE_FLOOR), _PRICE_CAP)
             from .price_forecast import _price_bounds  # noqa: PLC0415
-            low, high = _price_bounds(x, model, price)
+            low, high = _price_bounds(x, model, price, month)
             return price, min(max(low, _PRICE_FLOOR), _PRICE_CAP), min(max(high, _PRICE_FLOOR), _PRICE_CAP)
 
     # Fallback heuristic: base price + gas pass-through + load-above-base sensitivity
