@@ -112,26 +112,64 @@ _HISTORY_DAYS: dict[str, int] = {
 }
 
 
+_SPACE_REPO_ID = "JollyAkshay/grid-dashboard"
+
+
+def _download_from_hub(filename: str) -> None:
+    """
+    Best-effort pull of a persisted cache file from this Space's own repo
+    into the local api_cache/ dir. The 6-hourly refresh_forecast_cache.yml
+    Action keeps these current; this is what lets a freshly-restarted
+    container start warm instead of either finding nothing (cache miss) or
+    doing a live fetch that can silently under-deliver under load/rate
+    limits, as happened to PJM the first time this was tested live. Public
+    repo, no token needed.
+    """
+    try:
+        from huggingface_hub import hf_hub_download  # noqa: PLC0415
+        hf_hub_download(repo_id=_SPACE_REPO_ID, repo_type="space",
+                         filename=filename, local_dir=str(_CACHE_DIR.parent))
+        log.info("Pulled %s from the Space repo", filename)
+    except Exception as exc:
+        log.info("Could not pull %s from the Space repo: %s", filename, exc)
+
+
 def _load_price_history(iso: str) -> list:
     """
     Return long-window price history with file-backed 24h cache.
-    First call per ISO may take 1-5 minutes (CAISO/MISO especially).
-    Subsequent calls within 24h read from disk in <1s.
+    First call per ISO may take 1-5 minutes (CAISO/MISO especially) unless
+    a copy the scheduled Action already fetched can be pulled from the
+    Space repo instead. Subsequent calls within 24h read from local disk
+    in <1s.
     """
     days = _HISTORY_DAYS.get(iso, 400)
     _CACHE_DIR.mkdir(exist_ok=True)
     cache_path = _CACHE_DIR / f"{iso}_price_history_{days}d.json"
 
-    if cache_path.exists():
+    def _read_local() -> list | None:
+        if not cache_path.exists():
+            return None
         age_h = (time.time() - cache_path.stat().st_mtime) / 3600
-        if age_h < _CACHE_MAX_AGE_H:
-            try:
-                data = json.loads(cache_path.read_text())
-                log.info("%s: price history loaded from cache (%d rows, %.1fh old)",
-                         iso.upper(), len(data), age_h)
-                return data
-            except Exception:
-                pass
+        if age_h >= _CACHE_MAX_AGE_H:
+            return None
+        try:
+            data = json.loads(cache_path.read_text())
+            log.info("%s: price history loaded from local cache (%d rows, %.1fh old)",
+                      iso.upper(), len(data), age_h)
+            return data or None
+        except Exception:
+            return None
+
+    data = _read_local()
+    if data is not None:
+        return data
+
+    # Local cache is missing/stale (fresh container restart) — try the
+    # Space repo's persisted copy before falling back to a live fetch.
+    _download_from_hub(f"api_cache/{iso}_price_history_{days}d.json")
+    data = _read_local()
+    if data is not None:
+        return data
 
     log.info("%s: fetching %d-day price history (cache miss)", iso.upper(), days)
     from .price_forecast import fetch_price_history, _attach_ng_prices  # noqa: PLC0415
