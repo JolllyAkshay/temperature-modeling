@@ -1254,8 +1254,14 @@ def load_forward_curve_data(iso, _daily):
         if not has_cache:
             return None  # show "loading" state; warmup endpoint is building it
     try:
-        from temperature_modeling.forward_curve import build_forward_curve
-        return build_forward_curve(iso, n_months=12)
+        from temperature_modeling.forward_curve import build_forward_curve, backtest_forward_curve
+        result = build_forward_curve(iso, n_months=12)
+        try:
+            result["backtest"] = backtest_forward_curve(iso)
+        except Exception:
+            log.exception("%s: forward curve backtest failed", iso.upper())
+            result["backtest"] = None
+        return result
     except Exception as exc:
         log.warning("Forward curve failed for %s: %s", iso, exc)
         return None
@@ -1363,7 +1369,18 @@ def render_forward_curve(data, iso):
     gas_months = len(data.get("gas_curve", []))
     rmse_str   = f"  |  RMSE ${rmse:.1f}/MWh" if rmse else ""
     train_str  = f"  |  Trained on {train_days}d" if train_days else ""
-    stats_str  = f"Model: {model_src}{rmse_str}{train_str}  |  Gas curve: {gas_months} EIA STEO months"
+
+    bt = data.get("backtest") or {}
+    n_comparisons = bt.get("n_comparisons") or 0
+    if n_comparisons:
+        bt_str = f"  |  Backtest: {n_comparisons} realized month{'s' if n_comparisons != 1 else ''}, MAPE {bt['mape']}%"
+    elif bt.get("n_snapshots"):
+        n_snap = bt["n_snapshots"]
+        bt_str = f"  |  Backtest: accumulating ({n_snap} snapshot{'s' if n_snap != 1 else ''}, no completed months yet)"
+    else:
+        bt_str = ""
+
+    stats_str = f"Model: {model_src}{rmse_str}{train_str}  |  Gas curve: {gas_months} EIA STEO months{bt_str}"
 
     return fc_fig, ss_fig, stats_str
 
