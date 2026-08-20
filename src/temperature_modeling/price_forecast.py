@@ -62,7 +62,20 @@ def _write_price_history_cache(path: str, data: list) -> None:
 
 _EIA_LOAD_URL   = "https://api.eia.gov/v2/electricity/rto/region-data/data/"
 _EIA_NG_URL     = "https://api.eia.gov/v2/natural-gas/pri/fut/data/"   # daily Henry Hub spot
+_EIA_NG_SUM_URL = "https://api.eia.gov/v2/natural-gas/pri/sum/data/"   # state-level monthly, by sector
 _NYISO_LMP_URL  = "https://mis.nyiso.com/public/csv/damlbmp/{date}damlbmp_zone.csv"
+
+# Representative state per ISO for regional electric-power-sector gas prices.
+# A single state is a coarse proxy for ISOs spanning many states (PJM, MISO,
+# SPP especially), but it's a large improvement over one national Henry Hub
+# number for every ISO — regional basis blowouts (New England winter gas
+# constraints being the clearest example: measured MA electric-power gas at
+# $19-27/MCF in Jan-Feb 2026 vs ~$2.87 Henry Hub the same months) are exactly
+# what a single national price can't represent.
+_ISO_GAS_STATE = {
+    "pjm": "PA", "caiso": "CA", "ercot": "TX", "miso": "IL",
+    "nyiso": "NY", "isone": "MA", "spp": "KS",
+}
 _ISONE_API_BASE = "https://webservices.iso-ne.com/api/v1.1"
 
 # SPP Marketplace DA LMP — public, no auth needed
@@ -230,6 +243,70 @@ def fetch_henry_hub_daily(start: str, end: str) -> dict:
         if last_val is not None:
             result[ds] = last_val
         cur += timedelta(days=1)
+    return result
+
+
+def _regional_gas_cache_path(state: str) -> str:
+    return os.path.join(
+        os.path.dirname(__file__), "..", "..", "api_cache", f"gas_price_{state}_monthly.json"
+    )
+
+
+def fetch_regional_gas_price_monthly(state: str, start_ym: str, end_ym: str) -> dict[str, float]:
+    """
+    Return {YYYY-MM: $/MMBtu} electric-power-sector natural gas price for a
+    state (EIA process=PEU — "delivered to electric power" — the right
+    proxy for generator fuel cost, not the retail/commercial rate). Treats
+    $/MCF ≈ $/MMBtu (natural gas heating value is ~1.037 MMBtu/Mcf; the ~4%
+    difference is small next to the state-level/monthly approximation this
+    already is).
+
+    Cached 24h per state — this is monthly-granularity data that changes
+    rarely, and _eia_get has no retry logic, so hitting EIA fresh for every
+    ISO on every fit (7 calls back-to-back with no delay between them) was
+    triggering transient failures that silently degraded to Henry-Hub-only
+    for whichever ISO got unlucky, producing unstable, hard-to-reproduce
+    model quality between runs.
+    """
+    cache_path = _regional_gas_cache_path(state)
+    if os.path.exists(cache_path):
+        try:
+            age_h = (time.time() - os.path.getmtime(cache_path)) / 3600
+            if age_h < 24:
+                with open(cache_path, encoding="utf-8") as f:
+                    cached = json.load(f)
+                if cached:
+                    return cached
+        except Exception:
+            pass
+
+    rows = _eia_get(_EIA_NG_SUM_URL, {
+        "frequency":            "monthly",
+        "data[0]":              "value",
+        "facets[duoarea][]":    f"S{state}",
+        "facets[process][]":    "PEU",
+        "start":                start_ym,
+        "end":                  end_ym,
+        "length":               300,
+    })
+    result: dict[str, float] = {}
+    for row in rows:
+        period = row.get("period", "")
+        value  = row.get("value")
+        if period and value is not None:
+            try:
+                result[period] = float(value)
+            except (TypeError, ValueError):
+                pass
+
+    if result:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(result, f)
+        except OSError:
+            log.warning("Could not write regional gas price cache to %s", cache_path)
+
     return result
 
 
@@ -928,18 +1005,35 @@ def price_unavailable_reason(iso: str) -> str:
     return "Price data unavailable for this ISO"
 
 
-def _attach_ng_prices(history: list) -> list:
+def _attach_ng_prices(history: list, iso: str | None = None) -> list:
     """
-    Attach Henry Hub NG spot price to each history record.
-    Records without a matching NG price are kept with ng_price=None
+    Attach a natural gas price to each history record — the ISO's own
+    regional electric-power-sector price (state-level monthly, from EIA)
+    when available, falling back to national Henry Hub daily spot for
+    dates the regional series doesn't cover yet (it publishes with more
+    lag than Henry Hub) or when no ISO/state mapping is given.
+
+    Regional matters a lot: measured MA electric-power gas at $19-27/MCF
+    in Jan-Feb 2026 vs ~$2.87 Henry Hub the same months — a single
+    national price can't represent that kind of regional basis blowout.
+    Records without any matching NG price are kept with ng_price=None
     (the model falls back to the 5-feature version for those rows).
     """
     if not history:
         return history
     dates = sorted(r["date"] for r in history)
-    ng = fetch_henry_hub_daily(dates[0], dates[-1])
+    hh = fetch_henry_hub_daily(dates[0], dates[-1])
+
+    regional: dict[str, float] = {}
+    state = _ISO_GAS_STATE.get(iso) if iso else None
+    if state:
+        try:
+            regional = fetch_regional_gas_price_monthly(state, dates[0][:7], dates[-1][:7])
+        except Exception:
+            log.warning("%s: regional gas price fetch failed — using Henry Hub only", iso.upper() if iso else "?")
+
     for r in history:
-        r["ng_price"] = ng.get(r["date"])
+        r["ng_price"] = regional.get(r["date"][:7], hh.get(r["date"]))
     return history
 
 
@@ -1152,7 +1246,7 @@ def forecast_prices(iso: str, load_forecast: list) -> list:
     if not history:
         return []
 
-    history = _attach_ng_prices(history)
+    history = _attach_ng_prices(history, iso)
     model = _fit_price_model(history)
     if not model:
         return []

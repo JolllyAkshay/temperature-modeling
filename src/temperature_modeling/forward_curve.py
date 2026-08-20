@@ -178,7 +178,7 @@ def _load_price_history(iso: str) -> list:
     from .price_forecast import fetch_price_history, _attach_ng_prices  # noqa: PLC0415
     history = fetch_price_history(iso, days=days)
     if history:
-        history = _attach_ng_prices(history)
+        history = _attach_ng_prices(history, iso)
         try:
             cache_path.write_text(json.dumps(history))
             log.info("%s: price history cached (%d rows)", iso.upper(), len(history))
