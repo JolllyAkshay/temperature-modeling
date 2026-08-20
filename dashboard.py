@@ -1247,10 +1247,7 @@ def load_forward_curve_data(iso, _daily):
     _cache_dir = _HERE / "api_cache"
     _slow_fetch = {"spp"}  # ISOs that do a multi-minute HTTP crawl without a cache
     if iso in _slow_fetch:
-        has_cache = (
-            (_cache_dir / f"{iso}_price_history_730d.json").exists()
-            or (_cache_dir / f"{iso}_price_history_400d.json").exists()
-        )
+        has_cache = (_cache_dir / f"{iso}_price_history_archive.json").exists()
         if not has_cache:
             return None  # show "loading" state; warmup endpoint is building it
     try:

@@ -523,7 +523,7 @@ async def warm_forward_curve(
     return {
         "status":     "warming",
         "iso":        iso,
-        "cache_path": f"api_cache/{iso}_price_history_730d.json",
+        "cache_path": f"api_cache/{iso}_price_history_archive.json",
     }
 
 

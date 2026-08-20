@@ -103,13 +103,18 @@ jobs:
           repo = "JollyAkshay/grid-dashboard"
           token = os.environ["HF_TOKEN"]
           isos = ["pjm", "caiso", "ercot", "miso", "nyiso", "isone", "spp"]
-          days = {"pjm": 730, "ercot": 730, "isone": 730, "nyiso": 730, "spp": 730,
-                  "caiso": 400, "miso": 400}
 
           # Existing archive (if any) so today's snapshot appends instead of
-          # starting the history over from a fresh checkout every run.
+          # starting the history over from a fresh checkout every run. Also
+          # grab any legacy fixed-window cache (730d/400d, naming varies by
+          # when it was last written) so _load_price_history's one-time
+          # migration has something to seed the new archive from on a
+          # runner that has never built one before — otherwise every ISO
+          # would re-bootstrap from scratch on this workflow's first run
+          # after the archive-format switch.
           filenames = [f"api_cache/{iso}_forward_curve_history.jsonl" for iso in isos]
-          filenames += [f"api_cache/{iso}_price_history_{days[iso]}d.json" for iso in isos]
+          filenames += [f"api_cache/{iso}_price_history_archive.json" for iso in isos]
+          filenames += [f"api_cache/{iso}_price_history_{d}d.json" for iso in isos for d in (730, 400)]
           filenames.append("api_cache/hh_futures_cache.json")
 
           for filename in filenames:
@@ -152,7 +157,7 @@ jobs:
 
           patterns = [
               "api_cache/*_forward_curve_history.jsonl",
-              "api_cache/*_price_history_*d.json",
+              "api_cache/*_price_history_archive.json",
               "api_cache/hh_futures_cache.json",
           ]
           for pattern in patterns:

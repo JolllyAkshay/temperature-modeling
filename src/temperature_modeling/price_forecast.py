@@ -494,8 +494,13 @@ def _fetch_isone_price_history(days: int = 90) -> list:
 
 
 def _spp_price_history_cache_path(days: int) -> str:
+    # "_raw" keeps this filename pattern structurally distinct from
+    # forward_curve.py's persisted archive (*_price_history_archive.json) —
+    # this cache holds unenriched rows straight from the live fetcher,
+    # not the ng/renewable-attached data the archive stores, and the two
+    # must never resolve to the same path.
     return os.path.join(
-        os.path.dirname(__file__), "..", "..", "api_cache", f"spp_price_history_{days}d.json"
+        os.path.dirname(__file__), "..", "..", "api_cache", f"spp_price_history_raw_{days}d.json"
     )
 
 
@@ -691,8 +696,13 @@ def _fetch_miso_price_history(days: int = 90) -> list:
 
 
 def _caiso_price_history_cache_path(days: int) -> str:
+    # "_raw" keeps this filename pattern structurally distinct from
+    # forward_curve.py's persisted archive (*_price_history_archive.json) —
+    # this cache holds unenriched rows straight from the live fetcher,
+    # not the ng/renewable-attached data the archive stores, and the two
+    # must never resolve to the same path.
     return os.path.join(
-        os.path.dirname(__file__), "..", "..", "api_cache", f"caiso_price_history_{days}d.json"
+        os.path.dirname(__file__), "..", "..", "api_cache", f"caiso_price_history_raw_{days}d.json"
     )
 
 

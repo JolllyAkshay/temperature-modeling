@@ -98,9 +98,14 @@ _PRICE_FLOOR = 1.0
 _CACHE_DIR = Path(__file__).parent.parent.parent / "api_cache"
 _CACHE_MAX_AGE_H = 24
 
-# Per-ISO history depth. ISOs with fast bulk/paginated fetchers use 730 days
-# (2 full seasonal cycles). ISOs with per-day file fetchers cap at 400 days
-# (still covers all 12 months; prevents multi-minute downloads).
+# Per-ISO *bootstrap* history depth — used only for the very first fetch, when
+# no archive exists yet anywhere (local disk or the Space repo). ISOs with
+# fast bulk/paginated fetchers bootstrap at 730 days (2 full seasonal
+# cycles) in one shot. ISOs with slow per-day/chunked fetchers bootstrap at
+# 400 days to keep the first fetch under a few minutes, then grow toward
+# the same 730-day depth over time via small incremental top-ups (see
+# _load_price_history) — no need to ever repeat a slow multi-hundred-day
+# live fetch once an archive exists.
 _HISTORY_DAYS: dict[str, int] = {
     "nyiso":  730,   # monthly zip archives, ~21s
     "pjm":    730,   # single paginated API, chunked at 366d (requires PJM_API_KEY)
@@ -113,6 +118,11 @@ _HISTORY_DAYS: dict[str, int] = {
     # the other per-day fetchers above.
     "spp":    400,
 }
+
+_MAX_ARCHIVE_DAYS   = 730   # cap on how far the growing archive is allowed to reach
+_ARCHIVE_TOPUP_DAYS = 14    # incremental fetch window once an archive already exists —
+                            # generous buffer over the 6-hourly refresh cadence so a
+                            # missed run or two doesn't create a gap
 
 
 _SPACE_REPO_ID = "JollyAkshay/grid-dashboard"
@@ -137,27 +147,62 @@ def _download_from_hub(filename: str) -> None:
         log.info("Could not pull %s from the Space repo: %s", filename, exc)
 
 
+def _archive_path(iso: str) -> Path:
+    return _CACHE_DIR / f"{iso}_price_history_archive.json"
+
+
+def _migrate_legacy_cache(iso: str) -> list | None:
+    """
+    One-time migration: seed the new growing archive from whatever
+    fixed-window cache file this ISO already has (local disk or the Space
+    repo), instead of discarding a slow bootstrap fetch that already ran
+    this session. Old files used the {iso}_price_history_{days}d.json
+    naming scheme, with `days` sometimes 400 and sometimes 730 depending
+    on when the file was written (isone/spp moved 730 -> 400 mid-session).
+    """
+    candidates = sorted({_HISTORY_DAYS.get(iso, 400), 730, 400}, reverse=True)
+    for days in candidates:
+        legacy_path = _CACHE_DIR / f"{iso}_price_history_{days}d.json"
+        if not legacy_path.exists():
+            _download_from_hub(f"api_cache/{iso}_price_history_{days}d.json")
+        if legacy_path.exists():
+            try:
+                data = json.loads(legacy_path.read_text())
+                if data:
+                    log.info("%s: migrated %d rows from legacy cache %s",
+                              iso.upper(), len(data), legacy_path.name)
+                    return data
+            except Exception:
+                continue
+    return None
+
+
 def _load_price_history(iso: str) -> list:
     """
-    Return long-window price history with file-backed 24h cache.
-    First call per ISO may take 1-5 minutes (CAISO/MISO especially) unless
-    a copy the scheduled Action already fetched can be pulled from the
-    Space repo instead. Subsequent calls within 24h read from local disk
-    in <1s.
-    """
-    days = _HISTORY_DAYS.get(iso, 400)
-    _CACHE_DIR.mkdir(exist_ok=True)
-    cache_path = _CACHE_DIR / f"{iso}_price_history_{days}d.json"
+    Return price history backed by a growing, persisted archive rather than
+    a fixed rolling window. Once bootstrapped, each refresh only fetches the
+    last _ARCHIVE_TOPUP_DAYS days and merges them in — so CAISO/MISO/ISO-NE/
+    SPP (which bootstrap at 400 days, see _HISTORY_DAYS) grow toward the
+    same 730-day depth PJM/ERCOT/NYISO get in one shot, without ever
+    repeating a slow multi-hundred-day live fetch.
 
-    def _read_local() -> list | None:
+    First call per ISO may take 1-5 minutes (CAISO/MISO especially) unless
+    an existing archive — or a legacy fixed-window cache to migrate from —
+    can be pulled from the Space repo instead. Subsequent calls within 24h
+    read from local disk in <1s.
+    """
+    _CACHE_DIR.mkdir(exist_ok=True)
+    cache_path = _archive_path(iso)
+
+    def _read_local(ignore_age: bool = False) -> list | None:
         if not cache_path.exists():
             return None
         age_h = (time.time() - cache_path.stat().st_mtime) / 3600
-        if age_h >= _CACHE_MAX_AGE_H:
+        if not ignore_age and age_h >= _CACHE_MAX_AGE_H:
             return None
         try:
             data = json.loads(cache_path.read_text())
-            log.info("%s: price history loaded from local cache (%d rows, %.1fh old)",
+            log.info("%s: price history archive loaded from local cache (%d rows, %.1fh old)",
                       iso.upper(), len(data), age_h)
             return data or None
         except Exception:
@@ -167,22 +212,41 @@ def _load_price_history(iso: str) -> list:
     if data is not None:
         return data
 
-    # Local cache is missing/stale (fresh container restart) — try the
+    # Local archive is missing/stale (fresh container restart) — try the
     # Space repo's persisted copy before falling back to a live fetch.
-    _download_from_hub(f"api_cache/{iso}_price_history_{days}d.json")
+    _download_from_hub(f"api_cache/{iso}_price_history_archive.json")
     data = _read_local()
     if data is not None:
         return data
 
-    log.info("%s: fetching %d-day price history (cache miss)", iso.upper(), days)
     from .price_forecast import fetch_price_history, _attach_ng_prices, _attach_renewable_generation  # noqa: PLC0415
-    history = fetch_price_history(iso, days=days)
+
+    # A stale local/Hub archive (or one seeded from the legacy fixed-window
+    # cache) is still a far better top-up base than starting from nothing —
+    # only fall through to a full bootstrap fetch if no archive exists
+    # anywhere at all.
+    existing = _read_local(ignore_age=True)
+    if existing is None:
+        existing = _migrate_legacy_cache(iso)
+
+    if existing:
+        log.info("%s: topping up price history archive (%d existing rows)", iso.upper(), len(existing))
+        fresh = fetch_price_history(iso, days=_ARCHIVE_TOPUP_DAYS)
+        merged = {r["date"]: r for r in existing}
+        for r in fresh:
+            merged[r["date"]] = r  # fresh data wins on overlapping dates
+        history = sorted(merged.values(), key=lambda r: r["date"])[-_MAX_ARCHIVE_DAYS:]
+    else:
+        days = _HISTORY_DAYS.get(iso, 400)
+        log.info("%s: bootstrapping %d-day price history archive (cache miss)", iso.upper(), days)
+        history = fetch_price_history(iso, days=days)
+
     if history:
         history = _attach_ng_prices(history, iso)
         history = _attach_renewable_generation(history, iso)
         try:
             cache_path.write_text(json.dumps(history))
-            log.info("%s: price history cached (%d rows)", iso.upper(), len(history))
+            log.info("%s: price history archive saved (%d rows)", iso.upper(), len(history))
         except Exception:
             pass
     return history
