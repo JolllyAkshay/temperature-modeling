@@ -1037,6 +1037,33 @@ def _attach_ng_prices(history: list, iso: str | None = None) -> list:
     return history
 
 
+def _attach_renewable_generation(history: list, iso: str | None = None) -> list:
+    """
+    Attach renewable_gw (solar + wind) to each history record for ISOs with
+    material renewable penetration (currently caiso/ercot/pjm/miso — see
+    net_load._ISO_RENEWABLES). Lets _fit_price_model use net load
+    (load - renewables) instead of raw load: for CAISO/ERCOT specifically,
+    price is driven as much by how much solar/wind is on the grid as by
+    gross demand (CAISO's duck curve is the textbook example — verified
+    empirically that plugging in regional gas price alone regressed CAISO's
+    calibration, consistent with its price formation being renewable- not
+    gas-driven). Records without renewable data are kept with
+    renewable_gw=None (the model uses raw load for those rows/ISOs).
+    """
+    if not history or not iso:
+        return history
+    from .net_load import fetch_historical_renewable_generation  # noqa: PLC0415
+    dates = sorted(r["date"] for r in history)
+    try:
+        renewables = fetch_historical_renewable_generation(iso, dates[0], dates[-1])
+    except Exception:
+        log.warning("%s: historical renewable generation fetch failed", iso.upper())
+        renewables = {}
+    for r in history:
+        r["renewable_gw"] = renewables.get(r["date"])
+    return history
+
+
 # ---------------------------------------------------------------------------
 # Regression model (log-linear load → price, optional NG co-variate)
 # ---------------------------------------------------------------------------
@@ -1061,9 +1088,16 @@ def _price_quantile_coeffs(X: "np.ndarray", y: "np.ndarray", quantile: float) ->
 
 def _fit_price_model(history: list) -> dict | None:
     """
-    Fit OLS: log(price) ~ log(load) + weekday + sin_month + cos_month [+ log(ng_price)] + intercept.
-    If Henry Hub NG prices are available for ≥ half the rows the model uses 6 features;
-    otherwise falls back to 5 features (no NG term).
+    Fit OLS: log(load_or_net_load) + weekday + sin_month + cos_month [+ log(ng_price)] + intercept
+    ~ log(price). Uses net load (load - solar - wind) instead of raw load
+    when renewable generation data is available for ≥ half the rows — for
+    ISOs with material renewable penetration (CAISO's duck curve, ERCOT's
+    wind fleet), price tracks how much renewable generation is on the grid
+    at least as much as it tracks gross demand; raw load alone can't
+    explain a price collapse on a sunny/windy day at the same load level
+    as a still/cloudy one. If Henry Hub NG prices are available for ≥ half
+    the rows the model uses 6 features; otherwise falls back to 5 features
+    (no NG term).
 
     Also fits p10/p90 linear quantile regressions on the same features, with a
     conformal calibration step (Romano et al. 2019 CQR — same methodology
@@ -1097,14 +1131,29 @@ def _fit_price_model(history: list) -> dict | None:
     rows_with_ng = [r for r in rows if r.get("ng_price") and r["ng_price"] > 0]
     use_ng = len(rows_with_ng) >= len(rows) // 2
 
+    n_with_renewable = sum(1 for r in rows if r.get("renewable_gw") is not None)
+    use_net_load = n_with_renewable >= len(rows) // 2
+    if use_net_load:
+        log.info("Price model: using net load (renewable data on %d/%d rows)",
+                 n_with_renewable, len(rows))
+
     fit_rows = rows_with_ng if use_ng else rows
+
+    # Net load floor: CAISO/ERCOT can have renewables exceed load (negative
+    # net load / negative prices) — floor at a small positive value so
+    # log() stays defined while still compressing hard into "very low net
+    # load" territory, which is exactly the regime that matters here.
+    _NET_LOAD_FLOOR_MW = 100.0
 
     X, y_vals, months = [], [], []
     for r in fit_rows:
         d = date.fromisoformat(r["date"])
         month = d.month
+        load_feature = r["load_mw"]
+        if use_net_load and r.get("renewable_gw") is not None:
+            load_feature = max(r["load_mw"] - r["renewable_gw"] * 1000, _NET_LOAD_FLOOR_MW)
         row_x = [
-            math.log(max(r["load_mw"], 1)),
+            math.log(max(load_feature, 1)),
             float(d.weekday() < 5),
             math.sin(2 * math.pi * month / 12),
             math.cos(2 * math.pi * month / 12),
@@ -1200,6 +1249,7 @@ def _fit_price_model(history: list) -> dict | None:
         "coeffs":                coeffs.tolist(),
         "rmse":                  round(rmse, 2),
         "use_ng":                use_ng,
+        "use_net_load":          use_net_load,
         "p10_coeffs":            p10_coeffs,
         "p90_coeffs":            p90_coeffs,
         "cqr_delta_usd_mwh":     cqr_delta,
@@ -1247,17 +1297,30 @@ def forecast_prices(iso: str, load_forecast: list) -> list:
         return []
 
     history = _attach_ng_prices(history, iso)
+    history = _attach_renewable_generation(history, iso)
     model = _fit_price_model(history)
     if not model:
         return []
 
-    coeffs  = model["coeffs"]
-    rmse    = model["rmse"]
-    use_ng  = model.get("use_ng", False)
+    coeffs       = model["coeffs"]
+    rmse         = model["rmse"]
+    use_ng       = model.get("use_ng", False)
+    use_net_load = model.get("use_net_load", False)
 
     # For forecasting future days, use a 7-day trailing average of NG spot as proxy
     ng_vals = [r["ng_price"] for r in history if r.get("ng_price") and r["ng_price"] > 0]
     ng_forecast = sum(ng_vals[-7:]) / len(ng_vals[-7:]) if ng_vals else None
+
+    # Live renewable forecast for the same window the model was fit to expect
+    renewable_forecast: dict[str, float] = {}
+    if use_net_load:
+        try:
+            from .net_load import fetch_net_load_forecast  # noqa: PLC0415
+            fc_dates = [date.fromisoformat(d["date"]) for d in load_forecast]
+            for row in fetch_net_load_forecast(iso, fc_dates):
+                renewable_forecast[row["date"]] = row["renewable_gw"]
+        except Exception:
+            log.warning("%s: renewable forecast unavailable — using raw load for price", iso.upper())
 
     # Sanity bounds: reject forecast if regression wildly extrapolates
     train_prices = [r["price"] for r in history if r.get("price") and r["price"] > 0]
@@ -1278,8 +1341,12 @@ def forecast_prices(iso: str, load_forecast: list) -> list:
             continue
         d = date.fromisoformat(day["date"])
         month = d.month
+        load_feature = load_mw
+        renewable_gw = renewable_forecast.get(day["date"])
+        if use_net_load and renewable_gw is not None:
+            load_feature = max(load_mw - renewable_gw * 1000, 100.0)
         x = [
-            math.log(max(load_mw, 1)),
+            math.log(max(load_feature, 1)),
             float(d.weekday() < 5),
             math.sin(2 * math.pi * month / 12),
             math.cos(2 * math.pi * month / 12),

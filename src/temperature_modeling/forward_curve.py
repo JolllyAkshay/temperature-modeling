@@ -175,10 +175,11 @@ def _load_price_history(iso: str) -> list:
         return data
 
     log.info("%s: fetching %d-day price history (cache miss)", iso.upper(), days)
-    from .price_forecast import fetch_price_history, _attach_ng_prices  # noqa: PLC0415
+    from .price_forecast import fetch_price_history, _attach_ng_prices, _attach_renewable_generation  # noqa: PLC0415
     history = fetch_price_history(iso, days=days)
     if history:
         history = _attach_ng_prices(history, iso)
+        history = _attach_renewable_generation(history, iso)
         try:
             cache_path.write_text(json.dumps(history))
             log.info("%s: price history cached (%d rows)", iso.upper(), len(history))
@@ -339,6 +340,7 @@ def _predict_monthly_price(
     ng_price: float,
     model: dict | None,
     iso: str,
+    renewable_gw: float | None = None,
 ) -> tuple[float, float | None, float | None]:
     """
     Predict monthly average price ($/MWh).
@@ -349,8 +351,11 @@ def _predict_monthly_price(
     if model:
         coeffs = model["coeffs"]
         use_ng = model.get("use_ng", False)
+        load_feature = load_mw
+        if model.get("use_net_load") and renewable_gw is not None:
+            load_feature = max(load_mw - renewable_gw * 1000, 100.0)
         x = [
-            math.log(max(load_mw, 1.0)),
+            math.log(max(load_feature, 1.0)),
             0.71,   # fraction of weekdays in a typical month
             math.sin(2 * math.pi * month / 12),
             math.cos(2 * math.pi * month / 12),
@@ -412,6 +417,21 @@ def build_forward_curve(iso: str, n_months: int = 12) -> dict[str, Any]:
                         iso.upper(), len(unique_months))
             model = None
 
+    # Seasonal renewable climatology (monthly average from the same history
+    # the model was fit on) — the forward curve predicts a delivery month
+    # 1-12 months out, not a specific day, so there's no "forecast" of
+    # renewable output to use the way the 15-day dashboard panel can; the
+    # historical monthly average is the equivalent of the weather normals
+    # already used for temperature.
+    renewable_by_month: dict[int, float] = {}
+    if model and model.get("use_net_load") and history:
+        from collections import defaultdict
+        vals_by_month: dict[int, list] = defaultdict(list)
+        for r in history:
+            if r.get("renewable_gw") is not None:
+                vals_by_month[date.fromisoformat(r["date"]).month].append(r["renewable_gw"])
+        renewable_by_month = {m: sum(v) / len(v) for m, v in vals_by_month.items() if v}
+
     # Sanity ceiling: 5× max training price or $300, whichever is larger
     train_prices = [r["price"] for r in history if r.get("price") and r["price"] > 0]
     _price_ceiling = max(max(train_prices) * 5, 300.0) if train_prices else 300.0
@@ -439,11 +459,14 @@ def build_forward_curve(iso: str, n_months: int = 12) -> dict[str, Any]:
             ng_price = next(iter(gas_curve.values()), 3.50) if gas_curve else 3.50
         gas_assumptions[ym] = round(ng_price, 2)
 
+        month_renewable_gw = renewable_by_month.get(month)
+
         scenarios: dict[str, dict] = {}
         for scenario_name, temp_offset in [("cold", -std_temp), ("base", 0.0), ("hot", +std_temp)]:
             temp    = normal_temp + temp_offset
             load_gw = _monthly_load_gw(iso, temp)
-            price, low, high = _predict_monthly_price(load_gw * 1000, month, ng_price, model, iso)
+            price, low, high = _predict_monthly_price(
+                load_gw * 1000, month, ng_price, model, iso, month_renewable_gw)
             # If OLS blows up for this month, fall back to heuristic
             if price > _price_ceiling:
                 log.warning("%s %s: OLS price $%.0f exceeds ceiling $%.0f — using heuristic",
