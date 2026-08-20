@@ -1269,11 +1269,15 @@ def _price_bounds(x: list, model: dict, point_price: float, month: int | None = 
     delta = model.get("cqr_delta_usd_mwh")
     if month is not None:
         half_key = "cqr_delta_h1_usd_mwh" if month in (11, 12, 1, 2, 3, 4) else "cqr_delta_h2_usd_mwh"
-        delta = model.get(half_key) or delta
+        half_delta = model.get(half_key)
+        if half_delta is not None:   # `or` would wrongly discard a legitimate 0.0
+            delta = half_delta
     if p10c is not None and p90c is not None and delta is not None and len(x) == len(p10c):
         low  = math.exp(sum(c * xi for c, xi in zip(p10c, x))) - delta
         high = math.exp(sum(c * xi for c, xi in zip(p90c, x))) + delta
-        return max(low, 1.0), max(high, low)
+        low  = max(low, 1.0)
+        high = max(high, low)   # compare against the *clamped* low, not the raw one
+        return low, high
     rmse = model.get("rmse", 0.0)
     return max(point_price - rmse, 0), point_price + rmse
 
@@ -1322,8 +1326,11 @@ def forecast_prices(iso: str, load_forecast: list) -> list:
         except Exception:
             log.warning("%s: renewable forecast unavailable — using raw load for price", iso.upper())
 
-    # Sanity bounds: reject forecast if regression wildly extrapolates
-    train_prices = [r["price"] for r in history if r.get("price") and r["price"] > 0]
+    # Sanity bounds: reject forecast if regression wildly extrapolates.
+    # Was reading a "price" key no history row has ever had (always
+    # "price_usd_mwh") — train_prices was always empty, so every ISO fell
+    # back to the flat $500 default regardless of its real price range.
+    train_prices = [r["price_usd_mwh"] for r in history if r.get("price_usd_mwh") and r["price_usd_mwh"] > 0]
     max_train_price = max(train_prices) if train_prices else 500.0
     price_ceiling = max(max_train_price * 20, 2000.0)   # 20× max training price or $2000
 

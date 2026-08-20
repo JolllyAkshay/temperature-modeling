@@ -432,8 +432,13 @@ def build_forward_curve(iso: str, n_months: int = 12) -> dict[str, Any]:
                 vals_by_month[date.fromisoformat(r["date"]).month].append(r["renewable_gw"])
         renewable_by_month = {m: sum(v) / len(v) for m, v in vals_by_month.items() if v}
 
-    # Sanity ceiling: 5× max training price or $300, whichever is larger
-    train_prices = [r["price"] for r in history if r.get("price") and r["price"] > 0]
+    # Sanity ceiling: 5× max training price or $300, whichever is larger.
+    # Was reading a "price" key that no history row has ever had (always
+    # "price_usd_mwh") — train_prices was always empty, so every ISO got the
+    # flat $300 fallback regardless of its real price range, silently
+    # discarding legitimate high predictions (and their new CQR bounds) for
+    # ISOs like ISO-NE that have genuinely settled above $400/MWh.
+    train_prices = [r["price_usd_mwh"] for r in history if r.get("price_usd_mwh") and r["price_usd_mwh"] > 0]
     _price_ceiling = max(max(train_prices) * 5, 300.0) if train_prices else 300.0
 
     # Henry Hub forward curve
