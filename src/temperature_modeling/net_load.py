@@ -110,7 +110,14 @@ def fetch_historical_renewable_generation(iso: str, start: str, end: str) -> dic
         "wind_speed_unit": "ms",
     }
     try:
-        data = get_json(ERA5_ARCHIVE_URL, params, session, "renewable-history")
+        # This is always a best-effort feature attachment (callers already
+        # fall back to raw load on failure) — get_json's default 5-retry,
+        # 65s-start backoff can block up to ~33 minutes under sustained
+        # 429s, which is fine for nothing else that calls this function.
+        # Cap it tightly so a rate-limited run degrades in seconds, not
+        # minutes.
+        data = get_json(ERA5_ARCHIVE_URL, params, session, "renewable-history",
+                         _retries=2, _backoff=8.0)
     except Exception:
         log.warning("%s: historical renewable generation fetch failed", iso.upper())
         return {}

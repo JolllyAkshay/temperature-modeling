@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
@@ -243,14 +244,27 @@ def generate_cache(iso, cfg):
     era5_avg_hist, recent_avg_f = {}, []
 
     log.info("%s: fetching ERA5 for %d locations ...", iso.upper(), len(locations))
+    # ERA5's default retry policy (get_json, via fetch_era5_daily) can block
+    # up to ~33 minutes per location under sustained 429s — fine for a
+    # one-off backtest, fatal for a 30-minute scheduled job running 7 ISOs
+    # sequentially. This is best-effort data (GFS fallback below covers a
+    # total failure), so use a much tighter retry budget, plus a wall-clock
+    # ceiling on the whole per-ISO loop as a backstop in case even the
+    # tightened per-call budget adds up across many locations.
+    era5_loop_deadline = time.time() + 60
     try:
         per_label = {}
         for i, loc in enumerate(locations, 1):
+            if time.time() > era5_loop_deadline:
+                log.warning("%s: ERA5 hindcast budget exceeded — stopping at %d/%d locations",
+                            iso.upper(), i - 1, len(locations))
+                break
             log.info("  [%d/%d] %s", i, len(locations), loc["label"])
             per_label[loc["label"]] = fetch_era5_daily(
                 Coordinates(loc["lat"], loc["lon"]),
                 today - timedelta(days=16), today - timedelta(days=1),
                 era5_session,
+                retries=2, backoff=8.0,
             )
         era5_avg_hist = per_label
         for lag_d in sorted(today - timedelta(days=k) for k in range(8, 0, -1)):

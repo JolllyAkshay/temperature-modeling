@@ -71,6 +71,8 @@ def fetch_era5_daily(
     end: date,
     session: requests.Session,
     variable: str = "temperature_2m",
+    retries: int = 5,
+    backoff: float = 65.0,
 ) -> Dict[date, float]:
     """
     Fetch an ERA5 hourly variable from the Open-Meteo archive and return
@@ -86,6 +88,13 @@ def fetch_era5_daily(
         Shared requests.Session.
     variable:
         Open-Meteo hourly variable name (default ``"temperature_2m"``).
+    retries, backoff:
+        Passed through to get_json's 429 retry policy. The 65s-start,
+        5-retry default can block for up to ~33 minutes in the worst case
+        (65+130+260+520+1040s) — fine for a one-off backtest, but far too
+        long for a best-effort call inside a time-boxed batch job. Callers
+        like precache_forecasts.py's hindcast loop (which already has a
+        GFS-based fallback if this fails) should pass a much tighter budget.
 
     Returns
     -------
@@ -105,7 +114,7 @@ def fetch_era5_daily(
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
     }
-    data = get_json(ERA5_ARCHIVE_URL, params, session, "ERA5")
+    data = get_json(ERA5_ARCHIVE_URL, params, session, "ERA5", _retries=retries, _backoff=backoff)
     return hourly_to_daily_mean(data, variable)
 
 
@@ -236,7 +245,7 @@ def get_json(
 
     for attempt in range(_retries):
         try:
-            resp = session.get(url, params=params)
+            resp = session.get(url, params=params, timeout=30)
         except requests.RequestException as exc:
             raise SatelliteAPIError(f"{label} request failed: {exc}") from exc
 
