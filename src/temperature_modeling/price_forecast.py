@@ -452,28 +452,39 @@ def _fetch_isone_price_history(days: int = 90) -> list:
     session.auth = (_ISONE_API_USER, _ISONE_API_PASS)
     session.headers["Accept"] = "application/json"
 
-    def _fetch_day(d: date) -> tuple[str, float | None]:
+    def _fetch_day(d: date) -> tuple[str, float | None, str | None]:
+        """Third element is a short failure reason, or None on success."""
         url = f"{_ISONE_API_BASE}/hourlylmp/da/final/day/{d.strftime('%Y%m%d')}/location/4000.json"
         try:
             r = session.get(url, timeout=30)
             if r.status_code != 200:
-                return d.isoformat(), None
+                return d.isoformat(), None, f"HTTP {r.status_code}"
             lmps = [
                 float(entry["LmpTotal"])
                 for entry in r.json().get("HourlyLmps", {}).get("HourlyLmp", [])
                 if entry.get("LmpTotal") is not None
             ]
-            avg = (sum(lmps) / len(lmps)) if lmps else None
-            return d.isoformat(), avg
-        except Exception:
-            return d.isoformat(), None
+            if not lmps:
+                return d.isoformat(), None, "no LmpTotal entries in response"
+            return d.isoformat(), sum(lmps) / len(lmps), None
+        except Exception as exc:
+            return d.isoformat(), None, f"{type(exc).__name__}: {exc}"
 
     dates = [end_dt - timedelta(days=i) for i in range(days)]
     price_by_date: dict = {}
+    failures: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=5) as pool:
-        for d_str, avg in pool.map(_fetch_day, dates):
+        for d_str, avg, reason in pool.map(_fetch_day, dates):
             if avg is not None:
                 price_by_date[d_str] = [avg]
+            else:
+                failures[reason] = failures.get(reason, 0) + 1
+
+    if failures:
+        n_failed = sum(failures.values())
+        breakdown = ", ".join(f"{n}x {reason}" for reason, n in sorted(failures.items(), key=lambda kv: -kv[1]))
+        log_fn = log.warning if n_failed / len(dates) > 0.1 else log.info
+        log_fn("ISO-NE: %d/%d days failed — %s", n_failed, len(dates), breakdown)
 
     if not price_by_date:
         log.warning("ISO-NE: no price data returned for any requested day")

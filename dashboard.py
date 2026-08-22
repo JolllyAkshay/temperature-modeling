@@ -1250,10 +1250,21 @@ def load_forward_curve_data(iso, _daily):
         if not has_cache:
             return None  # show "loading" state; warmup endpoint is building it
     try:
-        from temperature_modeling.forward_curve import build_forward_curve, backtest_forward_curve
-        result = build_forward_curve(iso, n_months=12)
+        from temperature_modeling.forward_curve import (
+            build_forward_curve, backtest_forward_curve, _load_price_history,
+        )
+        # Both calls need the same price history — load it once here instead
+        # of each function separately hitting _load_price_history's disk
+        # cache (cheap once warm, but still two redundant reads+parses of a
+        # file that can run to 730 rows per ISO on every render).
         try:
-            result["backtest"] = backtest_forward_curve(iso)
+            history = _load_price_history(iso)
+        except Exception:
+            log.exception("%s: price history load failed", iso.upper())
+            history = []
+        result = build_forward_curve(iso, n_months=12, history=history)
+        try:
+            result["backtest"] = backtest_forward_curve(iso, history=history)
         except Exception:
             log.exception("%s: forward curve backtest failed", iso.upper())
             result["backtest"] = None

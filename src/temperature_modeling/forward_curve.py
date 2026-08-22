@@ -450,9 +450,17 @@ def _predict_monthly_price(
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def build_forward_curve(iso: str, n_months: int = 12) -> dict[str, Any]:
+def build_forward_curve(iso: str, n_months: int = 12, history: list | None = None) -> dict[str, Any]:
     """
     Build a 12-month forward electricity price curve for the given ISO.
+
+    Parameters
+    ----------
+    history:
+        Pre-loaded price history, if the caller already has it (e.g. the
+        dashboard also needs it for backtest_forward_curve in the same
+        request — pass it to both instead of hitting _load_price_history
+        twice). Loaded internally when omitted.
 
     Returns
     -------
@@ -464,14 +472,15 @@ def build_forward_curve(iso: str, n_months: int = 12) -> dict[str, Any]:
     """
     # Fit OLS price model from 730-day cached price history
     model: dict | None = None
-    history: list = []
     try:
         from .price_forecast import _fit_price_model  # noqa: PLC0415
-        history = _load_price_history(iso)
+        if not history:
+            history = _load_price_history(iso)
         if history:
             model = _fit_price_model(history)
     except Exception:
         log.warning("%s: price model fit failed — using fallback heuristic", iso.upper())
+    history = history or []   # guarantee a list even if the fetch above raised
 
     # Reject model if training data spans < 6 calendar months — need full seasonal cycle
     if model and history:
@@ -664,7 +673,7 @@ def _month_diff(from_ym: str, to_ym: str) -> int:
     return (ty - fy) * 12 + (tm - fm)
 
 
-def backtest_forward_curve(iso: str) -> dict[str, Any]:
+def backtest_forward_curve(iso: str, history: list | None = None) -> dict[str, Any]:
     """
     Compare archived forward-curve snapshots against realized settlement
     prices, for delivery months that have since fully completed.
@@ -673,6 +682,13 @@ def backtest_forward_curve(iso: str) -> dict[str, Any]:
     to fit the model. A month only counts as "realized" once it's fully in
     the past (never the current month) and has at least 20 days of price
     data — a handful of scattered days isn't a reliable settlement average.
+
+    Parameters
+    ----------
+    history:
+        Pre-loaded price history, if the caller already has it — see
+        build_forward_curve's identical parameter. Loaded internally when
+        omitted.
 
     Returns
     -------
@@ -690,7 +706,8 @@ def backtest_forward_curve(iso: str) -> dict[str, Any]:
     if not snapshots:
         return empty
 
-    history = _load_price_history(iso)
+    if not history:
+        history = _load_price_history(iso)
     monthly_actuals: dict[str, list[float]] = {}
     for row in history:
         d = row.get("date", "")
