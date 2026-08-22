@@ -689,31 +689,30 @@ log.info("Loading PJM forecast at startup...")
 _startup_data = fetch_pjm_load_forecast()
 
 
-def _prefetch_comparisons():
-    """Populate comparison caches for CAISO, ERCOT, MISO at startup."""
+def _prefetch_remaining_isos():
+    """
+    Warm the full forecast pipeline (load, price, net load, comparison,
+    backtest) for every ISO besides PJM, which is already warmed
+    synchronously above. Without this, the first dashboard visitor to click
+    an un-warmed ISO tab triggers a live fetch mid-request — up to ~90s for
+    CAISO/SPP cold — instead of hitting the cache _fetch_iso_forecast
+    already checks for. Runs in the background so it never blocks app
+    startup; each ISO's own try/except means one slow/failing ISO can't
+    hold up the rest.
+    """
     import time as _t
-    from temperature_modeling.caiso_load import fetch_caiso_official_comparison
-    from temperature_modeling.ercot_load import fetch_ercot_official_comparison
-    from temperature_modeling.miso_load  import fetch_miso_official_comparison
-
-    _s = requests.Session()
-    _s.headers["User-Agent"] = "grid-dashboard/startup"
-    for label, fn in [
-        ("CAISO", lambda: fetch_caiso_official_comparison(_s)),
-        ("ERCOT", lambda: fetch_ercot_official_comparison(_s)),
-        ("MISO",  lambda: fetch_miso_official_comparison(_s)),
-    ]:
+    for iso in ("caiso", "ercot", "miso", "nyiso", "isone", "spp"):
         try:
-            result = fn()
-            n = len(result.get("actual", {}))
-            log.info("%s comparison: %d days cached", label, n)
+            result = _fetch_iso_forecast(iso)
+            n = len(result.get("load") or [])
+            log.info("%s: startup prefetch done — %d days cached", iso.upper(), n)
         except Exception:
-            log.exception("%s comparison prefetch failed", label)
+            log.exception("%s: startup prefetch failed", iso.upper())
         _t.sleep(1)
 
 
 import threading as _threading
-_threading.Thread(target=_prefetch_comparisons, daemon=True).start()
+_threading.Thread(target=_prefetch_remaining_isos, daemon=True).start()
 
 log.info("Dashboard ready at http://127.0.0.1:8050")
 
@@ -1284,6 +1283,8 @@ def render_forward_curve(data, iso):
     hot_avg   = [m["scenarios"]["hot"]["monthly_avg"]  for m in curve]
     base_on   = [m["scenarios"]["base"]["on_peak"]     for m in curve]
     base_off  = [m["scenarios"]["base"]["off_peak"]    for m in curve]
+    base_low  = [m["scenarios"]["base"].get("low_usd_mwh")  for m in curve]
+    base_high = [m["scenarios"]["base"].get("high_usd_mwh") for m in curve]
 
     _BLUE  = "#2563eb"
     _RED   = "#ef4444"
@@ -1291,6 +1292,19 @@ def render_forward_curve(data, iso):
     _GRAY  = "#94a3b8"
 
     fc_fig = go.Figure()
+    # CQR band first (bottom layer) — this is the model's statistical
+    # prediction interval (conformalized quantile regression), a distinct
+    # and generally much wider uncertainty source than the cold/hot weather
+    # scenario spread plotted on top of it. Only draw it if every month has
+    # both bounds (older cached curves built before CQR shipped won't).
+    if all(v is not None for v in base_low) and all(v is not None for v in base_high):
+        fc_fig.add_trace(go.Scatter(
+            x=months + months[::-1],
+            y=base_high + base_low[::-1],
+            fill="toself", fillcolor="rgba(148,163,184,0.18)",
+            line=dict(width=0), showlegend=True, name="90% prediction interval (CQR)",
+            hoverinfo="skip",
+        ))
     fc_fig.add_trace(go.Scatter(
         x=months + months[::-1],
         y=hot_avg + cold_avg[::-1],
@@ -2181,7 +2195,15 @@ def render_capacity_market(iso):
     rm_col  = get_reserve_margin_color(rm_pct)
     rm_str  = f"{rm_pct:.1f}%" if rm_pct else "—"
     price   = cm.get("clearing_price_mw_year")
-    price_s = f"${price:,.0f}/MW-year" if price else "Energy-only market"
+    if price:
+        price_s = f"${price:,.0f}/MW-year"
+    elif cm.get("native_unit_price"):
+        # Locational/no-single-figure markets (e.g. NYISO's per-zone ICAP
+        # pricing) still have a real capacity mechanism — show the verified
+        # native-unit price rather than falsely implying no market exists.
+        price_s = cm["native_unit_price"]
+    else:
+        price_s = "Energy-only market"
     procured = cm.get("procured_mw")
     req      = cm.get("requirement_mw")
 
