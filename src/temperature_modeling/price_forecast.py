@@ -28,6 +28,8 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import requests
 
+from ._nerc_calendar import is_peak_hour
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -100,7 +102,12 @@ _ISONE_API_PASS = os.environ.get("ISONE_API_PASS", "")
 # "{start}to{end}" value for date-range filters (not two separate params).
 _PJM_DATAMINER_URL   = "https://api.pjm.com/api/v1/da_hrl_lmps"
 _PJM_DATAMINER_KEY   = os.environ.get("PJM_API_KEY", "")
-_PJM_WESTERN_HUB_ID  = 1   # pnode_id=1 is the PJM-RTO system-wide reference price
+# pnode_id=51288 is the real PJM Western Hub — the node ICE's PJM power
+# futures actually settle against. Was previously 1, which PJM's own
+# pnode registry confirms is "PJM-RTO" (an RTO-wide aggregate reference
+# price), not Western Hub — every PJM price this codebase computed before
+# this fix was trained on the wrong node.
+_PJM_WESTERN_HUB_ID  = 51288
 
 # ERCOT DAM Settlement Point Prices — NP4-190-CD (register at api.ercot.com)
 _ERCOT_NP_URL         = "https://api.ercot.com/api/public-reports/np4-190-cd/dam_stlmnt_pnt_prices"
@@ -167,6 +174,71 @@ def _eia_get(url: str, params: dict) -> list:
     except Exception:
         log.warning("EIA request failed: %s", url)
         return []
+
+
+def _eia_load_daily_peak_split(respondent: str, start: str, end: str) -> dict:
+    """
+    Like _eia_load_daily, but also splits each day's hourly demand into
+    on-peak/off-peak averages (NERC/ICE convention — see _nerc_calendar),
+    for PJM's separate peak/off-peak price models.
+
+    EIA's hourly demand series (frequency="hourly") is in UTC, unlike PJM
+    DataMiner2's price timestamps (already Eastern Prevailing Time) — this
+    converts each hour to Eastern before bucketing by calendar date and
+    classifying peak/off-peak, so dates line up correctly with the price
+    side and DST transitions are handled properly (fixed-offset UTC-4/-5
+    arithmetic would misclassify hours near the DST boundary).
+
+    Returns {date_str: {"all": avg_mw, "peak": avg_mw|None, "offpeak": avg_mw|None}}.
+    """
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+    eastern = ZoneInfo("America/New_York")
+
+    # {date_str: {"all": [...], "peak": [...], "offpeak": [...]}}
+    daily: dict = {}
+    offset = 0
+    page_size = 5000   # EIA hard limit per request
+
+    while True:
+        rows = _eia_get(_EIA_LOAD_URL, {
+            "frequency":            "hourly",
+            "data[0]":              "value",
+            "facets[respondent][]": respondent,
+            "facets[type][]":       "D",
+            "start":  start,
+            "end":    end,
+            "length": page_size,
+            "offset": offset,
+        })
+        if not rows:
+            break
+        for row in rows:
+            period = row.get("period", "")
+            v = row.get("value")
+            if not period or v is None:
+                continue
+            try:
+                utc_dt = datetime.strptime(period, "%Y-%m-%dT%H").replace(tzinfo=ZoneInfo("UTC"))
+            except ValueError:
+                continue
+            local_dt = utc_dt.astimezone(eastern).replace(tzinfo=None)
+            d = local_dt.date().isoformat()
+            bucket = daily.setdefault(d, {"all": [], "peak": [], "offpeak": []})
+            value = float(v)
+            bucket["all"].append(value)
+            bucket["peak" if is_peak_hour(local_dt) else "offpeak"].append(value)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    return {
+        d: {
+            "all":     sum(vals["all"]) / len(vals["all"]) if vals["all"] else None,
+            "peak":    sum(vals["peak"]) / len(vals["peak"]) if vals["peak"] else None,
+            "offpeak": sum(vals["offpeak"]) / len(vals["offpeak"]) if vals["offpeak"] else None,
+        }
+        for d, vals in daily.items()
+    }
 
 
 def _eia_load_daily(respondent: str, start: str, end: str) -> dict:
@@ -811,9 +883,15 @@ def _fetch_caiso_price_history_live(days: int = 90) -> list:
 
 def _fetch_pjm_price_history(days: int = 90) -> list:
     """
-    Fetch PJM day-ahead LMPs from PJM DataMiner2 API (Western Hub, pnode_id=1).
+    Fetch PJM day-ahead LMPs from PJM DataMiner2 API (Western Hub, pnode_id=51288).
     Requires PJM_API_KEY env var — free registration at pjm.com/data/dataminer.
     Pairs with EIA PJM demand for the regression model.
+
+    Retains hourly granularity long enough to classify each hour as on-peak
+    or off-peak (NERC/ICE convention — see _nerc_calendar) before collapsing
+    to daily rows, so on_peak_usd_mwh/off_peak_usd_mwh are genuine
+    peak-hour-vs-off-peak-hour historical averages, not a synthetic split of
+    the blended daily price.
     """
     if not _PJM_DATAMINER_KEY:
         log.info("PJM: no DataMiner2 key — set PJM_API_KEY (free at pjm.com)")
@@ -826,6 +904,7 @@ def _fetch_pjm_price_history(days: int = 90) -> list:
     session.headers["User-Agent"] = "grid-dashboard/1.0"
     session.headers["Accept"] = "text/csv"   # API defaults to JSON without this
 
+    # {date_str: {"all": [...], "peak": [...], "offpeak": [...]}}
     price_by_date: dict = {}
     page_size = 50000
 
@@ -864,8 +943,12 @@ def _fetch_pjm_price_history(days: int = 90) -> list:
                     lmp_raw = row.get("total_lmp_da")
                     if raw_dt and lmp_raw:
                         try:
-                            period = datetime.strptime(raw_dt, "%m/%d/%Y %I:%M:%S %p").date().isoformat()
-                            price_by_date.setdefault(period, []).append(float(lmp_raw))
+                            dt = datetime.strptime(raw_dt, "%m/%d/%Y %I:%M:%S %p")
+                            period = dt.date().isoformat()
+                            price = float(lmp_raw)
+                            bucket = price_by_date.setdefault(period, {"all": [], "peak": [], "offpeak": []})
+                            bucket["all"].append(price)
+                            bucket["peak" if is_peak_hour(dt) else "offpeak"].append(price)
                         except (ValueError, TypeError):
                             pass
                 if len(rows) < page_size:
@@ -880,17 +963,23 @@ def _fetch_pjm_price_history(days: int = 90) -> list:
     if not price_by_date:
         return []
 
-    daily_load = _eia_load_daily("PJM", start_dt.isoformat(), end_dt.isoformat())
+    daily_load = _eia_load_daily_peak_split("PJM", start_dt.isoformat(), end_dt.isoformat())
 
     result = []
     for d in sorted(set(price_by_date) & set(daily_load)):
+        prices = price_by_date[d]
+        load = daily_load[d]
         result.append({
-            "date":          d,
-            "load_mw":       round(daily_load[d]),
-            "price_usd_mwh": round(sum(price_by_date[d]) / len(price_by_date[d]), 2),
+            "date":            d,
+            "load_mw":         round(load["all"]),
+            "on_peak_load_mw":  round(load["peak"]) if load["peak"] is not None else None,
+            "off_peak_load_mw": round(load["offpeak"]) if load["offpeak"] is not None else None,
+            "price_usd_mwh":     round(sum(prices["all"]) / len(prices["all"]), 2),
+            "on_peak_usd_mwh":   round(sum(prices["peak"]) / len(prices["peak"]), 2) if prices["peak"] else None,
+            "off_peak_usd_mwh":  round(sum(prices["offpeak"]) / len(prices["offpeak"]), 2) if prices["offpeak"] else None,
         })
 
-    log.info("PJM: fetched %d days of price history (DataMiner2 + EIA load)", len(result))
+    log.info("PJM: fetched %d days of price history (DataMiner2 + EIA load, peak/off-peak split)", len(result))
     return result
 
 
@@ -1166,6 +1255,11 @@ def _fit_price_model(history: list) -> dict | None:
     # load" territory, which is exactly the regime that matters here.
     _NET_LOAD_FLOOR_MW = 100.0
 
+    feature_names = ["log_load", "weekday_frac", "sin_month", "cos_month"]
+    if use_ng:
+        feature_names.append("log_ng")
+    feature_names.append("intercept")
+
     X, y_vals, months = [], [], []
     for r in fit_rows:
         d = date.fromisoformat(r["date"])
@@ -1188,6 +1282,26 @@ def _fit_price_model(history: list) -> dict | None:
 
     X_arr = np.array(X)
     y_arr = np.array(y_vals)
+
+    # Drop near-constant feature columns before fitting (excluding the
+    # intercept, which is constant by design). A column with ~zero variance
+    # is collinear with the intercept and destabilizes the least-squares
+    # solve — e.g. weekday_frac is a constant 1.0 for every row when fitting
+    # a peak-hours-only model (peak hours only exist Mon-Fri by definition),
+    # which produced wildly unstable coefficients and a $500-clamped
+    # nonsense prediction before this check existed. Caught generically
+    # here rather than special-cased for that one caller, so it also
+    # protects any other subset-fit (e.g. off-peak, or a future per-season
+    # fit) from the same failure mode.
+    variances = X_arr.var(axis=0)
+    keep_mask = [i == len(feature_names) - 1 or variances[i] > 1e-10 for i in range(len(feature_names))]
+    if not all(keep_mask):
+        dropped = [n for n, k in zip(feature_names, keep_mask) if not k]
+        log.info("Price model: dropping near-constant feature(s) %s (degenerate for this training subset)",
+                  dropped)
+        X_arr = X_arr[:, keep_mask]
+        feature_names = [n for n, k in zip(feature_names, keep_mask) if k]
+
     coeffs, _, _, _ = np.linalg.lstsq(X_arr, y_arr, rcond=None)
 
     y_pred = X_arr @ coeffs
@@ -1268,6 +1382,7 @@ def _fit_price_model(history: list) -> dict | None:
 
     return {
         "coeffs":                coeffs.tolist(),
+        "feature_names":         feature_names,
         "rmse":                  round(rmse, 2),
         "use_ng":                use_ng,
         "use_net_load":          use_net_load,
@@ -1277,6 +1392,36 @@ def _fit_price_model(history: list) -> dict | None:
         "cqr_delta_h1_usd_mwh":  cqr_delta_h1,   # Nov-Apr
         "cqr_delta_h2_usd_mwh":  cqr_delta_h2,   # May-Oct
     }
+
+
+def _fit_peak_offpeak_price_models(history: list) -> tuple[dict | None, dict | None]:
+    """
+    Fit separate on-peak and off-peak price models from history rows that
+    carry on_peak_usd_mwh/off_peak_usd_mwh and on_peak_load_mw/off_peak_load_mw
+    (currently only PJM's history has these — see _fetch_pjm_price_history).
+
+    Reuses _fit_price_model unchanged by remapping each row's peak-type
+    price/load onto the price_usd_mwh/load_mw keys it already expects, then
+    dropping rows where that split is undefined for the type (e.g. weekends
+    have no on-peak hours at all, so on_peak_usd_mwh is None on those rows).
+
+    Returns (peak_model, offpeak_model) — either may be None if there isn't
+    enough data of that type to fit (same ≥7-row minimum as _fit_price_model).
+    """
+    def _remap(variant: str) -> list:
+        price_key = f"{variant}_usd_mwh"
+        load_key  = f"{variant}_load_mw"
+        remapped = []
+        for r in history:
+            p, l = r.get(price_key), r.get(load_key)
+            if p is None or l is None:
+                continue
+            remapped.append({**r, "price_usd_mwh": p, "load_mw": l})
+        return remapped
+
+    peak_model    = _fit_price_model(_remap("on_peak"))
+    offpeak_model = _fit_price_model(_remap("off_peak"))
+    return peak_model, offpeak_model
 
 
 def _price_bounds(x: list, model: dict, point_price: float, month: int | None = None) -> tuple[float, float]:

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 import dash
-from dash import dcc, html, Input, Output, ALL
+from dash import dcc, html, Input, Output, State, ALL
 import plotly.graph_objects as go
 
 # ---------------------------------------------------------------------------
@@ -753,7 +753,7 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
 )
 
-app.layout = html.Div(
+_main_dashboard_layout = html.Div(
     style={"fontFamily": "Inter, system-ui, sans-serif",
            "backgroundColor": "#f8fafc", "minHeight": "100vh", "color": "#1e293b"},
     children=[
@@ -773,11 +773,21 @@ app.layout = html.Div(
                     html.Span(f"PJM · CAISO · ERCOT · MISO · NYISO · ISO-NE · SPP  ·  Updated {datetime.now().strftime('%d %b %Y')}",
                               style={"color": "#94a3b8", "fontSize": "12px"}),
                 ]),
-                html.Button(
-                    "⟳ Refresh", id="refresh-btn",
-                    style={"background": "#f1f5f9", "border": "1px solid #e2e8f0",
-                           "color": "#475569", "padding": "6px 16px",
-                           "borderRadius": "6px", "cursor": "pointer", "fontSize": "13px"},
+                html.Div(
+                    style={"display": "flex", "alignItems": "center", "gap": "14px"},
+                    children=[
+                        dcc.Link(
+                            "Futures Pricer →", href="/futures-pricer",
+                            style={"color": "#2563eb", "fontSize": "13px", "fontWeight": 500,
+                                   "textDecoration": "none"},
+                        ),
+                        html.Button(
+                            "⟳ Refresh", id="refresh-btn",
+                            style={"background": "#f1f5f9", "border": "1px solid #e2e8f0",
+                                   "color": "#475569", "padding": "6px 16px",
+                                   "borderRadius": "6px", "cursor": "pointer", "fontSize": "13px"},
+                        ),
+                    ],
                 ),
             ],
         ),
@@ -1220,6 +1230,206 @@ app.layout = html.Div(
         dcc.Interval(id="forecast-refresh", interval=15 * 60 * 1000, n_intervals=0),
     ],
 )
+
+
+# ---------------------------------------------------------------------------
+# Futures Pricer — separate page (PJM Western Hub only for now)
+# ---------------------------------------------------------------------------
+def _next_n_months(n=24):
+    """[(YYYY-MM, 'Mon YYYY'), ...] for the next n months, starting next month."""
+    today = date.today()
+    options = []
+    y, m = today.year, today.month
+    for _ in range(n):
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+        d = date(y, m, 1)
+        options.append((d.strftime("%Y-%m"), d.strftime("%b %Y")))
+    return options
+
+
+def _futures_pricer_layout():
+    return html.Div(
+        style={"fontFamily": "Inter, system-ui, sans-serif",
+               "backgroundColor": "#f8fafc", "minHeight": "100vh", "color": "#1e293b"},
+        children=[
+            html.Div(
+                style={"padding": "14px 28px", "borderBottom": "1px solid #e2e8f0",
+                       "backgroundColor": "#ffffff", "display": "flex", "alignItems": "center",
+                       "justifyContent": "space-between", "boxShadow": "0 1px 4px rgba(0,0,0,0.06)"},
+                children=[
+                    html.Div([
+                        html.H1("Futures Contract Pricer", style={"margin": 0, "fontSize": "18px",
+                                                                    "fontWeight": 700, "color": "#0f172a"}),
+                        html.Span("PJM Western Hub — compare a real market quote against the model's forward curve",
+                                  style={"color": "#94a3b8", "fontSize": "12px"}),
+                    ]),
+                    dcc.Link("← Back to Dashboard", href="/",
+                             style={"color": "#2563eb", "fontSize": "13px", "fontWeight": 500,
+                                    "textDecoration": "none"}),
+                ],
+            ),
+            html.Div(
+                style={"maxWidth": "760px", "margin": "0 auto", "padding": "28px 24px"},
+                children=[
+                    html.Div(
+                        style={"background": "#ffffff", "border": "1px solid #e2e8f0", "borderRadius": "10px",
+                               "padding": "22px 24px", "marginBottom": "20px"},
+                        children=[
+                            html.Div(
+                                style={"display": "flex", "gap": "16px", "flexWrap": "wrap", "marginBottom": "16px"},
+                                children=[
+                                    html.Div([
+                                        html.Label("Delivery month", style={"fontSize": "12px", "color": "#64748b",
+                                                                             "display": "block", "marginBottom": "4px"}),
+                                        dcc.Dropdown(
+                                            id="fp-delivery-month",
+                                            options=[{"label": lbl, "value": ym} for ym, lbl in _next_n_months()],
+                                            value=_next_n_months()[0][0],
+                                            clearable=False, style={"width": "160px"},
+                                        ),
+                                    ]),
+                                    html.Div([
+                                        html.Label("Type", style={"fontSize": "12px", "color": "#64748b",
+                                                                   "display": "block", "marginBottom": "4px"}),
+                                        dcc.RadioItems(
+                                            id="fp-peak-type",
+                                            options=[
+                                                {"label": " Monthly avg", "value": "monthly_avg"},
+                                                {"label": " On-peak",     "value": "on_peak"},
+                                                {"label": " Off-peak",    "value": "off_peak"},
+                                            ],
+                                            value="monthly_avg", inline=True,
+                                            style={"fontSize": "13px"}, inputStyle={"marginRight": "4px", "marginLeft": "10px"},
+                                        ),
+                                    ]),
+                                    html.Div([
+                                        html.Label("Weather scenario", style={"fontSize": "12px", "color": "#64748b",
+                                                                               "display": "block", "marginBottom": "4px"}),
+                                        dcc.Dropdown(
+                                            id="fp-scenario",
+                                            options=[{"label": "Cold", "value": "cold"},
+                                                     {"label": "Base", "value": "base"},
+                                                     {"label": "Hot",  "value": "hot"}],
+                                            value="base", clearable=False, style={"width": "120px"},
+                                        ),
+                                    ]),
+                                ],
+                            ),
+                            html.Div(
+                                style={"display": "flex", "gap": "12px", "alignItems": "flex-end"},
+                                children=[
+                                    html.Div([
+                                        html.Label("Quoted price ($/MWh)", style={"fontSize": "12px", "color": "#64748b",
+                                                                                   "display": "block", "marginBottom": "4px"}),
+                                        dcc.Input(id="fp-quoted-price", type="number", placeholder="e.g. 42.50",
+                                                   style={"width": "140px", "padding": "7px 10px",
+                                                          "border": "1px solid #cbd5e1", "borderRadius": "6px"}),
+                                    ]),
+                                    html.Button(
+                                        "Price Contract", id="fp-submit", n_clicks=0,
+                                        style={"background": "#2563eb", "color": "#ffffff", "border": "none",
+                                               "padding": "9px 20px", "borderRadius": "6px", "cursor": "pointer",
+                                               "fontSize": "13px", "fontWeight": 600},
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                    html.Div(id="fp-result"),
+                ],
+            ),
+        ],
+    )
+
+
+_FP_SIGNAL_COLOR = {
+    "within_band":       "#16a34a",
+    "above_band":        "#ef4444",
+    "below_band":        "#ef4444",
+    "no_band_available": "#94a3b8",
+}
+_FP_SIGNAL_LABEL = {
+    "within_band":       "Within model's expected range",
+    "above_band":        "Quoted above model's expected range",
+    "below_band":        "Quoted below model's expected range",
+    "no_band_available": "No statistical band available for comparison",
+}
+
+
+@app.callback(
+    Output("fp-result", "children"),
+    Input("fp-submit", "n_clicks"),
+    State("fp-delivery-month", "value"),
+    State("fp-peak-type", "value"),
+    State("fp-scenario", "value"),
+    State("fp-quoted-price", "value"),
+)
+def render_futures_pricer_result(n_clicks, delivery_month, peak_type, scenario, quoted_price):
+    if not n_clicks:
+        return []
+    if quoted_price is None:
+        return html.Div("Enter a quoted price.", style={"color": "#ef4444", "fontSize": "13px"})
+
+    from temperature_modeling.futures_pricer import price_contract
+    try:
+        r = price_contract("pjm", delivery_month, peak_type, float(quoted_price), scenario=scenario)
+    except ValueError as exc:
+        return html.Div(str(exc), style={"color": "#ef4444", "fontSize": "13px"})
+    except Exception:
+        log.exception("Futures pricer failed")
+        return html.Div("Pricing failed — try again in a moment.", style={"color": "#ef4444", "fontSize": "13px"})
+
+    band_str = (f"${r['band_low']:.2f} – ${r['band_high']:.2f}"
+                if r["band_source"] == "cqr" else "unavailable")
+    spread_str = f"${r['spread_usd_mwh']:+.2f}/MWh"
+    if r["spread_pct"] is not None:
+        spread_str += f" ({r['spread_pct']:+.1f}%)"
+
+    return html.Div(
+        style={"background": "#ffffff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px 24px"},
+        children=[
+            html.Div(
+                style={"display": "flex", "gap": "10px", "flexWrap": "wrap", "marginBottom": "16px"},
+                children=[
+                    card("Model Price", f"${r['model_price']:.2f}", "per MWh", "#0f172a"),
+                    card("90% Band", band_str, r["band_source"], "#6366f1"),
+                    card("Quoted", f"${r['quoted_price']:.2f}", "per MWh", "#0f172a"),
+                    card("Spread", spread_str, "quoted − model", "#f97316"),
+                ],
+            ),
+            html.Div(
+                _FP_SIGNAL_LABEL.get(r["signal"], r["signal"]),
+                style={"fontSize": "14px", "fontWeight": 700,
+                       "color": _FP_SIGNAL_COLOR.get(r["signal"], "#334155"),
+                       "marginBottom": "10px"},
+            ),
+            html.Div(
+                f"{r['lead_months']} month(s) out · model: {r['model_source']} · "
+                f"peak split: {r.get('peak_split_method') or 'n/a'} · confidence: {r['confidence']}",
+                style={"fontSize": "12px", "color": "#64748b", "marginBottom": "8px"},
+            ),
+            html.Ul(
+                [html.Li(note, style={"fontSize": "12px", "color": "#94a3b8"}) for note in r["confidence_notes"]],
+                style={"margin": 0, "paddingLeft": "18px"},
+            ) if r["confidence_notes"] else None,
+        ],
+    )
+
+
+app.layout = html.Div([
+    dcc.Location(id="url", refresh=False),
+    html.Div(id="page-content"),
+])
+
+
+@app.callback(Output("page-content", "children"), Input("url", "pathname"))
+def render_page(pathname):
+    if pathname == "/futures-pricer":
+        return _futures_pricer_layout()
+    return _main_dashboard_layout
 
 
 # ---------------------------------------------------------------------------

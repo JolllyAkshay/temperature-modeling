@@ -418,15 +418,22 @@ def _predict_monthly_price(
         load_feature = load_mw
         if model.get("use_net_load") and renewable_gw is not None:
             load_feature = max(load_mw - renewable_gw * 1000, 100.0)
-        x = [
-            math.log(max(load_feature, 1.0)),
-            0.71,   # fraction of weekdays in a typical month
-            math.sin(2 * math.pi * month / 12),
-            math.cos(2 * math.pi * month / 12),
-        ]
-        if use_ng:
-            x.append(math.log(max(ng_price, 0.01)))
-        x.append(1.0)
+        feature_values = {
+            "log_load":     math.log(max(load_feature, 1.0)),
+            "weekday_frac": 0.71,   # fraction of weekdays in a typical month
+            "sin_month":    math.sin(2 * math.pi * month / 12),
+            "cos_month":    math.cos(2 * math.pi * month / 12),
+            "log_ng":       math.log(max(ng_price, 0.01)) if use_ng else None,
+            "intercept":    1.0,
+        }
+        # feature_names records which columns the model was actually fit on
+        # (e.g. weekday_frac is dropped when a training subset makes it a
+        # constant, such as an on-peak-hours-only fit — see _fit_price_model)
+        # — build x to match exactly, rather than assuming the full set.
+        default_names = ["log_load", "weekday_frac", "sin_month", "cos_month"] + \
+                         (["log_ng"] if use_ng else []) + ["intercept"]
+        names = model.get("feature_names", default_names)
+        x = [feature_values[n] for n in names]
         if len(x) == len(coeffs):
             raw = math.exp(sum(c * xi for c, xi in zip(coeffs, x)))
             price = min(max(raw, _PRICE_FLOOR), _PRICE_CAP)
@@ -490,6 +497,44 @@ def build_forward_curve(iso: str, n_months: int = 12, history: list | None = Non
                         iso.upper(), len(unique_months))
             model = None
 
+    # Separate on-peak/off-peak price models, fit from genuine NERC-peak-hour
+    # vs off-peak-hour historical data (currently only PJM's history has the
+    # on_peak_usd_mwh/off_peak_usd_mwh/on_peak_load_mw/off_peak_load_mw
+    # fields this needs — see _fetch_pjm_price_history). Falls back to
+    # _split_peak_offpeak's synthetic ratio (below) when unavailable, exactly
+    # as before for every other ISO.
+    peak_model = offpeak_model = None
+    peak_load_ratio = offpeak_load_ratio = None
+    peak_ceiling = offpeak_ceiling = None
+    if history and any(r.get("on_peak_usd_mwh") is not None for r in history):
+        try:
+            from .price_forecast import _fit_peak_offpeak_price_models  # noqa: PLC0415
+            peak_model, offpeak_model = _fit_peak_offpeak_price_models(history)
+        except Exception:
+            log.warning("%s: peak/off-peak price model fit failed — using synthetic ratio split", iso.upper())
+
+        # Empirical peak-load / off-peak-load ratio to the blended monthly
+        # load estimate _monthly_load_gw already produces — the fitted
+        # models' own coefficients capture the peak-vs-off-peak price
+        # relationship; this just gives them a peak-shaped (or off-peak
+        # -shaped) load input to predict from, instead of the blended one.
+        peak_ratios, offpeak_ratios = [], []
+        for r in history:
+            load = r.get("load_mw")
+            if not load:
+                continue
+            if r.get("on_peak_load_mw") is not None:
+                peak_ratios.append(r["on_peak_load_mw"] / load)
+            if r.get("off_peak_load_mw") is not None:
+                offpeak_ratios.append(r["off_peak_load_mw"] / load)
+        peak_load_ratio = sum(peak_ratios) / len(peak_ratios) if peak_ratios else 1.0
+        offpeak_load_ratio = sum(offpeak_ratios) / len(offpeak_ratios) if offpeak_ratios else 1.0
+
+        peak_prices = [r["on_peak_usd_mwh"] for r in history if r.get("on_peak_usd_mwh")]
+        offpeak_prices = [r["off_peak_usd_mwh"] for r in history if r.get("off_peak_usd_mwh")]
+        peak_ceiling = max(max(peak_prices) * 5, 300.0) if peak_prices else 300.0
+        offpeak_ceiling = max(max(offpeak_prices) * 5, 300.0) if offpeak_prices else 300.0
+
     # Seasonal renewable climatology (monthly average from the same history
     # the model was fit on) — the forward curve predicts a delivery month
     # 1-12 months out, not a specific day, so there's no "forecast" of
@@ -550,7 +595,24 @@ def build_forward_curve(iso: str, n_months: int = 12, history: list | None = Non
                 log.warning("%s %s: OLS price $%.0f exceeds ceiling $%.0f — using heuristic",
                             iso.upper(), ym, price, _price_ceiling)
                 price, low, high = _predict_monthly_price(load_gw * 1000, month, ng_price, None, iso)
-            on_peak, off_peak = _split_peak_offpeak(price, iso, month)
+
+            on_peak_low = on_peak_high = off_peak_low = off_peak_high = None
+            peak_split_method = "synthetic_ratio"
+            if peak_model and offpeak_model:
+                on_peak, on_peak_low, on_peak_high = _predict_monthly_price(
+                    load_gw * 1000 * peak_load_ratio, month, ng_price, peak_model, iso, month_renewable_gw)
+                if on_peak > peak_ceiling:
+                    on_peak, on_peak_low, on_peak_high = _predict_monthly_price(
+                        load_gw * 1000 * peak_load_ratio, month, ng_price, None, iso)
+                off_peak, off_peak_low, off_peak_high = _predict_monthly_price(
+                    load_gw * 1000 * offpeak_load_ratio, month, ng_price, offpeak_model, iso, month_renewable_gw)
+                if off_peak > offpeak_ceiling:
+                    off_peak, off_peak_low, off_peak_high = _predict_monthly_price(
+                        load_gw * 1000 * offpeak_load_ratio, month, ng_price, None, iso)
+                on_peak, off_peak = round(on_peak, 2), round(off_peak, 2)
+                peak_split_method = "empirical_hourly"
+            else:
+                on_peak, off_peak = _split_peak_offpeak(price, iso, month)
 
             # Spark spread and implied heat rate — computed from displayed (rounded)
             # values so traders can reproduce every number independently:
@@ -559,7 +621,7 @@ def build_forward_curve(iso: str, n_months: int = 12, history: list | None = Non
             #   spark_ct      = monthly_avg − 10.0 × ng_price_mmbtu
             p_r  = round(price, 2)
             ng_r = round(ng_price, 2)
-            op_r = on_peak    # already rounded by _split_peak_offpeak
+            op_r = on_peak    # already rounded above (either path)
             fp_r = off_peak
             implied_hr = round(p_r  * 1000 / ng_r, 0) if ng_r > 0 else None
             spark_ccgt = round(p_r  - 7.0  * ng_r, 2)
@@ -573,6 +635,11 @@ def build_forward_curve(iso: str, n_months: int = 12, history: list | None = Non
                 "monthly_avg":         round(price, 2),
                 "low_usd_mwh":         round(low, 2) if low is not None else None,
                 "high_usd_mwh":        round(high, 2) if high is not None else None,
+                "peak_split_method":   peak_split_method,
+                "on_peak_low_usd_mwh":   round(on_peak_low, 2) if on_peak_low is not None else None,
+                "on_peak_high_usd_mwh":  round(on_peak_high, 2) if on_peak_high is not None else None,
+                "off_peak_low_usd_mwh":  round(off_peak_low, 2) if off_peak_low is not None else None,
+                "off_peak_high_usd_mwh": round(off_peak_high, 2) if off_peak_high is not None else None,
                 "on_peak":             on_peak,
                 "off_peak":            off_peak,
                 "implied_heat_rate":   implied_hr,   # BTU/kWh; compare to your plant HR

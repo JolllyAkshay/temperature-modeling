@@ -145,6 +145,7 @@ def root():
             "forward_curve":          "/v1/forward-curve/{iso}",
             "forward_curve_history":  "/v1/forward-curve/history/{iso}",
             "forward_curve_accuracy": "/v1/forward-curve/accuracy/{iso}",
+            "futures_pricer":         "/v1/futures-pricer/{iso}",
             "net_load":               "/v1/net-load/{iso}",
             "carbon":                 "/v1/carbon/{iso}",
             "accuracy":               "/v1/accuracy/{iso}",
@@ -409,8 +410,14 @@ def get_forward_curve(
 
     Each scenario includes:
     - `monthly_avg` — settlement-equivalent average price ($/MWh)
-    - `on_peak` — Mon-Fri HE07-22 (NERC definition, ≈45% of hours)
+    - `on_peak` — Mon-Fri HE08-23 EPT ex-NERC-holidays (ICE/NERC convention, 16h/day)
     - `off_peak` — remaining hours; satisfies weighted-average = monthly_avg
+
+    For PJM, `on_peak`/`off_peak` are fit from genuine historical peak-hour
+    vs off-peak-hour settlement data (`peak_split_method: "empirical_hourly"`
+    in each scenario) — for every other ISO, and as a PJM fallback when
+    there isn't enough peak/off-peak-specific history, it's a synthetic
+    ratio applied to the blended price (`peak_split_method: "synthetic_ratio"`).
 
     Gas price assumptions come from EIA STEO Henry Hub forecasts (free,
     published monthly). The `gas_curve` field shows the assumed $/MMBtu
@@ -488,6 +495,49 @@ def get_forward_curve_accuracy(iso: str, _key: str = Security(_require_key)):
         return backtest_forward_curve(iso)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Backtest failed: {exc}")
+
+
+@app.get("/v1/futures-pricer/{iso}", tags=["forecast"])
+def get_futures_price_comparison(
+    iso: str,
+    delivery_month: str,
+    peak_type: str,
+    quoted_price: float,
+    scenario: str = "base",
+    _key: str = Security(_require_key),
+):
+    """
+    Compare a real power futures contract (e.g. quoted on ICE) against this
+    project's own forward-curve prediction for the same delivery month and
+    peak type — a decision-support signal for potential mispricing.
+
+    Scoped to PJM Western Hub only for now. There's no live market data feed
+    here (enterprise-only, out of reach) — `quoted_price` is always supplied
+    by the caller.
+
+    Query params:
+    - `delivery_month`: "YYYY-MM", must be in the future, within 60 months out
+    - `peak_type`: "monthly_avg" | "on_peak" | "off_peak"
+    - `quoted_price`: the market-quoted $/MWh price to compare against
+    - `scenario`: "cold" | "base" | "hot" (default "base")
+
+    `signal` is one of "within_band" / "above_band" / "below_band" /
+    "no_band_available". `confidence_notes` flags anything that should make
+    you trust the comparison less — e.g. a delivery month beyond EIA STEO's
+    real forecast horizon, or an on/off-peak split still using the synthetic
+    ratio rather than a genuine peak-hour model fit.
+    """
+    from temperature_modeling.futures_pricer import price_contract
+
+    try:
+        return price_contract(
+            iso=iso, delivery_month=delivery_month, peak_type=peak_type,
+            quoted_price=quoted_price, scenario=scenario,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Futures pricer failed: {exc}")
 
 
 @app.post("/v1/forward-curve/warm/{iso}", tags=["admin"])
