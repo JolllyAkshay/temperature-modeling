@@ -20,6 +20,7 @@ from pathlib import Path
 import requests
 import dash
 from dash import dcc, html, Input, Output, State, ALL
+from flask import request as flask_request
 import plotly.graph_objects as go
 
 # ---------------------------------------------------------------------------
@@ -102,6 +103,7 @@ from temperature_modeling.ensemble import get_ensemble_forecast
 from temperature_modeling.carbon_intensity import fetch_carbon_intensity
 from temperature_modeling.demand_response import compute_dr_windows
 from temperature_modeling.theta_ensemble import predict_theta, blend_with_xgboost
+from temperature_modeling.usage_tracking import log_event
 
 FORECAST_CACHE_TTL_HOURS = 3
 
@@ -1572,6 +1574,12 @@ def render_electricity_explainer_result(n_clicks, zip_code):
         log.exception("Electricity explainer failed")
         return html.Div("Lookup failed — try again in a moment.", style={"color": "#ef4444", "fontSize": "13px"})
 
+    try:
+        log_event("zip_lookup", request=flask_request, zip=zip_code,
+                   iso=r.get("iso"), found=r.get("found"))
+    except Exception:
+        log.exception("usage log failed for zip_lookup")
+
     if not r["found"]:
         return html.Div(f"No data for zip code {zip_code}.", style={"color": "#ef4444", "fontSize": "13px"})
 
@@ -1888,6 +1896,10 @@ app.layout = html.Div([
 
 @app.callback(Output("page-content", "children"), Input("url", "pathname"))
 def render_page(pathname):
+    try:
+        log_event("page_view", request=flask_request, path=pathname or "/")
+    except Exception:
+        log.exception("usage log failed for page_view")
     if pathname == "/futures-pricer":
         return _futures_pricer_layout()
     if pathname == "/my-electricity":
@@ -3129,7 +3141,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 # REST API routes (served by the same Flask server as the dashboard)
 # ---------------------------------------------------------------------------
-from flask import jsonify, request as flask_request
+from flask import jsonify
 
 _VALID_ISOS = {"pjm", "caiso", "ercot", "miso", "nyiso", "isone", "spp"}
 

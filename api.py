@@ -49,6 +49,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def _log_usage(request, call_next):
+    response = await call_next(request)
+    try:
+        from temperature_modeling.usage_tracking import log_event  # noqa: PLC0415
+        path = request.url.path
+        if not path.startswith("/v1/_internal"):
+            log_event("api_call", request=request, path=path,
+                       status_code=response.status_code, authenticated=bool(request.headers.get("X-API-Key")))
+    except Exception:
+        log.exception("usage log failed for api_call")
+    return response
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -649,3 +663,22 @@ async def refresh_iso(
         return {"status": "already_refreshing", "iso": iso}
     background_tasks.add_task(_run_refresh, iso)
     return {"status": "refresh_queued", "iso": iso}
+
+
+@app.get("/v1/usage/summary", tags=["admin"])
+def get_usage_summary_route(_key: str = Security(_require_key)):
+    """
+    Aggregate usage stats: total events, unique visitors, activity by
+    page/endpoint, geography, and organization (from IP reverse-lookup) —
+    see usage_tracking.get_usage_summary for field details.
+    """
+    from temperature_modeling.usage_tracking import get_usage_summary  # noqa: PLC0415
+    return get_usage_summary()
+
+
+@app.get("/v1/_internal/usage-log", tags=["admin"], include_in_schema=False)
+def get_usage_log_raw(_key: str = Security(_require_key)):
+    """Raw JSONL usage log — for the sync job that persists it to the Space repo."""
+    from fastapi.responses import PlainTextResponse  # noqa: PLC0415
+    from temperature_modeling.usage_tracking import get_raw_log  # noqa: PLC0415
+    return PlainTextResponse(content=get_raw_log(), media_type="application/x-ndjson")
