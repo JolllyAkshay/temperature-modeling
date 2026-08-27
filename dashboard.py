@@ -1520,18 +1520,21 @@ def render_electricity_explainer_result(n_clicks, zip_code):
 
     sections = []
 
-    # Map — where this zip code is
+    # Map — where this zip code is, plus nearest plants if available
     loc = r.get("location")
+    np_result = r.get("nearest_plants", {})
+    plants = np_result["data"] if np_result.get("available") else []
     if loc:
         iso_label = {"pjm": "PJM", "caiso": "CAISO", "ercot": "ERCOT", "miso": "MISO",
                      "nyiso": "NYISO", "isone": "ISO-NE", "spp": "SPP"}.get(r["iso"])
         map_title = f"{iso_label} territory" if iso_label else "not in a wholesale market territory covered here"
-        fig = go.Figure(go.Scattergeo(
+        traces = [go.Scattergeo(
             lon=[loc["lon"]], lat=[loc["lat"]], mode="markers+text",
             text=[zip_code], textposition="top center",
             marker=dict(size=12, color="#2563eb", line=dict(width=1.5, color="#ffffff")),
-            hovertemplate=f"{loc['display_name']}<extra></extra>",
-        ))
+            hovertemplate=f"{loc['display_name']}<extra></extra>", name="You",
+        )]
+        fig = go.Figure(traces)
         fig.update_layout(
             geo=dict(scope="usa", projection_type="albers usa",
                      showland=True, landcolor="#f1f5f9", showlakes=True, lakecolor="#ffffff",
@@ -1539,12 +1542,25 @@ def render_electricity_explainer_result(n_clicks, zip_code):
                      center=dict(lat=loc["lat"], lon=loc["lon"]),
                      projection_scale=8 if r["iso"] else 4),
             margin=dict(l=0, r=0, t=0, b=0), height=220,
-            paper_bgcolor="#ffffff",
+            paper_bgcolor="#ffffff", showlegend=False,
         )
         sections.append(_elec_section(
             f"Where you are — {map_title}",
             dcc.Graph(figure=fig, config={"displayModeBar": False}, style={"height": "220px"}),
         ))
+
+    # Nearest generating plants
+    if plants:
+        plant_rows = [
+            html.Div(f"{p['plant_name']} ({p['primary_fuel']}) — {p['distance_miles']:.1f} mi, "
+                     f"{p['capacity_mw']:,.0f} MW — {p['owner']}",
+                     style={"fontSize": "13px", "marginBottom": "5px"})
+            for p in plants
+        ]
+        plant_rows.append(html.Div("From EIA-860, searched within your state only — a plant just over "
+                                    "a state line won't show up here even if it's physically closer.",
+                                    style={"fontSize": "11px", "color": "#94a3b8", "marginTop": "6px"}))
+        sections.append(_elec_section("Nearest generating plants", html.Div(plant_rows)))
 
     # Who provides your electricity
     util_rows = []

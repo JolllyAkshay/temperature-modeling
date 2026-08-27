@@ -18,6 +18,7 @@ from .zip_lookup import (
 )
 from .carbon_intensity import fetch_carbon_intensity, fetch_carbon_intensity_history
 from .demand_response import compute_dr_windows
+from .nearby_plants import find_nearest_plants
 from .capacity_market import get_capacity_market_data
 from .market_competitiveness import get_market_competitiveness
 
@@ -50,6 +51,11 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                                    res_rate_usd_mwh}, ...]}} or {available: False,
                                    reason} — trailing 24 months, same state-average
                                    series as latest_state_rates, for a trend chart
+        nearest_plants:           {available, data: [{plant_name, owner,
+                                   distance_miles, capacity_mw, primary_fuel,
+                                   balancing_authority}, ...]} or {available: False,
+                                   reason} — 5 closest operating plants (EIA-860),
+                                   searched within the zip's own state only
         fuel_mix:                {available, data} or {available: False, reason}
         fuel_mix_history:        {available, data} or {available: False, reason} —
                                    trailing 24h clean_pct/fuel_mix_mw trend, for a chart
@@ -95,6 +101,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         "location": location,
         "latest_state_rates": {},
         "retail_rate_history": {"available": False, "reason": "No data for this zip code in our dataset."},
+        "nearest_plants": {"available": False, "reason": "No data for this zip code in our dataset."},
     }
 
     if not zl["found"]:
@@ -130,6 +137,25 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         if history:
             result["retail_rate_history"] = {"available": True, "data": {"state": state, "history": history}}
             break
+
+    # Nearest generating plants — needs both a geocoded location and a
+    # state to search within; best-effort like the rate lookups above.
+    if location:
+        state = next((u["state"] for u in zl["utilities"] if u.get("state")), None)
+        if state:
+            try:
+                plants = find_nearest_plants(location["lat"], location["lon"], state, n=5, session=session)
+            except Exception:
+                log.exception("%s: nearest-plants lookup failed", state)
+                plants = []
+            result["nearest_plants"] = (
+                {"available": True, "data": plants} if plants
+                else {"available": False, "reason": "No plant data available for this area."}
+            )
+        else:
+            result["nearest_plants"] = {"available": False, "reason": "No plant data available for this area."}
+    else:
+        result["nearest_plants"] = {"available": False, "reason": "Couldn't locate this zip code on the map."}
 
     iso = zl["iso"]
     if iso is None:
