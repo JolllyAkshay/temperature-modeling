@@ -1588,6 +1588,30 @@ def render_electricity_explainer_result(n_clicks, zip_code):
             dcc.Graph(figure=rate_fig, config={"displayModeBar": False}, style={"height": "200px"}),
         ))
 
+    # Bill estimator — rate x adjustable usage. Prefer the fresher statewide
+    # EIA rate over the per-utility annual snapshot when both exist.
+    state_rates = list(r["latest_state_rates"].values())
+    util_rates = [u["res_rate_usd_mwh"] for u in r["utilities"] if u.get("res_rate_usd_mwh")]
+    if state_rates:
+        bill_rate = state_rates[0]["res_rate_usd_mwh"]
+    elif util_rates:
+        bill_rate = sum(util_rates) / len(util_rates)
+    else:
+        bill_rate = None
+    if bill_rate:
+        sections.append(_elec_section(
+            "Estimate your bill",
+            html.Div([
+                html.Label("Monthly usage (kWh) — US average household is about 900 kWh/month",
+                           style={"fontSize": "12px", "color": "#64748b", "display": "block", "marginBottom": "6px"}),
+                dcc.Input(id="elec-bill-usage", type="number", value=900, min=0, step=50,
+                          style={"width": "140px", "padding": "8px", "fontSize": "14px",
+                                 "border": "1px solid #cbd5e1", "borderRadius": "6px", "marginBottom": "10px"}),
+                dcc.Store(id="elec-bill-rate", data=bill_rate),
+                html.Div(id="elec-bill-estimate", style={"fontSize": "18px", "fontWeight": 700, "color": "#0f172a"}),
+            ]),
+        ))
+
     if r["non_rto"]:
         sections.append(_elec_section("Your area", _unavailable(r["fuel_mix"]["reason"])))
         return html.Div(sections)
@@ -1734,6 +1758,21 @@ def render_electricity_explainer_result(n_clicks, zip_code):
         sections.append(_elec_section("How competitive is your market?", _unavailable(mc["reason"])))
 
     return html.Div(sections)
+
+
+app.clientside_callback(
+    """
+    function(usage_kwh, rate_usd_mwh) {
+        if (!usage_kwh || usage_kwh <= 0 || !rate_usd_mwh) { return ""; }
+        const rate_per_kwh = rate_usd_mwh / 1000;
+        const bill = rate_per_kwh * usage_kwh;
+        return "Estimated: $" + bill.toFixed(2) + "/month (at $" + rate_per_kwh.toFixed(3) + "/kWh × " + usage_kwh + " kWh)";
+    }
+    """,
+    Output("elec-bill-estimate", "children"),
+    Input("elec-bill-usage", "value"),
+    Input("elec-bill-rate", "data"),
+)
 
 
 app.layout = html.Div([
