@@ -1,0 +1,8 @@
+{
+  "source": "NREL/OpenEI - U.S. Electric Utility Companies and Rates: Look-up by Zip Code (2024)",
+  "source_url": "https://data.openei.org/submissions/8563",
+  "files": ["iou_zipcodes_2024.csv", "non_iou_zipcodes_2024.csv"],
+  "vintage_year": 2024,
+  "downloaded": "2026-08-26",
+  "notes": "Rates are average residential/commercial/industrial rates per utility, not per zip code. ISO/RTO membership is a separate hand-curated mapping in zip_lookup.py, not part of this dataset."
+}

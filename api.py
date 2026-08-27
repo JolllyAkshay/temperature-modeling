@@ -146,6 +146,7 @@ def root():
             "forward_curve_history":  "/v1/forward-curve/history/{iso}",
             "forward_curve_accuracy": "/v1/forward-curve/accuracy/{iso}",
             "futures_pricer":         "/v1/futures-pricer/{iso}",
+            "my_electricity":         "/v1/my-electricity/{zip_code}  (no API key required)",
             "net_load":               "/v1/net-load/{iso}",
             "carbon":                 "/v1/carbon/{iso}",
             "accuracy":               "/v1/accuracy/{iso}",
@@ -538,6 +539,33 @@ def get_futures_price_comparison(
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Futures pricer failed: {exc}")
+
+
+@app.get("/v1/my-electricity/{zip_code}", tags=["consumer"])
+def get_my_electricity(zip_code: str):
+    """
+    Consumer-facing: what powers this zip code, how the wholesale price is
+    set, what capacity auctions apply, how competitive the market is, and
+    who the electricity provider is.
+
+    **No API key required** — unlike every other route in this API, this
+    one is meant for public/consumer use (a simple lookup widget, a
+    script, casual curiosity), not gated behind the same access control
+    as the trader-facing endpoints.
+
+    A well-formed zip code that isn't served by one of the 7 wholesale
+    markets this project covers (PJM, CAISO, ERCOT, MISO, NYISO, ISO-NE,
+    SPP) is a normal, honest result, not an error — see `non_rto` in the
+    response.
+    """
+    from temperature_modeling.electricity_explainer import explain_electricity
+
+    try:
+        return explain_electricity(zip_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Electricity explainer failed: {exc}")
 
 
 @app.post("/v1/forward-curve/warm/{iso}", tags=["admin"])

@@ -777,6 +777,11 @@ _main_dashboard_layout = html.Div(
                     style={"display": "flex", "alignItems": "center", "gap": "14px"},
                     children=[
                         dcc.Link(
+                            "What Powers My Zip Code →", href="/my-electricity",
+                            style={"color": "#2563eb", "fontSize": "13px", "fontWeight": 500,
+                                   "textDecoration": "none"},
+                        ),
+                        dcc.Link(
                             "Futures Pricer →", href="/futures-pricer",
                             style={"color": "#2563eb", "fontSize": "13px", "fontWeight": 500,
                                    "textDecoration": "none"},
@@ -1419,6 +1424,187 @@ def render_futures_pricer_result(n_clicks, delivery_month, peak_type, scenario, 
     )
 
 
+# ---------------------------------------------------------------------------
+# "What Powers My Zip Code" — consumer-facing page, public API too (no key)
+# ---------------------------------------------------------------------------
+def _electricity_explainer_layout():
+    return html.Div(
+        style={"fontFamily": "Inter, system-ui, sans-serif",
+               "backgroundColor": "#f8fafc", "minHeight": "100vh", "color": "#1e293b"},
+        children=[
+            html.Div(
+                style={"padding": "14px 28px", "borderBottom": "1px solid #e2e8f0",
+                       "backgroundColor": "#ffffff", "display": "flex", "alignItems": "center",
+                       "justifyContent": "space-between", "boxShadow": "0 1px 4px rgba(0,0,0,0.06)"},
+                children=[
+                    html.Div([
+                        html.H1("What Powers My Zip Code", style={"margin": 0, "fontSize": "20px",
+                                                                    "fontWeight": 700, "color": "#0f172a"}),
+                        html.Span("Where your electricity comes from, how it's priced, and who provides it",
+                                  style={"color": "#94a3b8", "fontSize": "13px"}),
+                    ]),
+                    dcc.Link("← Back to Dashboard", href="/",
+                             style={"color": "#2563eb", "fontSize": "13px", "fontWeight": 500,
+                                    "textDecoration": "none"}),
+                ],
+            ),
+            html.Div(
+                style={"maxWidth": "720px", "margin": "0 auto", "padding": "32px 24px"},
+                children=[
+                    html.Div(
+                        style={"background": "#ffffff", "border": "1px solid #e2e8f0", "borderRadius": "10px",
+                               "padding": "24px", "marginBottom": "24px", "display": "flex",
+                               "gap": "12px", "alignItems": "flex-end"},
+                        children=[
+                            html.Div([
+                                html.Label("Enter your zip code", style={"fontSize": "13px", "color": "#64748b",
+                                                                          "display": "block", "marginBottom": "6px"}),
+                                dcc.Input(id="elec-zip", type="text", placeholder="e.g. 19104",
+                                          maxLength=5, style={"width": "160px", "padding": "9px 12px",
+                                                               "border": "1px solid #cbd5e1", "borderRadius": "6px",
+                                                               "fontSize": "15px"}),
+                            ]),
+                            html.Button(
+                                "Look Up", id="elec-submit", n_clicks=0,
+                                style={"background": "#2563eb", "color": "#ffffff", "border": "none",
+                                       "padding": "10px 22px", "borderRadius": "6px", "cursor": "pointer",
+                                       "fontSize": "14px", "fontWeight": 600},
+                            ),
+                        ],
+                    ),
+                    html.Div(id="elec-result"),
+                ],
+            ),
+        ],
+    )
+
+
+def _elec_section(title, body):
+    return html.Div(
+        style={"background": "#ffffff", "border": "1px solid #e2e8f0", "borderRadius": "10px",
+               "padding": "22px 24px", "marginBottom": "16px"},
+        children=[
+            html.H2(title, style={"fontSize": "16px", "fontWeight": 700, "color": "#0f172a",
+                                   "margin": "0 0 12px"}),
+            body,
+        ],
+    )
+
+
+def _unavailable(reason):
+    return html.Div(reason, style={"fontSize": "13px", "color": "#94a3b8", "fontStyle": "italic"})
+
+
+@app.callback(
+    Output("elec-result", "children"),
+    Input("elec-submit", "n_clicks"),
+    State("elec-zip", "value"),
+)
+def render_electricity_explainer_result(n_clicks, zip_code):
+    if not n_clicks:
+        return []
+    if not zip_code:
+        return html.Div("Enter a zip code.", style={"color": "#ef4444", "fontSize": "13px"})
+
+    from temperature_modeling.electricity_explainer import explain_electricity
+    try:
+        r = explain_electricity(zip_code)
+    except ValueError as exc:
+        return html.Div(str(exc), style={"color": "#ef4444", "fontSize": "13px"})
+    except Exception:
+        log.exception("Electricity explainer failed")
+        return html.Div("Lookup failed — try again in a moment.", style={"color": "#ef4444", "fontSize": "13px"})
+
+    if not r["found"]:
+        return html.Div(f"No data for zip code {zip_code}.", style={"color": "#ef4444", "fontSize": "13px"})
+
+    sections = []
+
+    # Who provides your electricity
+    util_rows = []
+    for u in r["utilities"]:
+        rate = f"{u['res_rate_cents_kwh']:.1f}¢/kWh avg residential" if u.get("res_rate_cents_kwh") else "rate n/a"
+        note = f" — {u['note']}" if u.get("note") else ""
+        util_rows.append(html.Div(f"{u['name']} ({u['state']}) — {rate}{note}",
+                                   style={"fontSize": "14px", "marginBottom": "6px"}))
+    sections.append(_elec_section(
+        "Who provides your electricity",
+        html.Div(util_rows + [html.Div(
+            f"Provider/rate data from {r['data_vintage_year']} (NREL/OpenEI) — your actual bill depends on your specific plan.",
+            style={"fontSize": "11px", "color": "#94a3b8", "marginTop": "8px"})]),
+    ))
+
+    if r["non_rto"]:
+        sections.append(_elec_section("Your area", _unavailable(r["fuel_mix"]["reason"])))
+        return html.Div(sections)
+
+    # What's generating your power right now
+    fm = r["fuel_mix"]
+    if fm["available"]:
+        mix = fm["data"]["fuel_mix"]
+        total = sum(mix.values()) or 1
+        rows = [html.Div(f"{name}: {mw:,.0f} MW ({100*mw/total:.0f}%)", style={"fontSize": "14px", "marginBottom": "4px"})
+                for name, mw in mix.items()]
+        rows.append(html.Div(f"{fm['data']['clean_pct']:.0f}% from zero-carbon sources right now",
+                              style={"fontSize": "13px", "color": "#16a34a", "marginTop": "8px", "fontWeight": 600}))
+        sections.append(_elec_section("What's generating your power right now", html.Div(rows)))
+    else:
+        sections.append(_elec_section("What's generating your power right now", _unavailable(fm["reason"])))
+
+    # How wholesale prices work
+    wp = r["wholesale_price_context"]
+    if wp["available"]:
+        d = wp["data"]
+        sections.append(_elec_section(
+            "How wholesale prices work",
+            html.Div([
+                html.Div(f"Next month ({d['month']}) forward price: ${d['monthly_avg_usd_mwh']:.2f}/MWh "
+                         f"(${d['on_peak_usd_mwh']:.2f} on-peak, ${d['off_peak_usd_mwh']:.2f} off-peak)",
+                         style={"fontSize": "14px", "marginBottom": "10px"}),
+                html.Div(wp["disclaimer"], style={"fontSize": "12px", "color": "#b45309",
+                                                    "background": "#fffbeb", "border": "1px solid #fde68a",
+                                                    "borderRadius": "6px", "padding": "10px 12px"}),
+            ]),
+        ))
+    else:
+        sections.append(_elec_section("How wholesale prices work", _unavailable(wp["reason"])))
+
+    # Capacity auctions
+    ca = r["capacity_auctions"]
+    if ca["available"]:
+        d = ca["data"]
+        price = f"${d['clearing_price_mw_year']:,.0f}/MW-year" if d.get("clearing_price_mw_year") else "no centralized capacity price"
+        sections.append(_elec_section(
+            "Capacity auctions in your area",
+            html.Div([
+                html.Div(f"Mechanism: {d.get('mechanism', 'n/a')}", style={"fontSize": "14px", "marginBottom": "4px"}),
+                html.Div(f"Latest clearing price: {price}", style={"fontSize": "14px", "marginBottom": "4px"}),
+                html.Div(d.get("notes", ""), style={"fontSize": "12px", "color": "#64748b", "marginTop": "8px"}),
+                html.Div(f"Source: {d.get('source', '')}", style={"fontSize": "10px", "color": "#cbd5e1", "marginTop": "6px"}),
+            ]),
+        ))
+    else:
+        sections.append(_elec_section("Capacity auctions in your area", _unavailable(ca["reason"])))
+
+    # Market competitiveness
+    mc = r["market_competitiveness"]
+    if mc["available"]:
+        d = mc["data"]
+        metric = f"{d['headline_metric']}: {d['headline_value']}" if d.get("headline_metric") else "See assessment below"
+        sections.append(_elec_section(
+            "How competitive is your market?",
+            html.Div([
+                html.Div(metric, style={"fontSize": "14px", "fontWeight": 600, "marginBottom": "6px"}),
+                html.Div(d.get("assessment", ""), style={"fontSize": "13px", "color": "#334155", "marginBottom": "8px"}),
+                html.Div(f"Source: {d.get('source', '')}", style={"fontSize": "10px", "color": "#cbd5e1"}),
+            ]),
+        ))
+    else:
+        sections.append(_elec_section("How competitive is your market?", _unavailable(mc["reason"])))
+
+    return html.Div(sections)
+
+
 app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
     html.Div(id="page-content"),
@@ -1429,6 +1615,8 @@ app.layout = html.Div([
 def render_page(pathname):
     if pathname == "/futures-pricer":
         return _futures_pricer_layout()
+    if pathname == "/my-electricity":
+        return _electricity_explainer_layout()
     return _main_dashboard_layout
 
 
