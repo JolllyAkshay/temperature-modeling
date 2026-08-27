@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import temperature_modeling.electricity_explainer as ee
@@ -22,18 +24,19 @@ import temperature_modeling.electricity_explainer as ee
 def _fake_zip_result(iso="pjm", found=True):
     return {
         "zip": "07029", "found": found,
-        "utilities": [{"name": "Public Service Elec & Gas Co", "iso": iso, "iso_status": "mapped"}] if found else [],
+        "utilities": [{"name": "Public Service Elec & Gas Co", "state": "NJ", "iso": iso,
+                        "iso_status": "mapped", "res_rate_usd_mwh": 204.17}] if found else [],
         "iso": iso, "multi_utility": False, "data_vintage_year": 2024,
     }
 
 
 def _fake_curve():
+    """3 months with different prices, so the annual-average calc is genuinely exercised."""
+    def _month(name, avg):
+        return {"month": name, "scenarios": {"base": {"monthly_avg": avg, "on_peak": avg * 1.1, "off_peak": avg * 0.8}}}
     return {
         "model_source": "ols-log-linear",
-        "curve": [{
-            "month": "2026-09",
-            "scenarios": {"base": {"monthly_avg": 24.39, "on_peak": 26.51, "off_peak": 20.15}},
-        }],
+        "curve": [_month("2026-09", 24.39), _month("2026-10", 30.0), _month("2026-11", 45.0)],
     }
 
 
@@ -59,10 +62,37 @@ def test_full_assembly_for_rto_zip(mock_lookup, mock_fuel, mock_cap, mock_comp, 
     assert r["capacity_auctions"]["available"] is True
     assert r["market_competitiveness"]["available"] is True
     assert r["wholesale_price_context"]["available"] is True
-    assert r["wholesale_price_context"]["data"]["monthly_avg_usd_mwh"] == 24.39
+    wp_data = r["wholesale_price_context"]["data"]
+    assert wp_data["next_month_avg_usd_mwh"] == 24.39
+    assert wp_data["next_month"] == "2026-09"
+    # annual average of 24.39, 30.0, 45.0
+    assert wp_data["annual_avg_usd_mwh"] == pytest.approx((24.39 + 30.0 + 45.0) / 3, abs=0.01)
+    assert wp_data["annual_avg_months"] == 3
     assert "disclaimer" in r["wholesale_price_context"]
     assert "not your electric bill" in r["wholesale_price_context"]["disclaimer"] or \
            "your electric bill" in r["wholesale_price_context"]["disclaimer"]
+    # gap_explainer should be populated since the fake utility has a rate
+    assert r["wholesale_price_context"]["gap_explainer"] is not None
+    assert "x the annual-average" in r["wholesale_price_context"]["gap_explainer"]
+
+
+def test_gap_note_returns_none_without_a_rate():
+    """No residential rate available -> no gap note, rather than a note with garbage numbers."""
+    assert ee._retail_wholesale_gap_note([{"name": "Some Utility"}], 30.0) is None
+    assert ee._retail_wholesale_gap_note([], 30.0) is None
+
+
+def test_gap_note_returns_none_without_a_wholesale_price():
+    assert ee._retail_wholesale_gap_note([{"res_rate_usd_mwh": 200.0}], 0) is None
+    assert ee._retail_wholesale_gap_note([{"res_rate_usd_mwh": 200.0}], None) is None
+
+
+def test_gap_note_computes_correct_ratio():
+    note = ee._retail_wholesale_gap_note([{"res_rate_usd_mwh": 200.0}], 40.0)
+    assert note is not None
+    assert "5.0x" in note
+    assert "$200/MWh" in note
+    assert "$40/MWh" in note
 
 
 @mock.patch.object(ee, "get_market_competitiveness")

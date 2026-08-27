@@ -1561,17 +1561,23 @@ def render_electricity_explainer_result(n_clicks, zip_code):
     wp = r["wholesale_price_context"]
     if wp["available"]:
         d = wp["data"]
-        sections.append(_elec_section(
-            "How wholesale prices work",
-            html.Div([
-                html.Div(f"Next month ({d['month']}) forward price: ${d['monthly_avg_usd_mwh']:.2f}/MWh "
-                         f"(${d['on_peak_usd_mwh']:.2f} on-peak, ${d['off_peak_usd_mwh']:.2f} off-peak)",
-                         style={"fontSize": "14px", "marginBottom": "10px"}),
-                html.Div(wp["disclaimer"], style={"fontSize": "12px", "color": "#b45309",
-                                                    "background": "#fffbeb", "border": "1px solid #fde68a",
-                                                    "borderRadius": "6px", "padding": "10px 12px"}),
-            ]),
-        ))
+        rows = [
+            html.Div(f"Annual average forward price ({d['annual_avg_months']}-month strip): "
+                     f"${d['annual_avg_usd_mwh']:.2f}/MWh — this is the figure comparable to your retail rate above.",
+                     style={"fontSize": "14px", "marginBottom": "6px", "fontWeight": 600}),
+            html.Div(f"Next month ({d['next_month']}) specifically: ${d['next_month_avg_usd_mwh']:.2f}/MWh "
+                     f"(${d['next_month_on_peak_usd_mwh']:.2f} on-peak, ${d['next_month_off_peak_usd_mwh']:.2f} off-peak) "
+                     f"— a single month, often not representative of the year.",
+                     style={"fontSize": "13px", "color": "#64748b", "marginBottom": "10px"}),
+        ]
+        if wp.get("gap_explainer"):
+            rows.append(html.Div(wp["gap_explainer"], style={"fontSize": "12px", "color": "#334155",
+                                                                "background": "#f1f5f9", "borderRadius": "6px",
+                                                                "padding": "10px 12px", "marginBottom": "10px"}))
+        rows.append(html.Div(wp["disclaimer"], style={"fontSize": "12px", "color": "#b45309",
+                                                         "background": "#fffbeb", "border": "1px solid #fde68a",
+                                                         "borderRadius": "6px", "padding": "10px 12px"}))
+        sections.append(_elec_section("How wholesale prices work", html.Div(rows)))
     else:
         sections.append(_elec_section("How wholesale prices work", _unavailable(wp["reason"])))
 

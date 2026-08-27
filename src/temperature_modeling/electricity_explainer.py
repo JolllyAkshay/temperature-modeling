@@ -43,7 +43,12 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         fuel_mix:                {available, data} or {available: False, reason}
         capacity_auctions:       {available, data} or {available: False, reason}
         market_competitiveness:  {available, data} or {available: False, reason}
-        wholesale_price_context: {available, data, disclaimer} or {available: False, reason}
+        wholesale_price_context: {available, data, disclaimer, gap_explainer} or
+                                   {available: False, reason} — data includes both
+                                   annual_avg_usd_mwh (the figure comparable to the
+                                   retail rate) and next_month_avg_usd_mwh (near-term,
+                                   not meant for the retail comparison since a single
+                                   month is often a cheap/expensive outlier)
 
     Raises ValueError for a malformed zip (propagated from zip_lookup).
     Never raises for a well-formed zip with no data, or a non-RTO zip —
@@ -116,22 +121,30 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         log.exception("%s: market competitiveness lookup failed", iso.upper())
         result["market_competitiveness"] = {"available": False, "reason": "Market data temporarily unavailable."}
 
-    # Wholesale price context — near-term forward strip, heavily caveated
+    # Wholesale price context — a 12-month forward strip. The annual average
+    # is the number worth comparing against the retail rate (both are
+    # annual figures); next month alone is often a shoulder month and can
+    # make the wholesale-vs-retail gap look larger than it typically is.
     try:
         from .forward_curve import build_forward_curve  # noqa: PLC0415
-        curve = build_forward_curve(iso, n_months=1)
-        month = curve["curve"][0] if curve.get("curve") else None
-        if month:
+        curve = build_forward_curve(iso, n_months=12)
+        months = curve.get("curve") or []
+        if months:
+            next_month = months[0]
+            annual_avg = sum(m["scenarios"]["base"]["monthly_avg"] for m in months) / len(months)
             result["wholesale_price_context"] = {
                 "available": True,
                 "data": {
-                    "month": month["month"],
-                    "monthly_avg_usd_mwh": month["scenarios"]["base"]["monthly_avg"],
-                    "on_peak_usd_mwh": month["scenarios"]["base"]["on_peak"],
-                    "off_peak_usd_mwh": month["scenarios"]["base"]["off_peak"],
+                    "annual_avg_usd_mwh": round(annual_avg, 2),
+                    "annual_avg_months": len(months),
+                    "next_month": next_month["month"],
+                    "next_month_avg_usd_mwh": next_month["scenarios"]["base"]["monthly_avg"],
+                    "next_month_on_peak_usd_mwh": next_month["scenarios"]["base"]["on_peak"],
+                    "next_month_off_peak_usd_mwh": next_month["scenarios"]["base"]["off_peak"],
                     "model_source": curve["model_source"],
                 },
                 "disclaimer": _WHOLESALE_DISCLAIMER,
+                "gap_explainer": _retail_wholesale_gap_note(result["utilities"], annual_avg),
             }
         else:
             result["wholesale_price_context"] = {"available": False, "reason": "Wholesale price data temporarily unavailable."}
@@ -140,3 +153,27 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         result["wholesale_price_context"] = {"available": False, "reason": "Wholesale price data temporarily unavailable."}
 
     return result
+
+
+def _retail_wholesale_gap_note(utilities: list, annual_avg_wholesale: float) -> str | None:
+    """
+    A short, honestly-sourced explanation of why retail runs higher than
+    wholesale — not a real per-utility cost breakdown (we don't have that
+    data), just context so the gap reads as expected market structure
+    rather than a data error. Only computed when a residential rate is
+    actually available to compare against.
+    """
+    rates = [u["res_rate_usd_mwh"] for u in utilities if u.get("res_rate_usd_mwh")]
+    if not rates or not annual_avg_wholesale:
+        return None
+    avg_retail = sum(rates) / len(rates)
+    ratio = avg_retail / annual_avg_wholesale
+    return (
+        f"Your utility's average residential rate (${avg_retail:.0f}/MWh) runs about "
+        f"{ratio:.1f}x the annual-average wholesale price (${annual_avg_wholesale:.0f}/MWh). "
+        f"That's expected — per ISO-NE's own public breakdown, wholesale energy and "
+        f"transmission together typically make up only about a third of a residential bill "
+        f"in ISO-run markets; the rest is distribution infrastructure, capacity market "
+        f"costs, state policy programs (like renewable energy requirements), and utility "
+        f"margin, none of which show up in the wholesale price alone."
+    )
