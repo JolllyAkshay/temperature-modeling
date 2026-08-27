@@ -52,6 +52,9 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                                    retail rate) and next_month_avg_usd_mwh (near-term,
                                    not meant for the retail comparison since a single
                                    month is often a cheap/expensive outlier)
+        wholesale_price_history:  {available, data} or {available: False, reason} —
+                                   real settled daily prices for the last 90 days
+                                   (not model-predicted, unlike wholesale_price_context)
 
     Raises ValueError for a malformed zip (propagated from zip_lookup).
     Never raises for a well-formed zip with no data, or a non-RTO zip —
@@ -82,7 +85,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
 
     if not zl["found"]:
         reason = "No data for this zip code in our dataset."
-        for key in ("fuel_mix", "fuel_mix_history", "capacity_auctions", "market_competitiveness", "wholesale_price_context"):
+        for key in ("fuel_mix", "fuel_mix_history", "capacity_auctions", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
             result[key] = {"available": False, "reason": reason}
         return result
 
@@ -106,7 +109,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                    "markets this tool covers (PJM, CAISO, ERCOT, MISO, NYISO, ISO-NE, SPP) — "
                    "it's likely served by a vertically-integrated utility or federal power "
                    "authority instead. See the utility notes above for specifics.")
-        for key in ("fuel_mix", "fuel_mix_history", "capacity_auctions", "market_competitiveness", "wholesale_price_context"):
+        for key in ("fuel_mix", "fuel_mix_history", "capacity_auctions", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
             result[key] = {"available": False, "reason": reason}
         return result
 
@@ -173,6 +176,19 @@ def explain_electricity(zip_code: str, session=None) -> dict:
     except Exception:
         log.exception("%s: wholesale price context failed", iso.upper())
         result["wholesale_price_context"] = {"available": False, "reason": "Wholesale price data temporarily unavailable."}
+
+    # Wholesale price history — real settled daily prices over the last 90
+    # days, distinct from wholesale_price_context's forward-looking strip.
+    try:
+        from .forward_curve import get_recent_settled_prices  # noqa: PLC0415
+        recent = get_recent_settled_prices(iso, days=90)
+        result["wholesale_price_history"] = (
+            {"available": True, "data": recent} if recent
+            else {"available": False, "reason": "Wholesale price history temporarily unavailable."}
+        )
+    except Exception:
+        log.exception("%s: wholesale price history failed", iso.upper())
+        result["wholesale_price_history"] = {"available": False, "reason": "Wholesale price history temporarily unavailable."}
 
     return result
 

@@ -252,6 +252,31 @@ def _load_price_history(iso: str) -> list:
     return history
 
 
+def get_recent_settled_prices(iso: str, days: int = 90) -> list[dict]:
+    """
+    Return the trailing `days` of real, already-settled daily wholesale
+    prices for `iso` — distinct from build_forward_curve's forward-looking
+    strip, which is model-predicted. Reads from the same persisted archive
+    _load_price_history maintains, so no extra network fetch on a warm cache.
+
+    Each row: {date, price_usd_mwh, on_peak_usd_mwh, off_peak_usd_mwh}.
+    Returns [] if the archive can't be loaded.
+    """
+    history = _load_price_history(iso)
+    if not history:
+        return []
+    recent = sorted(history, key=lambda r: r["date"])[-days:]
+    return [
+        {
+            "date": r["date"],
+            "price_usd_mwh": r.get("price_usd_mwh"),
+            "on_peak_usd_mwh": r.get("on_peak_usd_mwh"),
+            "off_peak_usd_mwh": r.get("off_peak_usd_mwh"),
+        }
+        for r in recent
+    ]
+
+
 def _season(month: int) -> str:
     if month in (6, 7, 8):
         return "summer"

@@ -1627,6 +1627,32 @@ def render_electricity_explainer_result(n_clicks, zip_code):
     else:
         sections.append(_elec_section("How wholesale prices work", _unavailable(wp["reason"])))
 
+    # Wholesale price history — real settled daily prices, last 90 days
+    wph = r.get("wholesale_price_history", {})
+    if wph.get("available"):
+        rows_data = wph["data"]
+        dates = [row["date"] for row in rows_data]
+        prices = [row["price_usd_mwh"] for row in rows_data]
+        price_fig = go.Figure(go.Scatter(
+            x=dates, y=prices, mode="lines",
+            line=dict(color="#7c3aed", width=1.5),
+            hovertemplate="%{x}<br>$%{y:.2f}/MWh<extra></extra>",
+        ))
+        price_fig.update_layout(
+            margin=dict(l=45, r=10, t=10, b=30), height=200,
+            paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+            yaxis=dict(title="$/MWh", gridcolor="#e2e8f0"),
+            xaxis=dict(title=None, tickangle=-45, nticks=8, gridcolor="#e2e8f0"),
+        )
+        sections.append(_elec_section(
+            "Real settled wholesale prices — last 90 days",
+            html.Div([
+                dcc.Graph(figure=price_fig, config={"displayModeBar": False}, style={"height": "200px"}),
+                html.Div("Actual settled daily prices, not the forward-looking model above.",
+                         style={"fontSize": "11px", "color": "#94a3b8", "marginTop": "4px"}),
+            ]),
+        ))
+
     # Capacity auctions
     ca = r["capacity_auctions"]
     if ca["available"]:
