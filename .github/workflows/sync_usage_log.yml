@@ -1,0 +1,53 @@
+name: Sync Usage Log
+
+on:
+  schedule:
+    # Every 30 min, matching the keepalive cadence — keeps the data-loss
+    # window on a redeploy small without hammering the ip-api.com-backed
+    # /usage/summary path.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch current usage log from the live Space
+        env:
+          GRID_API_KEY: ${{ secrets.GRID_API_KEY }}
+        run: |
+          mkdir -p api_cache
+          status=$(curl -s -o api_cache/usage_log.jsonl -w "%{http_code}" \
+            -H "X-API-Key: $GRID_API_KEY" \
+            https://jollyakshay-grid-dashboard.hf.space/fastapi/v1/_internal/usage-log)
+          echo "HTTP status: $status"
+          if [ "$status" != "200" ]; then
+            echo "::warning::Usage log fetch failed with HTTP $status — skipping upload this run"
+            exit 0
+          fi
+          echo "Fetched $(wc -l < api_cache/usage_log.jsonl) lines"
+
+      - name: Upload to the Space repo
+        if: success()
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install -q huggingface_hub
+          python - <<'EOF'
+          import os
+          from pathlib import Path
+          from huggingface_hub import upload_file
+
+          path = Path("api_cache/usage_log.jsonl")
+          if not path.exists() or path.stat().st_size == 0:
+              print("No usage log content to upload — skipping.")
+          else:
+              upload_file(
+                  path_or_fileobj=str(path), path_in_repo="api_cache/usage_log.jsonl",
+                  repo_id="JollyAkshay/grid-dashboard", repo_type="space",
+                  token=os.environ["HF_TOKEN"],
+                  commit_message="Sync usage log",
+              )
+              print(f"Uploaded {path.stat().st_size} bytes")
+          EOF
