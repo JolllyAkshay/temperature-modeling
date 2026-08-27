@@ -10,12 +10,14 @@ explain_electricity(zip_code: str, session=None) -> dict
 """
 
 import logging
+from datetime import date, timedelta
 
 from .zip_lookup import (
     lookup_zip, fetch_latest_state_residential_rate,
     fetch_state_residential_rate_history, geocode_zip,
 )
 from .carbon_intensity import fetch_carbon_intensity, fetch_carbon_intensity_history
+from .demand_response import compute_dr_windows
 from .capacity_market import get_capacity_market_data
 from .market_competitiveness import get_market_competitiveness
 
@@ -51,6 +53,10 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         fuel_mix:                {available, data} or {available: False, reason}
         fuel_mix_history:        {available, data} or {available: False, reason} —
                                    trailing 24h clean_pct/fuel_mix_mw trend, for a chart
+        best_time_to_use:        {available, data: {best_window, low_carbon_window,
+                                   low_cost_window}} or {available: False, reason} —
+                                   today/tomorrow demand-response windows (see
+                                   demand_response.compute_dr_windows for field shapes)
         capacity_auctions:       {available, data} or {available: False, reason}
         market_competitiveness:  {available, data} or {available: False, reason}
         wholesale_price_context: {available, data, disclaimer, gap_explainer} or
@@ -93,7 +99,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
 
     if not zl["found"]:
         reason = "No data for this zip code in our dataset."
-        for key in ("fuel_mix", "fuel_mix_history", "capacity_auctions", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
+        for key in ("fuel_mix", "fuel_mix_history", "best_time_to_use", "capacity_auctions", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
             result[key] = {"available": False, "reason": reason}
         return result
 
@@ -131,7 +137,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                    "markets this tool covers (PJM, CAISO, ERCOT, MISO, NYISO, ISO-NE, SPP) — "
                    "it's likely served by a vertically-integrated utility or federal power "
                    "authority instead. See the utility notes above for specifics.")
-        for key in ("fuel_mix", "fuel_mix_history", "capacity_auctions", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
+        for key in ("fuel_mix", "fuel_mix_history", "best_time_to_use", "capacity_auctions", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
             result[key] = {"available": False, "reason": reason}
         return result
 
@@ -151,6 +157,35 @@ def explain_electricity(zip_code: str, session=None) -> dict:
     except Exception:
         log.exception("%s: fuel mix history fetch failed", iso.upper())
         result["fuel_mix_history"] = {"available": False, "reason": "Fuel mix history temporarily unavailable."}
+
+    # Best time to use electricity — today/tomorrow low-carbon and low-cost
+    # windows, reusing demand_response.py's solar/wind-timing model (built
+    # for the trader dashboard's DR panel). That page runs a full weather-
+    # driven load forecast to size daily_load_gw precisely; this consumer
+    # page doesn't have that pipeline available, so the daily level is
+    # approximated from the current total generation (fm's total_mw) —
+    # coarser, but good enough to scale the typical hourly demand shape
+    # the model uses internally to time the solar/wind windows.
+    try:
+        if fm:
+            today = date.today()
+            tomorrow = today + timedelta(days=1)
+            approx_gw = fm.get("total_mw", 0) / 1000
+            daily_gw = {today.isoformat(): approx_gw, tomorrow.isoformat(): approx_gw}
+            dr = compute_dr_windows(iso, daily_gw, fm, session=session)
+            result["best_time_to_use"] = (
+                {"available": True, "data": {
+                    "best_window": dr["best_window"],
+                    "low_carbon_window": dr["low_carbon_window"],
+                    "low_cost_window": dr["low_cost_window"],
+                }} if dr else
+                {"available": False, "reason": "Best-time-to-use data temporarily unavailable."}
+            )
+        else:
+            result["best_time_to_use"] = {"available": False, "reason": "Best-time-to-use data temporarily unavailable."}
+    except Exception:
+        log.exception("%s: demand-response window computation failed", iso.upper())
+        result["best_time_to_use"] = {"available": False, "reason": "Best-time-to-use data temporarily unavailable."}
 
     # Capacity auctions
     try:

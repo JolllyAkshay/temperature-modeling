@@ -1625,6 +1625,27 @@ def render_electricity_explainer_result(n_clicks, zip_code):
             dcc.Graph(figure=hist_fig, config={"displayModeBar": False}, style={"height": "200px"}),
         ))
 
+    # Best time to use electricity
+    btu = r.get("best_time_to_use", {})
+    if btu.get("available"):
+        d = btu["data"]
+        best, lc, lcost = d["best_window"], d["low_carbon_window"], d["low_cost_window"]
+        rows = [
+            html.Div(f"Best overall window today: {best['label']} — {best['reason']}",
+                     style={"fontSize": "14px", "fontWeight": 600, "color": "#15803d", "marginBottom": "10px"}),
+            html.Div(f"Lowest carbon: {lc['label']} (about {lc['carbon_reduction_pct']}% below the day's average carbon intensity)",
+                     style={"fontSize": "13px", "marginBottom": "4px"}),
+            html.Div(f"Lowest demand / cheapest to serve: {lcost['label']} (about {lcost['cost_reduction_pct']}% below the day's average grid load)",
+                     style={"fontSize": "13px", "marginBottom": "8px"}),
+            html.Div("Estimated from typical hourly demand shape, current fuel mix, and forecast sun/wind — "
+                     "not a live price signal. Most useful if your plan has time-of-use pricing or you just "
+                     "want to shift flexible use (EV charging, laundry, etc.) to a cleaner/cheaper window.",
+                     style={"fontSize": "11px", "color": "#94a3b8"}),
+        ]
+        sections.append(_elec_section("Best time to use electricity today", html.Div(rows)))
+    else:
+        sections.append(_elec_section("Best time to use electricity today", _unavailable(btu.get("reason", "Temporarily unavailable."))))
+
     # How wholesale prices work
     wp = r["wholesale_price_context"]
     if wp["available"]:
