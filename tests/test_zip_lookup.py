@@ -88,7 +88,7 @@ def test_no_duplicate_utility_rows_for_deregulated_state():
     peco_rows = [u for u in r["utilities"] if u["name"] == "PECO Energy Co"]
     assert len(peco_rows) == 1
     assert peco_rows[0]["rate_basis"] == "bundled"
-    assert peco_rows[0]["res_rate_cents_kwh"] is not None
+    assert peco_rows[0]["res_rate_usd_mwh"] is not None
 
 
 def test_multi_utility_zip_reports_all_and_resolves_iso_from_mapped_only():
@@ -105,13 +105,13 @@ def test_multi_utility_zip_reports_all_and_resolves_iso_from_mapped_only():
     assert "Pacific Gas & Electric Co." in names
 
 
-def test_rate_is_in_cents_not_dollars():
-    """Source CSV stores rates as a dollar fraction (e.g. 0.16) — must be converted to cents/kWh."""
+def test_rate_is_in_usd_per_mwh_not_dollars_per_kwh():
+    """Source CSV stores rates as $/kWh (e.g. 0.16) — must be converted to $/MWh (x1000)."""
     r = lookup_zip("19104")
     peco = next(u for u in r["utilities"] if u["name"] == "PECO Energy Co")
-    # A residential rate should plausibly be single-to-double-digit cents/kWh,
-    # not a fraction less than 1 (that would mean the *100 conversion was skipped).
-    assert 5.0 < peco["res_rate_cents_kwh"] < 60.0
+    # A residential rate should plausibly be tens-to-hundreds of $/MWh,
+    # not a fraction less than 1 (that would mean the *1000 conversion was skipped).
+    assert 50.0 < peco["res_rate_usd_mwh"] < 600.0
 
 
 def test_data_vintage_year_present():

@@ -11,7 +11,7 @@ explain_electricity(zip_code: str, session=None) -> dict
 
 import logging
 
-from .zip_lookup import lookup_zip
+from .zip_lookup import lookup_zip, fetch_latest_state_residential_rate
 from .carbon_intensity import fetch_carbon_intensity
 from .capacity_market import get_capacity_market_data
 from .market_competitiveness import get_market_competitiveness
@@ -34,6 +34,12 @@ def explain_electricity(zip_code: str, session=None) -> dict:
     Returns a dict with:
         zip, found, utilities, data_vintage_year  (from zip_lookup)
         iso, non_rto (bool)
+        latest_state_rates:      {state: {period, res_rate_usd_mwh}, ...} —
+                                   live EIA monthly state average, typically
+                                   1-2 months old vs. the per-utility rate's
+                                   annual snapshot; coarser (state-wide, not
+                                   per-utility) but far fresher. Empty dict
+                                   if the EIA key is missing or the fetch fails.
         fuel_mix:                {available, data} or {available: False, reason}
         capacity_auctions:       {available, data} or {available: False, reason}
         market_competitiveness:  {available, data} or {available: False, reason}
@@ -52,6 +58,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         "data_vintage_year": zl["data_vintage_year"],
         "iso": zl["iso"],
         "non_rto": zl["found"] and zl["iso"] is None,
+        "latest_state_rates": {},
     }
 
     if not zl["found"]:
@@ -59,6 +66,20 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         for key in ("fuel_mix", "capacity_auctions", "market_competitiveness", "wholesale_price_context"):
             result[key] = {"available": False, "reason": reason}
         return result
+
+    # Best-effort — a live-rate miss should never take down the rest of
+    # the response, and applies regardless of ISO/non-RTO status (a
+    # utility's state-average rate exists whether or not it's in an ISO).
+    for state in {u["state"] for u in zl["utilities"] if u.get("state")}:
+        try:
+            rate = fetch_latest_state_residential_rate(state, session=session)
+        except Exception:
+            log.exception("%s: state rate fetch failed", state)
+            rate = None
+        if rate:
+            result["latest_state_rates"][state] = {
+                "period": rate["period"], "res_rate_usd_mwh": rate["res_rate_usd_mwh"],
+            }
 
     iso = zl["iso"]
     if iso is None:

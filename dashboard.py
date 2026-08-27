@@ -1523,14 +1523,20 @@ def render_electricity_explainer_result(n_clicks, zip_code):
     # Who provides your electricity
     util_rows = []
     for u in r["utilities"]:
-        rate = f"{u['res_rate_cents_kwh']:.1f}¢/kWh avg residential" if u.get("res_rate_cents_kwh") else "rate n/a"
+        rate = f"${u['res_rate_usd_mwh']:.2f}/MWh avg residential" if u.get("res_rate_usd_mwh") else "rate n/a"
         note = f" — {u['note']}" if u.get("note") else ""
         util_rows.append(html.Div(f"{u['name']} ({u['state']}) — {rate}{note}",
                                    style={"fontSize": "14px", "marginBottom": "6px"}))
+    state_rate_rows = [
+        html.Div(f"Latest {state} statewide residential average ({sr['period']}): ${sr['res_rate_usd_mwh']:.2f}/MWh",
+                  style={"fontSize": "13px", "color": "#2563eb", "marginTop": "4px"})
+        for state, sr in r["latest_state_rates"].items()
+    ]
     sections.append(_elec_section(
         "Who provides your electricity",
-        html.Div(util_rows + [html.Div(
-            f"Provider/rate data from {r['data_vintage_year']} (NREL/OpenEI) — your actual bill depends on your specific plan.",
+        html.Div(util_rows + state_rate_rows + [html.Div(
+            f"Per-utility rate from {r['data_vintage_year']} (NREL/OpenEI, annual snapshot); "
+            f"statewide average from EIA (monthly, most current available). Your actual bill depends on your specific plan.",
             style={"fontSize": "11px", "color": "#94a3b8", "marginTop": "8px"})]),
     ))
 
@@ -1574,15 +1580,19 @@ def render_electricity_explainer_result(n_clicks, zip_code):
     if ca["available"]:
         d = ca["data"]
         price = f"${d['clearing_price_mw_year']:,.0f}/MW-year" if d.get("clearing_price_mw_year") else "no centralized capacity price"
-        sections.append(_elec_section(
-            "Capacity auctions in your area",
-            html.Div([
-                html.Div(f"Mechanism: {d.get('mechanism', 'n/a')}", style={"fontSize": "14px", "marginBottom": "4px"}),
-                html.Div(f"Latest clearing price: {price}", style={"fontSize": "14px", "marginBottom": "4px"}),
-                html.Div(d.get("notes", ""), style={"fontSize": "12px", "color": "#64748b", "marginTop": "8px"}),
-                html.Div(f"Source: {d.get('source', '')}", style={"fontSize": "10px", "color": "#cbd5e1", "marginTop": "6px"}),
-            ]),
-        ))
+        rows = [
+            html.Div(f"Mechanism: {d.get('mechanism', 'n/a')}", style={"fontSize": "14px", "marginBottom": "4px"}),
+        ]
+        if d.get("active_delivery_period"):
+            rows.append(html.Div(f"Currently delivering under: {d['active_delivery_period']}",
+                                  style={"fontSize": "14px", "marginBottom": "4px", "fontWeight": 600}))
+        if d.get("auction_held_date"):
+            rows.append(html.Div(f"That auction was held: {d['auction_held_date']}",
+                                  style={"fontSize": "14px", "marginBottom": "4px", "color": "#2563eb"}))
+        rows.append(html.Div(f"Clearing price: {price}", style={"fontSize": "14px", "marginBottom": "4px"}))
+        rows.append(html.Div(d.get("notes", ""), style={"fontSize": "12px", "color": "#64748b", "marginTop": "8px"}))
+        rows.append(html.Div(f"Source: {d.get('source', '')}", style={"fontSize": "10px", "color": "#cbd5e1", "marginTop": "6px"}))
+        sections.append(_elec_section("Capacity auctions in your area", html.Div(rows)))
     else:
         sections.append(_elec_section("Capacity auctions in your area", _unavailable(ca["reason"])))
 
