@@ -12,7 +12,7 @@ explain_electricity(zip_code: str, session=None) -> dict
 import logging
 
 from .zip_lookup import lookup_zip, fetch_latest_state_residential_rate, geocode_zip
-from .carbon_intensity import fetch_carbon_intensity
+from .carbon_intensity import fetch_carbon_intensity, fetch_carbon_intensity_history
 from .capacity_market import get_capacity_market_data
 from .market_competitiveness import get_market_competitiveness
 
@@ -42,6 +42,8 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                                    per-utility) but far fresher. Empty dict
                                    if the EIA key is missing or the fetch fails.
         fuel_mix:                {available, data} or {available: False, reason}
+        fuel_mix_history:        {available, data} or {available: False, reason} —
+                                   trailing 24h clean_pct/fuel_mix_mw trend, for a chart
         capacity_auctions:       {available, data} or {available: False, reason}
         market_competitiveness:  {available, data} or {available: False, reason}
         wholesale_price_context: {available, data, disclaimer, gap_explainer} or
@@ -80,7 +82,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
 
     if not zl["found"]:
         reason = "No data for this zip code in our dataset."
-        for key in ("fuel_mix", "capacity_auctions", "market_competitiveness", "wholesale_price_context"):
+        for key in ("fuel_mix", "fuel_mix_history", "capacity_auctions", "market_competitiveness", "wholesale_price_context"):
             result[key] = {"available": False, "reason": reason}
         return result
 
@@ -104,7 +106,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                    "markets this tool covers (PJM, CAISO, ERCOT, MISO, NYISO, ISO-NE, SPP) — "
                    "it's likely served by a vertically-integrated utility or federal power "
                    "authority instead. See the utility notes above for specifics.")
-        for key in ("fuel_mix", "capacity_auctions", "market_competitiveness", "wholesale_price_context"):
+        for key in ("fuel_mix", "fuel_mix_history", "capacity_auctions", "market_competitiveness", "wholesale_price_context"):
             result[key] = {"available": False, "reason": reason}
         return result
 
@@ -116,6 +118,14 @@ def explain_electricity(zip_code: str, session=None) -> dict:
     except Exception:
         log.exception("%s: fuel mix fetch failed", iso.upper())
         result["fuel_mix"] = {"available": False, "reason": "Fuel mix data temporarily unavailable."}
+
+    # Fuel mix trend — trailing 24h, for a chart of how clean the mix has been
+    try:
+        fmh = fetch_carbon_intensity_history(iso, hours=24, session=session)
+        result["fuel_mix_history"] = fmh
+    except Exception:
+        log.exception("%s: fuel mix history fetch failed", iso.upper())
+        result["fuel_mix_history"] = {"available": False, "reason": "Fuel mix history temporarily unavailable."}
 
     # Capacity auctions
     try:

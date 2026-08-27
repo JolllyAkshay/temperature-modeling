@@ -1583,6 +1583,26 @@ def render_electricity_explainer_result(n_clicks, zip_code):
     else:
         sections.append(_elec_section("What's generating your power right now", _unavailable(fm["reason"])))
 
+    # Fuel mix trend — last 24h
+    fmh = r.get("fuel_mix_history", {})
+    if fmh.get("available"):
+        periods = fmh["periods"]
+        hist_fig = go.Figure(go.Scatter(
+            x=periods, y=fmh["clean_pct"], mode="lines+markers",
+            line=dict(color="#16a34a", width=2), marker=dict(size=4),
+            hovertemplate="%{x}<br>%{y:.0f}%% clean<extra></extra>",
+        ))
+        hist_fig.update_layout(
+            margin=dict(l=40, r=10, t=10, b=30), height=200,
+            paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+            yaxis=dict(title="% clean energy", range=[0, 100], gridcolor="#e2e8f0"),
+            xaxis=dict(title=None, tickangle=-45, nticks=8, gridcolor="#e2e8f0"),
+        )
+        sections.append(_elec_section(
+            "Clean energy % — last 24 hours",
+            dcc.Graph(figure=hist_fig, config={"displayModeBar": False}, style={"height": "200px"}),
+        ))
+
     # How wholesale prices work
     wp = r["wholesale_price_context"]
     if wp["available"]:
