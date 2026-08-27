@@ -11,7 +11,7 @@ explain_electricity(zip_code: str, session=None) -> dict
 
 import logging
 
-from .zip_lookup import lookup_zip, fetch_latest_state_residential_rate
+from .zip_lookup import lookup_zip, fetch_latest_state_residential_rate, geocode_zip
 from .carbon_intensity import fetch_carbon_intensity
 from .capacity_market import get_capacity_market_data
 from .market_competitiveness import get_market_competitiveness
@@ -34,6 +34,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
     Returns a dict with:
         zip, found, utilities, data_vintage_year  (from zip_lookup)
         iso, non_rto (bool)
+        location:                {lat, lon, display_name} or None — for the map
         latest_state_rates:      {state: {period, res_rate_usd_mwh}, ...} —
                                    live EIA monthly state average, typically
                                    1-2 months old vs. the per-utility rate's
@@ -56,6 +57,16 @@ def explain_electricity(zip_code: str, session=None) -> dict:
     """
     zl = lookup_zip(zip_code)
 
+    # Best-effort — independent of whether the zip is in the utility
+    # dataset, so a map location can still show even for a zip our
+    # provider data doesn't cover. None on any geocoding failure; the map
+    # is a visual nicety, never load-bearing for the rest of the response.
+    try:
+        location = geocode_zip(zl["zip"], session=session)
+    except Exception:
+        log.exception("%s: geocoding failed", zl["zip"])
+        location = None
+
     result = {
         "zip": zl["zip"],
         "found": zl["found"],
@@ -63,6 +74,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         "data_vintage_year": zl["data_vintage_year"],
         "iso": zl["iso"],
         "non_rto": zl["found"] and zl["iso"] is None,
+        "location": location,
         "latest_state_rates": {},
     }
 

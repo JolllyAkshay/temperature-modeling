@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from temperature_modeling.zip_lookup import lookup_zip
+from temperature_modeling.zip_lookup import lookup_zip, geocode_zip
 
 
 @pytest.mark.parametrize("zip_code,expected_iso,utility_substr", [
@@ -117,3 +117,46 @@ def test_rate_is_in_usd_per_mwh_not_dollars_per_kwh():
 def test_data_vintage_year_present():
     r = lookup_zip("19104")
     assert r["data_vintage_year"] == 2024
+
+
+# ---------------------------------------------------------------------------
+# geocode_zip — live network tests, matching this file's existing
+# convention of testing against real data rather than mocks.
+# ---------------------------------------------------------------------------
+
+def test_geocode_zip_malformed_returns_none_no_network_call():
+    assert geocode_zip("abc") is None
+    assert geocode_zip("123") is None
+    assert geocode_zip("") is None
+    assert geocode_zip(None) is None
+
+
+def test_geocode_zip_resolves_known_zips():
+    r = geocode_zip("78701")   # Austin, TX
+    assert r is not None
+    assert 30.0 < r["lat"] < 31.0
+    assert -98.0 < r["lon"] < -97.0
+    assert "Austin" in r["display_name"] or "Texas" in r["display_name"]
+
+
+def test_geocode_zip_po_box_only_zip_returns_none_not_a_wrong_location():
+    """
+    30301 is a PO-Box-only Atlanta zip with no real geographic boundary in
+    OSM's data. A naive free-text Nominatim query for "30301" matches an
+    unrelated OSM entity (a vending machine labeled "30301" in
+    Minneapolis) rather than Georgia — confirmed live during development.
+    Must return None here, not that wrong location.
+    """
+    r = geocode_zip("30301")
+    if r is not None:
+        # If Nominatim's data has since improved and it now resolves,
+        # it must at least be in the right state, not Minnesota.
+        assert "Georgia" in r["display_name"]
+        assert 33.0 < r["lat"] < 35.0
+    # else: None is the expected, honest answer for this zip today.
+
+
+def test_geocode_zip_is_cached():
+    r1 = geocode_zip("62701")
+    r2 = geocode_zip("62701")
+    assert r1 == r2

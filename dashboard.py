@@ -1520,6 +1520,32 @@ def render_electricity_explainer_result(n_clicks, zip_code):
 
     sections = []
 
+    # Map — where this zip code is
+    loc = r.get("location")
+    if loc:
+        iso_label = {"pjm": "PJM", "caiso": "CAISO", "ercot": "ERCOT", "miso": "MISO",
+                     "nyiso": "NYISO", "isone": "ISO-NE", "spp": "SPP"}.get(r["iso"])
+        map_title = f"{iso_label} territory" if iso_label else "not in a wholesale market territory covered here"
+        fig = go.Figure(go.Scattergeo(
+            lon=[loc["lon"]], lat=[loc["lat"]], mode="markers+text",
+            text=[zip_code], textposition="top center",
+            marker=dict(size=12, color="#2563eb", line=dict(width=1.5, color="#ffffff")),
+            hovertemplate=f"{loc['display_name']}<extra></extra>",
+        ))
+        fig.update_layout(
+            geo=dict(scope="usa", projection_type="albers usa",
+                     showland=True, landcolor="#f1f5f9", showlakes=True, lakecolor="#ffffff",
+                     subunitcolor="#cbd5e1", countrycolor="#cbd5e1",
+                     center=dict(lat=loc["lat"], lon=loc["lon"]),
+                     projection_scale=8 if r["iso"] else 4),
+            margin=dict(l=0, r=0, t=0, b=0), height=220,
+            paper_bgcolor="#ffffff",
+        )
+        sections.append(_elec_section(
+            f"Where you are — {map_title}",
+            dcc.Graph(figure=fig, config={"displayModeBar": False}, style={"height": "220px"}),
+        ))
+
     # Who provides your electricity
     util_rows = []
     for u in r["utilities"]:

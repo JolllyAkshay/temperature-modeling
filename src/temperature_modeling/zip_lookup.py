@@ -24,6 +24,7 @@ Public API
 ----------
 lookup_zip(zip_code: str) -> dict
 fetch_latest_state_residential_rate(state: str, session=None) -> dict | None
+geocode_zip(zip_code: str, session=None) -> dict | None
 """
 
 import csv
@@ -415,3 +416,108 @@ def fetch_latest_state_residential_rate(state: str, session: requests.Session | 
     }
     _STATE_RATE_CACHE[state] = (time.time(), result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Zip -> lat/lon, for the map. Persisted to disk (not just in-process) since
+# a zip's coordinates never change — no reason to ever re-fetch one already
+# looked up, and Nominatim's usage policy asks callers to avoid repeat
+# requests for the same query. Separate from geocoding.py's
+# geocode_location, which is free-text-only and hard-gated to PJM states —
+# neither fits a zip-code lookup that must work for any of the 7 ISOs.
+# ---------------------------------------------------------------------------
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_GEOCODE_CACHE_PATH = _DATA_DIR.parent.parent.parent / "api_cache" / "zip_geocode_cache.json"
+_GEOCODE_CACHE: dict | None = None
+
+
+def _load_geocode_cache() -> dict:
+    global _GEOCODE_CACHE
+    if _GEOCODE_CACHE is None:
+        try:
+            _GEOCODE_CACHE = json.loads(_GEOCODE_CACHE_PATH.read_text())
+        except Exception:
+            _GEOCODE_CACHE = {}
+    return _GEOCODE_CACHE
+
+
+def _save_geocode_cache() -> None:
+    try:
+        _GEOCODE_CACHE_PATH.parent.mkdir(exist_ok=True)
+        _GEOCODE_CACHE_PATH.write_text(json.dumps(_GEOCODE_CACHE))
+    except Exception:
+        log.warning("zip_lookup: failed to persist geocode cache")
+
+
+def geocode_zip(zip_code: str, session: requests.Session | None = None) -> dict | None:
+    """
+    Best-effort zip code -> {lat, lon, display_name}, via Nominatim
+    (OpenStreetMap), cached to disk indefinitely — a zip's centroid
+    doesn't move, and Nominatim's usage policy explicitly asks callers not
+    to repeat identical queries. Returns None on any failure; the map is a
+    visual nicety, never a hard requirement for the rest of the tool.
+
+    Two-tier lookup, verified against real zips before settling on this
+    shape:
+      1. Nominatim's structured `postalcode=` query — precise, but returns
+         nothing for some zips (e.g. 30301, a PO-Box-only Atlanta zip with
+         no real geographic boundary in OSM's data).
+      2. Free-text query as a fallback, but ONLY accepting a result
+         Nominatim itself typed as "postcode" — free-text search on a bare
+         5-digit number can otherwise match unrelated OSM entities whose
+         name happens to equal the zip (confirmed live: "30301" free-text
+         matched a vending machine labeled "30301" in Minneapolis). A
+         wrong-city result is worse than no map at all, so this rejects
+         anything not explicitly typed as a postcode rather than guessing.
+    """
+    zip_code = (zip_code or "").strip()
+    if not zip_code.isdigit() or len(zip_code) != 5:
+        return None
+
+    cache = _load_geocode_cache()
+    if zip_code in cache:
+        return cache[zip_code]
+
+    sess = session or requests.Session()
+    # requests.Session() already carries a default "python-requests/x.y"
+    # User-Agent — setdefault() would never override it since the key
+    # already exists. Nominatim's usage policy explicitly rejects generic
+    # HTTP-client user agents, so this has to be an unconditional assignment.
+    sess.headers["User-Agent"] = "grid-dashboard-electricity-explainer/1.0"
+
+    result = None
+    try:
+        r = sess.get(_NOMINATIM_URL, params={
+            "postalcode": zip_code, "country": "USA", "format": "json",
+            "addressdetails": 1, "limit": 1,
+        }, timeout=15)
+        r.raise_for_status()
+        hits = r.json()
+        if hits:
+            result = hits[0]
+        else:
+            r2 = sess.get(_NOMINATIM_URL, params={
+                "q": f"{zip_code}, USA", "format": "json", "addressdetails": 1,
+                "limit": 1, "countrycodes": "us",
+            }, timeout=15)
+            r2.raise_for_status()
+            hits2 = r2.json()
+            if hits2 and hits2[0].get("addresstype") == "postcode":
+                result = hits2[0]
+    except Exception as exc:
+        log.warning("zip_lookup: geocoding failed for %s: %s", zip_code, exc)
+        return None
+
+    if not result:
+        cache[zip_code] = None
+        _save_geocode_cache()
+        return None
+
+    parsed = {
+        "lat": float(result["lat"]),
+        "lon": float(result["lon"]),
+        "display_name": result.get("display_name", zip_code),
+    }
+    cache[zip_code] = parsed
+    _save_geocode_cache()
+    return parsed
