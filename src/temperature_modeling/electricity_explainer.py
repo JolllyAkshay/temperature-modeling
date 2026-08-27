@@ -11,7 +11,10 @@ explain_electricity(zip_code: str, session=None) -> dict
 
 import logging
 
-from .zip_lookup import lookup_zip, fetch_latest_state_residential_rate, geocode_zip
+from .zip_lookup import (
+    lookup_zip, fetch_latest_state_residential_rate,
+    fetch_state_residential_rate_history, geocode_zip,
+)
 from .carbon_intensity import fetch_carbon_intensity, fetch_carbon_intensity_history
 from .capacity_market import get_capacity_market_data
 from .market_competitiveness import get_market_competitiveness
@@ -41,6 +44,10 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                                    annual snapshot; coarser (state-wide, not
                                    per-utility) but far fresher. Empty dict
                                    if the EIA key is missing or the fetch fails.
+        retail_rate_history:      {available, data: {state, history: [{period,
+                                   res_rate_usd_mwh}, ...]}} or {available: False,
+                                   reason} — trailing 24 months, same state-average
+                                   series as latest_state_rates, for a trend chart
         fuel_mix:                {available, data} or {available: False, reason}
         fuel_mix_history:        {available, data} or {available: False, reason} —
                                    trailing 24h clean_pct/fuel_mix_mw trend, for a chart
@@ -81,6 +88,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
         "non_rto": zl["found"] and zl["iso"] is None,
         "location": location,
         "latest_state_rates": {},
+        "retail_rate_history": {"available": False, "reason": "No data for this zip code in our dataset."},
     }
 
     if not zl["found"]:
@@ -102,6 +110,20 @@ def explain_electricity(zip_code: str, session=None) -> dict:
             result["latest_state_rates"][state] = {
                 "period": rate["period"], "res_rate_usd_mwh": rate["res_rate_usd_mwh"],
             }
+
+    # Retail rate trend — trailing 24 months, one state (the first with
+    # a mapped rate) since utilities at a single zip are almost always
+    # in the same state; best-effort like the latest-rate fetch above.
+    result["retail_rate_history"] = {"available": False, "reason": "No state rate data available."}
+    for state in {u["state"] for u in zl["utilities"] if u.get("state")}:
+        try:
+            history = fetch_state_residential_rate_history(state, months=24, session=session)
+        except Exception:
+            log.exception("%s: state rate history fetch failed", state)
+            history = []
+        if history:
+            result["retail_rate_history"] = {"available": True, "data": {"state": state, "history": history}}
+            break
 
     iso = zl["iso"]
     if iso is None:

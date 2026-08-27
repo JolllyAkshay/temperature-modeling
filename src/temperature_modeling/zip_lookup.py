@@ -24,6 +24,7 @@ Public API
 ----------
 lookup_zip(zip_code: str) -> dict
 fetch_latest_state_residential_rate(state: str, session=None) -> dict | None
+fetch_state_residential_rate_history(state: str, months=24, session=None) -> list[dict]
 geocode_zip(zip_code: str, session=None) -> dict | None
 """
 
@@ -44,6 +45,7 @@ _ZIP_FILES = ["iou_zipcodes_2024.csv", "non_iou_zipcodes_2024.csv"]
 _EIA_RETAIL_SALES_URL = "https://api.eia.gov/v2/electricity/retail-sales/data/"
 _STATE_RATE_CACHE: dict = {}          # {state: (timestamp, result)}
 _STATE_RATE_CACHE_TTL_S = 24 * 3600   # EIA publishes this monthly — daily cache is plenty fresh
+_STATE_RATE_HISTORY_CACHE: dict = {}  # {"state:months": (timestamp, result)}
 
 # ---------------------------------------------------------------------------
 # Utility -> ISO/RTO membership.
@@ -415,6 +417,62 @@ def fetch_latest_state_residential_rate(state: str, session: requests.Session | 
         "res_rate_usd_mwh": round(cents_per_kwh * 10, 2),   # ¢/kWh -> $/MWh
     }
     _STATE_RATE_CACHE[state] = (time.time(), result)
+    return result
+
+
+def fetch_state_residential_rate_history(state: str, months: int = 24, session: requests.Session | None = None) -> list[dict]:
+    """
+    Trailing `months` of EIA's monthly average residential rate for a
+    state — same series as fetch_latest_state_residential_rate, extended
+    to a range for a rate-trend chart instead of just the latest point.
+
+    Returns a list of {period (YYYY-MM), res_rate_usd_mwh}, ascending by
+    period. Empty list if the key is missing, the state has no data, or
+    the request fails — always a best-effort supplement.
+    """
+    api_key = os.environ.get("EIA_API_KEY", "")
+    if not api_key:
+        return []
+
+    state = (state or "").strip().upper()
+    if not state:
+        return []
+
+    cache_key = f"{state}:{months}"
+    cached_ts, cached_val = _STATE_RATE_HISTORY_CACHE.get(cache_key, (0, None))
+    if cached_val is not None and time.time() - cached_ts < _STATE_RATE_CACHE_TTL_S:
+        return cached_val
+
+    sess = session or requests.Session()
+    try:
+        r = sess.get(_EIA_RETAIL_SALES_URL, params={
+            "api_key": api_key,
+            "frequency": "monthly",
+            "data[0]": "price",
+            "facets[stateid][]": state,
+            "facets[sectorid][]": "RES",
+            "sort[0][column]": "period",
+            "sort[0][direction]": "desc",
+            "length": months,
+        }, timeout=20)
+        r.raise_for_status()
+        rows = r.json().get("response", {}).get("data", [])
+    except Exception as exc:
+        log.warning("EIA retail-sales history fetch failed for %s: %s", state, exc)
+        return []
+
+    result = []
+    for row in rows:
+        if row.get("price") is None:
+            continue
+        try:
+            cents_per_kwh = float(row["price"])
+        except (TypeError, ValueError):
+            continue
+        result.append({"period": row["period"], "res_rate_usd_mwh": round(cents_per_kwh * 10, 2)})
+    result.sort(key=lambda r: r["period"])
+
+    _STATE_RATE_HISTORY_CACHE[cache_key] = (time.time(), result)
     return result
 
 

@@ -1566,6 +1566,28 @@ def render_electricity_explainer_result(n_clicks, zip_code):
             style={"fontSize": "11px", "color": "#94a3b8", "marginTop": "8px"})]),
     ))
 
+    # Retail rate trend — trailing 24 months, state average
+    rrh = r.get("retail_rate_history", {})
+    if rrh.get("available"):
+        hd = rrh["data"]
+        periods = [row["period"] for row in hd["history"]]
+        rates = [row["res_rate_usd_mwh"] for row in hd["history"]]
+        rate_fig = go.Figure(go.Scatter(
+            x=periods, y=rates, mode="lines+markers",
+            line=dict(color="#2563eb", width=2), marker=dict(size=4),
+            hovertemplate="%{x}<br>$%{y:.2f}/MWh<extra></extra>",
+        ))
+        rate_fig.update_layout(
+            margin=dict(l=45, r=10, t=10, b=30), height=200,
+            paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+            yaxis=dict(title="$/MWh", gridcolor="#e2e8f0"),
+            xaxis=dict(title=None, tickangle=-45, nticks=8, gridcolor="#e2e8f0"),
+        )
+        sections.append(_elec_section(
+            f"{hd['state']} residential rate — last 24 months",
+            dcc.Graph(figure=rate_fig, config={"displayModeBar": False}, style={"height": "200px"}),
+        ))
+
     if r["non_rto"]:
         sections.append(_elec_section("Your area", _unavailable(r["fuel_mix"]["reason"])))
         return html.Div(sections)
