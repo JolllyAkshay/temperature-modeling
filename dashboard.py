@@ -1757,6 +1757,38 @@ def render_electricity_explainer_result(n_clicks, zip_code):
     else:
         sections.append(_elec_section("Capacity auctions in your area", _unavailable(ca["reason"])))
 
+    # Capacity price trend — is it rising, and why?
+    cpt = r.get("capacity_price_trend", {})
+    if cpt.get("available"):
+        hist = cpt["data"]["history"]
+        periods = [h["delivery_period"] for h in hist]
+        prices = [h["clearing_price_mw_year"] for h in hist]
+        trend_fig = go.Figure(go.Bar(
+            x=periods, y=prices, marker_color="#f97316",
+            text=[f"{h['native_unit_price']}" for h in hist], textposition="outside",
+            hovertemplate="%{x}<br>$%{y:,.0f}/MW-year<extra></extra>",
+        ))
+        trend_fig.update_layout(
+            margin=dict(l=50, r=10, t=30, b=30), height=230,
+            paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+            yaxis=dict(title="$/MW-year", gridcolor="#e2e8f0"),
+            xaxis=dict(title=None, gridcolor="#e2e8f0"),
+        )
+        rows = [dcc.Graph(figure=trend_fig, config={"displayModeBar": False}, style={"height": "230px"})]
+        attrib = cpt["data"].get("data_center_attribution")
+        if attrib:
+            rows.append(html.Div([
+                html.Div(f"“{attrib['quote']}”", style={"fontStyle": "italic", "marginBottom": "4px"}),
+                html.Div(f"— {attrib['attributed_to']}, {attrib['date']}", style={"fontWeight": 600, "marginBottom": "6px"}),
+                html.Div(attrib["detail"], style={"marginBottom": "6px"}),
+                html.Div(f"Source: {attrib['source']}", style={"fontSize": "10px", "color": "#94a3b8"}),
+            ], style={"fontSize": "12px", "color": "#7c2d12", "background": "#fff7ed",
+                       "border": "1px solid #fed7aa", "borderRadius": "6px", "padding": "10px 12px",
+                       "marginTop": "10px"}))
+        sections.append(_elec_section("Is your capacity price rising — and why?", html.Div(rows)))
+    elif cpt.get("reason"):
+        sections.append(_elec_section("Is your capacity price rising — and why?", _unavailable(cpt["reason"])))
+
     # Market competitiveness
     mc = r["market_competitiveness"]
     if mc["available"]:

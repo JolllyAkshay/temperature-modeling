@@ -19,7 +19,7 @@ from .zip_lookup import (
 from .carbon_intensity import fetch_carbon_intensity, fetch_carbon_intensity_history
 from .demand_response import compute_dr_windows
 from .nearby_plants import find_nearest_plants
-from .capacity_market import get_capacity_market_data
+from .capacity_market import get_capacity_market_data, get_capacity_price_history
 from .market_competitiveness import get_market_competitiveness
 
 log = logging.getLogger(__name__)
@@ -64,6 +64,12 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                                    today/tomorrow demand-response windows (see
                                    demand_response.compute_dr_windows for field shapes)
         capacity_auctions:       {available, data} or {available: False, reason}
+        capacity_price_trend:    {available, data: {history: [{delivery_period,
+                                   auction_held_date, native_unit_price,
+                                   clearing_price_mw_year, yoy_change_pct, source}, ...],
+                                   data_center_attribution: {...} or None}} or
+                                   {available: False, reason} — multi-year capacity
+                                   price trend; PJM only (see capacity_market.py)
         market_competitiveness:  {available, data} or {available: False, reason}
         wholesale_price_context: {available, data, disclaimer, gap_explainer} or
                                    {available: False, reason} — data includes both
@@ -106,7 +112,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
 
     if not zl["found"]:
         reason = "No data for this zip code in our dataset."
-        for key in ("fuel_mix", "fuel_mix_history", "best_time_to_use", "capacity_auctions", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
+        for key in ("fuel_mix", "fuel_mix_history", "best_time_to_use", "capacity_auctions", "capacity_price_trend", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
             result[key] = {"available": False, "reason": reason}
         return result
 
@@ -163,7 +169,7 @@ def explain_electricity(zip_code: str, session=None) -> dict:
                    "markets this tool covers (PJM, CAISO, ERCOT, MISO, NYISO, ISO-NE, SPP) — "
                    "it's likely served by a vertically-integrated utility or federal power "
                    "authority instead. See the utility notes above for specifics.")
-        for key in ("fuel_mix", "fuel_mix_history", "best_time_to_use", "capacity_auctions", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
+        for key in ("fuel_mix", "fuel_mix_history", "best_time_to_use", "capacity_auctions", "capacity_price_trend", "market_competitiveness", "wholesale_price_context", "wholesale_price_history"):
             result[key] = {"available": False, "reason": reason}
         return result
 
@@ -220,6 +226,15 @@ def explain_electricity(zip_code: str, session=None) -> dict:
     except Exception:
         log.exception("%s: capacity market lookup failed", iso.upper())
         result["capacity_auctions"] = {"available": False, "reason": "Capacity market data temporarily unavailable."}
+
+    # Capacity price trend — multi-year, to show whether/why capacity costs
+    # are rising (e.g. PJM's data-center-driven jump). See capacity_market.py
+    # for why this is currently PJM-only.
+    try:
+        result["capacity_price_trend"] = get_capacity_price_history(iso)
+    except Exception:
+        log.exception("%s: capacity price history lookup failed", iso.upper())
+        result["capacity_price_trend"] = {"available": False, "reason": "Capacity price history temporarily unavailable."}
 
     # Market competitiveness
     try:

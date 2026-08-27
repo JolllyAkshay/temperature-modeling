@@ -17,6 +17,9 @@ Public API
 ----------
 get_capacity_market_data(iso) -> dict
     Returns capacity market snapshot for the given ISO.
+get_capacity_price_history(iso) -> dict
+    Returns multi-year capacity price trend + data-center-attribution note
+    (PJM only — see _CAPACITY_PRICE_HISTORY for why other ISOs aren't covered).
 """
 
 import logging
@@ -146,6 +149,79 @@ _STATIC_DATA: dict = {
         "source": "SPP 2026 Reliability Assessment",
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Multi-year capacity price history — answers "is this rising, and why?"
+# rather than just the single currently-active auction above. PJM only:
+# it's the one ISO with both a clean single RTO-wide number per year AND a
+# sourced attribution for the recent jump. MISO's post-2022/23 auctions are
+# seasonal (4 prices/year, not 1), ISO-NE's FCA 15/16 never cleared a single
+# system-wide price (zonal only), and NYISO has no comparable annual series
+# at all — forcing any of those into one number per year would mean picking
+# an unverified approximation, which this project's discipline (every
+# capacity_market.py figure checked against a real source) rules out. Build
+# those once a clean, verified single-number series actually exists.
+_CAPACITY_PRICE_HISTORY: dict = {
+    "pjm": [
+        {"delivery_period": "2022/23", "auction_held_date": "2021-05-19",
+         "native_unit_price": "$50.00/MW-day", "clearing_price_mw_year": 18_250,
+         "yoy_change_pct": -64, "source": "PJM 2022/2023 BRA Report"},
+        {"delivery_period": "2023/24", "auction_held_date": "2022-06-21",
+         "native_unit_price": "$34.13/MW-day", "clearing_price_mw_year": 12_457,
+         "yoy_change_pct": -32, "source": "PJM 2023/2024 BRA Report"},
+        {"delivery_period": "2024/25", "auction_held_date": "2023-02-27",
+         "native_unit_price": "$28.92/MW-day", "clearing_price_mw_year": 10_556,
+         "yoy_change_pct": -15, "source": "PJM 2024/2025 BRA Report; Monitoring Analytics, Oct 30 2023"},
+        {"delivery_period": "2025/26", "auction_held_date": "2024-07-30",
+         "native_unit_price": "$269.92/MW-day", "clearing_price_mw_year": 98_521,
+         "yoy_change_pct": 833, "source": "PJM 2025/2026 BRA Report; S&P Global, Jul 30 2024"},
+        {"delivery_period": "2026/27", "auction_held_date": "2025-07-22",
+         "native_unit_price": "$329.17/MW-day (FERC price cap)", "clearing_price_mw_year": 120_147,
+         "yoy_change_pct": 22, "source": "PJM 2026/2027 BRA Report"},
+        {"delivery_period": "2027/28", "auction_held_date": "2025-12-01",
+         "native_unit_price": "$333.44/MW-day (FERC price cap)", "clearing_price_mw_year": 121_706,
+         "yoy_change_pct": 1, "source": "PJM 2027/2028 BRA Report, Dec 2025"},
+    ],
+}
+
+_DATA_CENTER_ATTRIBUTION: dict = {
+    "pjm": {
+        "quote": "Data center load growth is the primary reason for recent and expected "
+                 "capacity market conditions, including total forecast load growth, the "
+                 "tight supply and demand balance, and high prices.",
+        "attributed_to": "Monitoring Analytics (PJM's Independent Market Monitor, Joe Bowring)",
+        "detail": "Data centers were estimated to have driven 63% of the 2025/26 auction's "
+                  "price increase (~$9.3B in added costs), and 82% ($7.3B of a $16.1B revenue "
+                  "increase) of the 2026/27 auction's increase.",
+        "date": "2025-10-02",
+        "source": "Utility Dive, \"Data centers 'primary reason' for high PJM capacity prices: "
+                  "market monitor,\" Oct 2025",
+    },
+}
+
+
+def get_capacity_price_history(iso: str) -> dict:
+    """
+    Multi-year capacity auction clearing-price trend, for charting whether
+    (and why) capacity costs are rising — distinct from get_capacity_market_data,
+    which only returns the single currently-active auction.
+
+    Returns {"available": True, "data": {"history": [...], "data_center_attribution":
+    {...} or None}} or {"available": False, "reason": str}.
+    """
+    iso = iso.lower()
+    history = _CAPACITY_PRICE_HISTORY.get(iso)
+    if not history:
+        return {"available": False,
+                "reason": f"No verified multi-year capacity price series for {iso.upper()} yet — "
+                          "this ISO's auction structure doesn't produce one clean comparable "
+                          "number per year (seasonal or zonal pricing), or it hasn't been "
+                          "researched and sourced yet."}
+    return {"available": True, "data": {
+        "history": history,
+        "data_center_attribution": _DATA_CENTER_ATTRIBUTION.get(iso),
+    }}
 
 
 def get_capacity_market_data(iso: str) -> dict:
