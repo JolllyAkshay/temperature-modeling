@@ -746,10 +746,28 @@ _TAB_SEL   = {"padding": "10px 22px", "fontSize": "13px", "fontWeight": 600,
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
+_SITE_URL = "https://jollyakshay-grid-dashboard.hf.space"
+_SITE_DESCRIPTION = (
+    "Live load forecasts, wholesale forward curves, and capacity-market analysis for all "
+    "7 major US ISOs (PJM, CAISO, ERCOT, MISO, NYISO, ISO-NE, SPP) — plus a free public tool "
+    "explaining what powers any US zip code and why electricity costs are rising, including "
+    "the effect of data center demand growth on capacity prices."
+)
+
 app = dash.Dash(
     __name__,
     title="Grid Load Forecast — US Power Grid",
-    meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
+    meta_tags=[
+        {"name": "viewport", "content": "width=device-width, initial-scale=1"},
+        {"name": "description", "content": _SITE_DESCRIPTION},
+        {"property": "og:type", "content": "website"},
+        {"property": "og:url", "content": _SITE_URL},
+        {"property": "og:title", "content": "US Grid Intelligence Platform"},
+        {"property": "og:description", "content": _SITE_DESCRIPTION},
+        {"name": "twitter:card", "content": "summary"},
+        {"name": "twitter:title", "content": "US Grid Intelligence Platform"},
+        {"name": "twitter:description", "content": _SITE_DESCRIPTION},
+    ],
     suppress_callback_exceptions=True,
 )
 
@@ -801,6 +819,45 @@ _main_dashboard_layout = html.Div(
         html.Div(
             style={"maxWidth": "1400px", "margin": "0 auto", "padding": "20px 24px"},
             children=[
+
+                # Intro / navigation cards — first-time visitors (not just traders)
+                # land here, so this exists to say what the platform is before
+                # dropping into the ISO-selector/forecast tool below.
+                html.Div(
+                    style={"marginBottom": "24px"},
+                    children=[
+                        html.P(
+                            "A free, live intelligence platform for the US electricity grid — built to track how "
+                            "data center and AI-driven demand growth is reshaping wholesale prices, capacity "
+                            "auctions, and consumer electricity costs across all 7 major US ISOs.",
+                            style={"fontSize": "14px", "color": "#475569", "maxWidth": "820px",
+                                   "lineHeight": "1.5", "marginBottom": "16px"},
+                        ),
+                        html.Div(
+                            style={"display": "flex", "gap": "14px", "flexWrap": "wrap"},
+                            children=[
+                                dcc.Link(html.Div([
+                                    html.Div("Load Forecast & Market Data", style={"fontWeight": 700, "fontSize": "14px", "color": "#0f172a", "marginBottom": "4px"}),
+                                    html.Div("15-day demand forecasts, real-time fuel mix, and capacity-market data for any of the 7 ISOs.",
+                                              style={"fontSize": "12px", "color": "#64748b"}),
+                                ], style={"padding": "14px 16px", "background": "#ffffff", "border": "1px solid #e2e8f0",
+                                          "borderRadius": "8px", "width": "230px"}), href="/", style={"textDecoration": "none"}),
+                                dcc.Link(html.Div([
+                                    html.Div("Futures Pricer", style={"fontWeight": 700, "fontSize": "14px", "color": "#0f172a", "marginBottom": "4px"}),
+                                    html.Div("Fair-value check for PJM Western Hub monthly forward power quotes against a modeled forward curve.",
+                                              style={"fontSize": "12px", "color": "#64748b"}),
+                                ], style={"padding": "14px 16px", "background": "#ffffff", "border": "1px solid #e2e8f0",
+                                          "borderRadius": "8px", "width": "230px"}), href="/futures-pricer", style={"textDecoration": "none"}),
+                                dcc.Link(html.Div([
+                                    html.Div("What Powers My Zip Code", style={"fontWeight": 700, "fontSize": "14px", "color": "#0f172a", "marginBottom": "4px"}),
+                                    html.Div("Enter any US zip code: see your fuel mix, provider, rate trend, and why capacity costs are rising.",
+                                              style={"fontSize": "12px", "color": "#64748b"}),
+                                ], style={"padding": "14px 16px", "background": "#ffffff", "border": "1px solid #e2e8f0",
+                                          "borderRadius": "8px", "width": "230px"}), href="/my-electricity", style={"textDecoration": "none"}),
+                            ],
+                        ),
+                    ],
+                ),
 
                 # ISO selector
                 html.Div(
